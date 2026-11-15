@@ -1,0 +1,49 @@
+name: Sync README badges
+
+# Markdown is static, so the badges in README.md cannot ask GitHub who owns
+# the repository they live in. This workflow does it for them: it regenerates
+# the badge block (see scripts/sync_badges.py) from this repository's own
+# coordinates and commits the result when it differs.
+#
+# On the upstream the regeneration is a no-op, so no commit ever appears
+# there. On a fork the very first push rewrites the badges to the fork, and
+# every later push leaves them alone. The commit message carries [skip ci]
+# so the workflow cannot run against its own commits.
+
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-readme-badges
+  cancel-in-progress: true
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      - name: Regenerate the badge block
+        env:
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          DOCKERHUB_NAMESPACE: ${{ vars.DOCKERHUB_NAMESPACE }}
+        run: python scripts/sync_badges.py
+
+      - name: Commit the new badges
+        run: |
+          if git diff --quiet README.md; then
+            echo "The badges already match ${GITHUB_REPOSITORY}."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add README.md
+          git commit -m "Sync README badges to this repository [skip ci]"
+          git push
