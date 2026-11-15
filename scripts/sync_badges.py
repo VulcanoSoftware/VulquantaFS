@@ -55,7 +55,7 @@ def main() -> None:
     if not pattern.search(text):
         sys.exit(f"{README}: the {START} / {END} markers were not found")
     README.write_text(pattern.sub(BLOCK, text, count=1), encoding="utf-8")
-    print(f"Badges now point at {REPOSITORY} (branch {BRANCH}, Docker Hub {NAMESPACE})")
+    sys.stdout.write(f"Badges now point at {REPOSITORY} (branch {BRANCH}, Docker Hub {NAMESPACE})\n")
 
 
 if __name__ == "__main__":
