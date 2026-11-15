@@ -5,6 +5,13 @@ name: Sync README badges
 # the badge block (see scripts/sync_badges.py) from this repository's own
 # coordinates and commits the result when it differs.
 #
+# It runs on every branch push, not only the default branch: a repository's
+# trunk is not always its default branch (a fork can develop on a branch of
+# its own). The commit step is what keeps the noise down -- when the badges
+# already match the repository, nothing is committed, so after the first sync
+# a push costs one checkout and one diff. Branches created from a synced
+# trunk never see a commit from this workflow at all.
+#
 # On the upstream the regeneration is a no-op, so no commit ever appears
 # there. On a fork the very first push rewrites the badges to the fork, and
 # every later push leaves them alone. The commit message carries [skip ci]
@@ -12,7 +19,6 @@ name: Sync README badges
 
 on:
   push:
-    branches: [master]
   workflow_dispatch:
 
 permissions:
@@ -28,6 +34,10 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v5
+        # A ref name, not the default detached sha: the commit step below
+        # pushes back to the branch that triggered this run.
+        with:
+          ref: ${{ github.ref }}
 
       - name: Regenerate the badge block
         env:
@@ -46,4 +56,4 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add README.md
           git commit -m "Sync README badges to this repository [skip ci]"
-          git push
+          git push origin "HEAD:${{ github.ref_name }}"
