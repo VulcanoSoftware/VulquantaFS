@@ -122,9 +122,13 @@ that, so heavily interleaved clients (sshfs, rclone) work whatever order
 their writes arrive in. The upload only consumes a staged region once it is
 contiguous, and a gap no write ever covers is zero-filled on close. A write
 that lands behind bytes already streamed is rejected, and so is a jump
-further ahead than `max_ahead_gap_mb` (default 1024). A transfer that is
-cut off mid-flight is discarded rather than committed, so an interrupted
-upload never truncates an existing file.
+further ahead than `max_ahead_gap_mb` (default 1024). The disk staging is
+enforced, not just warned about: every staged write checks the free space
+of `upload_buffer_dir`, and an upload that would outgrow it fails with a
+clear error (and is discarded, not committed truncated) instead of dying
+mid-transfer on a full disk. A transfer that is cut off mid-flight is
+discarded rather than committed, so an interrupted upload never truncates
+an existing file.
 
 **Known limits**, all of them shared with the WebDAV interface: files
 cannot be appended to or partially updated (every write stores a new

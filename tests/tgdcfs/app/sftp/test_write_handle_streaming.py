@@ -337,3 +337,95 @@ class TestStagedOverflow:
 
         await handle.abort()
         assert ops.digests == {}
+
+
+class TestStagingDiskFull:
+    async def test_a_staging_write_beyond_the_free_space_fails_with_numbers(
+        self, mocker, tmp_path
+    ):
+        mocker.patch(
+            "tgdcfs.app.sftp.handles.shutil.disk_usage",
+            return_value=Mock(free=MIB),
+        )
+        ops = CollectingOps()
+        handle = WriteHandle(
+            ops.as_mock(),
+            "/file.bin",
+            buffer_max_bytes=MIB,
+            buffer_dir=str(tmp_path),
+        )
+
+        # 2 MiB stream normally, then a write 1 MiB ahead of the stream
+        # position rolls over to disk, where only 1 MiB is free, and the
+        # message carries both numbers.
+        await handle.write(0, b"x" * (2 * MIB))
+        with pytest.raises(TechnicalError, match="not enough space") as excinfo:
+            await handle.write(3 * MIB, b"y" * (2 * MIB))
+
+        message = str(excinfo.value)
+        assert "1048576" in message  # need
+        assert str(MIB) in message  # have
+        assert str(tmp_path) in message
+        # The upload was cancelled, not left running for a truncated commit.
+        assert handle._closed
+        await handle.close()  # idempotent, must not commit
+        assert ops.digests == {}
+
+    async def test_exhaustion_mid_upload_aborts_without_committing(
+        self, mocker, tmp_path
+    ):
+        disk = {"free": 8 * MIB}
+        mocker.patch(
+            "tgdcfs.app.sftp.handles.shutil.disk_usage",
+            side_effect=lambda _: Mock(free=disk["free"]),
+        )
+        ops = CollectingOps()
+        handle = WriteHandle(
+            ops.as_mock(),
+            "/file.bin",
+            buffer_max_bytes=MIB,
+            buffer_dir=str(tmp_path),
+        )
+
+        # The first 2 MiB stream normally; the disk is still fine.
+        await handle.write(0, b"x" * (2 * MIB))
+        # Another process eats the disk while the upload is running.
+        disk["free"] = 512 * 1024
+        with pytest.raises(TechnicalError, match="not enough space"):
+            await handle.write(3 * MIB, b"y" * (2 * MIB))
+
+        assert handle._closed
+        await handle.close()
+        assert ops.digests == {}
+
+    async def test_exactly_enough_space_still_stages(self, mocker, tmp_path):
+        mocker.patch(
+            "tgdcfs.app.sftp.handles.shutil.disk_usage",
+            return_value=Mock(free=2 * MIB),
+        )
+        ops = CollectingOps()
+        handle = WriteHandle(
+            ops.as_mock(),
+            "/file.bin",
+            buffer_max_bytes=MIB,
+            buffer_dir=str(tmp_path),
+        )
+
+        await handle.write(0, b"x" * (2 * MIB))
+        await handle.close()
+
+        assert ops.digests == {"/file.bin": digest_of(b"x" * (2 * MIB))}
+
+    async def test_in_memory_staging_never_touches_the_disk_check(self, mocker):
+        mocker.patch(
+            "tgdcfs.app.sftp.handles.shutil.disk_usage",
+            side_effect=AssertionError("disk_usage must not be called"),
+        )
+        ops = CollectingOps()
+        handle = WriteHandle(ops.as_mock(), "/file.bin", buffer_max_bytes=8 * MIB)
+
+        payload = os.urandom(2 * MIB)
+        await feed_shuffled(handle, payload, CHUNK, seed=7)
+        await handle.close()
+
+        assert ops.digests == {"/file.bin": digest_of(payload)}

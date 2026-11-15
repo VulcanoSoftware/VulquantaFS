@@ -117,8 +117,8 @@ class TestBufferDiskWarning:
                 if r.levelname == "WARNING" and "buffer" in r.getMessage()
             ]
             assert len(warnings) == 1
-            assert "512" in warnings[0].getMessage()
-            assert "1024" in warnings[0].getMessage()
+            # The effective cap is the free space, not the configured gap.
+            assert warnings[0].getMessage().count("512") == 2
         finally:
             acceptor.close()
             await acceptor.wait_closed()

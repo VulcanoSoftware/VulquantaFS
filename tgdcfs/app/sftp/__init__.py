@@ -54,16 +54,18 @@ async def start_sftp_server(
 def _warn_when_buffer_disk_is_small(sftp_cfg: SFTPConfig) -> None:
     """Warn when the disk behind ``upload_buffer_dir`` cannot hold what one
     upload may stage there, so the surprise lands at startup and not in the
-    middle of a transfer."""
+    middle of a transfer. Uploads enforce this cap themselves -- the
+    effective bound is the smaller of the configured gap and the free
+    space, so that is what the message reports."""
     buffer_dir = sftp_cfg.upload_buffer_dir or tempfile.gettempdir()
     free = shutil.disk_usage(buffer_dir).free
     if free < sftp_cfg.max_ahead_gap_bytes:
         logger.warning(
             "Only %.0f MiB free on the disk of sftp.upload_buffer_dir (%s); "
-            "a single upload may stage up to %d MiB there before it fails",
+            "a single upload may stage up to %.0f MiB there before it fails",
             free / MIB,
             buffer_dir,
-            sftp_cfg.max_ahead_gap_mb,
+            min(free, sftp_cfg.max_ahead_gap_bytes) / MIB,
         )
 
 

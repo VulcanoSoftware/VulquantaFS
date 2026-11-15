@@ -2,6 +2,7 @@ import asyncio
 import errno
 import logging
 import os
+import shutil
 import tempfile
 import time
 from typing import AsyncIterator, List, Optional
@@ -12,6 +13,11 @@ from tgdcfs.errors import TechnicalError
 logger = logging.getLogger(__name__)
 
 MIB = 1024 * 1024
+
+
+class NoSpaceInBufferDir(TechnicalError):
+    """The disk behind ``upload_buffer_dir`` cannot take the staged bytes."""
+
 
 SEEK_DATA = getattr(os, "SEEK_DATA", 3)
 SEEK_HOLE = getattr(os, "SEEK_HOLE", 4)
@@ -167,7 +173,10 @@ class WriteHandle(Handle):
     already on the wire, so the upload fails rather than store a corrupted
     file. A forward jump wider than ``max_gap_bytes`` is treated as
     hostile and fails the same way; within that bound the client may write
-    as far ahead as it likes, the disk takes the overflow.
+    as far ahead as it likes, the disk takes the overflow -- but only as
+    much of it as the disk can actually absorb: every staging write checks
+    the free space of ``buffer_dir`` and the upload is aborted, not
+    committed truncated, once the disk cannot take any more.
     """
 
     def __init__(
@@ -198,6 +207,9 @@ class WriteHandle(Handle):
         # bytes themselves sit in ``_staging`` at their file offsets.
         self._staged: List[List[int]] = []
         self._staging: Optional[tempfile.SpooledTemporaryFile] = None
+        # Whether ``_staging`` has spilled to disk; SpooledTemporaryFile has
+        # no public accessor for it and the free-space check needs to know.
+        self._staging_on_disk = False
 
         self._dirty = False
         self._closed = False
@@ -225,7 +237,13 @@ class WriteHandle(Handle):
                     f"that were already streamed"
                 )
             if offset > self._pos or self._overlaps_staged(offset, len(data)):
-                await self._stage(offset, data)
+                try:
+                    await self._stage(offset, data)
+                except NoSpaceInBufferDir:
+                    # The staging disk is full: leaving the upload running
+                    # would let a later close() commit a truncated file.
+                    await self._abort_locked()
+                    raise
             else:
                 self._dirty = True
                 await self._enqueue(data)
@@ -256,13 +274,17 @@ class WriteHandle(Handle):
     async def abort(self) -> None:
         """Drop the upload without touching the stored file."""
         async with self._lock:
-            if self._closed:
-                return
-            self._closed = True
-            if self._task is not None:
-                self._task.cancel()
-                await asyncio.gather(self._task, return_exceptions=True)
-            await self._close_staging()
+            await self._abort_locked()
+
+    async def _abort_locked(self) -> None:
+        """:meth:`abort` for a caller that already holds the lock."""
+        if self._closed:
+            return
+        self._closed = True
+        if self._task is not None:
+            self._task.cancel()
+            await asyncio.gather(self._task, return_exceptions=True)
+        await self._close_staging()
 
     # -- streaming ---------------------------------------------------------
 
@@ -323,10 +345,29 @@ class WriteHandle(Handle):
         if offset + len(data) > self._buffer_max_bytes:
             # A seek far beyond the end inflates the in-memory buffer with
             # the gap before the rollover check ever sees it; go to disk
-            # first, where the gap costs nothing.
+            # first, where the gap costs nothing. The rollover flushes
+            # everything buffered in memory so far, so that is part of
+            # what the disk has to take.
+            high = self._staged[-1][1] if self._staged else 0
+            self._check_staging_disk_free(min(high, self._buffer_max_bytes) + len(data))
             self._staging.rollover()
+            self._staging_on_disk = True
+        elif self._staging_on_disk:
+            self._check_staging_disk_free(len(data))
         self._staging.seek(offset)
         self._staging.write(data)
+
+    def _check_staging_disk_free(self, need: int) -> None:
+        """Refuse to stage ``need`` more bytes on a disk that cannot take
+        them. Checked on every disk write, so the cap follows the free
+        space as other processes consume it while the upload runs."""
+        buffer_dir = self._buffer_dir or tempfile.gettempdir()
+        free = shutil.disk_usage(buffer_dir).free
+        if free < need:
+            raise NoSpaceInBufferDir(
+                f"not enough space in upload_buffer_dir '{buffer_dir}': "
+                f"need {need} bytes, have {free}"
+            )
 
     def _read_staging(self, offset: int, count: int) -> bytes:
         staging = self._staging
@@ -358,6 +399,7 @@ class WriteHandle(Handle):
     async def _close_staging(self) -> None:
         staging, self._staging = self._staging, None
         self._staged = []
+        self._staging_on_disk = False
         if staging is not None:
             await asyncio.to_thread(staging.close)
 

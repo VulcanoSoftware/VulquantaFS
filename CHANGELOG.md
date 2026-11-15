@@ -56,7 +56,12 @@ the fact on the commits that shipped them.
   ever covers is zero-filled on close. A write that lands behind bytes
   already streamed fails the upload rather than store a corrupted file,
   and a jump further ahead than the new `sftp.max_ahead_gap_mb` (default
-  1024 MiB) is rejected.
+  1024 MiB) is rejected. The disk staging is enforced against the actual
+  free space of `upload_buffer_dir`, re-checked on every staged write: an
+  upload that would outgrow the disk fails with a clear error ("not enough
+  space in upload_buffer_dir: need X, have Y") and is discarded instead of
+  being committed truncated, and the startup warning reports the effective
+  cap rather than only the configured maximum.
 
 - WebDAV listings report a file's creation date as the date of its oldest
   version. It used to be the time of the listing.

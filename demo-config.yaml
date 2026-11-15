@@ -124,7 +124,9 @@ tgdcfs:
   # bound writes may arrive in any order; the gap between the streamed
   # position and a far-ahead write waits for the write that fills it, and
   # a gap that never gets filled is zero-filled when the client closes the
-  # file.
+  # file. The disk part of the buffer is enforced against the actual free
+  # space of `upload_buffer_dir`: an upload that would outgrow it fails
+  # with a clear error and is discarded, never committed truncated.
   # ---------------------------------------------------------------------------
   sftp:
     enabled: false
