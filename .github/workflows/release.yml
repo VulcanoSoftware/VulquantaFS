@@ -180,9 +180,18 @@ jobs:
     needs: tags
     if: needs.tags.outputs.tags != ''
     runs-on: ubuntu-latest
+    env:
+      # The Docker Hub namespace comes from the repository's own owner, so a
+      # fork that runs this workflow publishes to its own namespace, never
+      # the upstream one. Override with the repository variable
+      # DOCKERHUB_NAMESPACE when the Docker Hub namespace differs from the
+      # GitHub username.
+      DOCKERHUB_NAMESPACE: ${{ vars.DOCKERHUB_NAMESPACE || github.repository_owner }}
     strategy:
       matrix:
-        repository: [xyvran/tgdcfs, xyvran/tgdcfs-fe]
+        repository:
+          - ${{ env.DOCKERHUB_NAMESPACE }}/tgdcfs
+          - ${{ env.DOCKERHUB_NAMESPACE }}/tgdcfs-fe
     steps:
       - name: Checkout code
         uses: actions/checkout@v5

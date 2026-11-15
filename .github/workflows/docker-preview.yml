@@ -22,16 +22,21 @@ jobs:
     runs-on: ubuntu-latest
     # Belt and braces: the release branch is served by docker-build-push.
     if: github.ref != 'refs/heads/master'
+    env:
+      # The Docker Hub namespace comes from the repository's own owner, so a
+      # fork that runs this workflow publishes to its own namespace, never
+      # the upstream one. Override with the repository variable
+      # DOCKERHUB_NAMESPACE when the Docker Hub namespace differs from the
+      # GitHub username.
+      DOCKERHUB_NAMESPACE: ${{ vars.DOCKERHUB_NAMESPACE || github.repository_owner }}
     strategy:
       fail-fast: false
       matrix:
         include:
           - name: tgdcfs
             dockerfile: Dockerfile
-            repository: vulcanosoftware/tgdcfs
           - name: tgdcfs-fe
             dockerfile: Dockerfile.frontend
-            repository: vulcanosoftware/tgdcfs-fe
     steps:
       - name: Checkout code
         uses: actions/checkout@v5
@@ -47,7 +52,7 @@ jobs:
       - name: Prepare build
         id: prep
         env:
-          REPOSITORY: ${{ matrix.repository }}
+          REPOSITORY: ${DOCKERHUB_NAMESPACE}/${{ matrix.name }}
           DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
           DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
         run: |
@@ -164,6 +169,6 @@ jobs:
             echo "docker pull ${{ steps.prep.outputs.image }}"
             echo '```'
             echo
-            echo "Also tagged \`${{ matrix.repository }}:preview\`, which moves with every"
+            echo "Also tagged \`${{ env.DOCKERHUB_NAMESPACE }}/${{ matrix.name }}:preview\`, which moves with every"
             echo "feature-branch build. Use the commit-pinned tag above when that matters."
           } >> "$GITHUB_STEP_SUMMARY"
