@@ -39,6 +39,12 @@ the fact on the commits that shipped them.
 - Config generator: a "Large Folders" section for the `listing` block; it
   is written only with the values that differ from the defaults, and
   "Load Existing config.yaml" reads it back.
+- New option `metadata.github_repo.tree_fetch_concurrency` (default `8`):
+  when the metadata repository is too big for one recursive tree call and
+  the startup falls back to reading it one directory at a time, the
+  directories are now read in parallel instead of one round trip after
+  another, and the load logs how many directories it read and how long
+  the fallback took.
 
 ### Changed
 

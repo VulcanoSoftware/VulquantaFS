@@ -61,6 +61,9 @@ class GithubConfig:
     # Where the directory dates come from. ``None`` leaves every loaded
     # directory on the ``now()`` default, as it was before the cache existed.
     timestamps: Optional[DirTimestampStore] = None
+    # How many directories the truncated-tree fallback reads in parallel
+    # (one request per directory; see ``_walk_tree``).
+    tree_fetch_concurrency: int = 8
     # PyGithub is synchronous: a write sleeps through GitHub's rate limits
     # and retries for as long as it takes, and on the event loop that froze
     # every other request (uploads timed out in FileZilla after 20 s of

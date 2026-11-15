@@ -4,6 +4,8 @@ import datetime
 import hashlib
 import json
 import logging
+import time
+from concurrent.futures import ThreadPoolExecutor
 from typing import Iterable, NamedTuple, Optional, Sequence
 
 from github import Github, GithubException, InputGitTreeElement
@@ -69,6 +71,7 @@ class GithubRepoMetadataRepository(IMetaDataRepository):
             commit=config.commit,
             name_key=name_key,
             timestamps=self._timestamps,
+            tree_fetch_concurrency=config.tree_fetch_concurrency,
         )
 
     async def push(self) -> None:
@@ -291,21 +294,43 @@ class GithubRepoMetadataRepository(IMetaDataRepository):
 
         One request per directory, like the contents API, but a tree lists
         all of a directory's entries where the contents API stops at 1000:
-        a folder of 20k files came back with 1000 of them. Raises when a
-        single directory's tree is truncated too.
+        a folder of 20k files came back with 1000 of them. Directories are
+        read level by level, ``tree_fetch_concurrency`` requests at a time,
+        so a big repo does not pay one round trip after another. Raises
+        when a single directory's tree is truncated too.
         """
+        started = time.monotonic()
         entries: list[_TreeEntry] = []
+        read = 0
         pending: list[tuple[str, str]] = [("", self._ghc.commit)]
-        while pending:
-            prefix, ref = pending.pop()
-            tree = self._ghc.repo.get_git_tree(ref)
-            if tree.truncated:
-                raise TechnicalError(f"The tree of '{prefix or '/'}' is truncated")
-            for e in tree.tree:
-                path = f"{prefix}{e.path}"
-                entries.append(_TreeEntry(path, e.type, e.sha))
-                if e.type == "tree":
-                    pending.append((f"{path}/", e.sha))
+        with ThreadPoolExecutor(
+            max_workers=self._ghc.tree_fetch_concurrency,
+            thread_name_prefix="github-tree",
+        ) as pool:
+            while pending:
+                batch, pending = (
+                    pending[: self._ghc.tree_fetch_concurrency],
+                    pending[self._ghc.tree_fetch_concurrency :],
+                )
+                trees = list(
+                    pool.map(lambda item: self._ghc.repo.get_git_tree(item[1]), batch)
+                )
+                for (prefix, _), t in zip(batch, trees):
+                    read += 1
+                    if t.truncated:
+                        raise TechnicalError(
+                            f"The tree of '{prefix or '/'}' is truncated"
+                        )
+                    for e in t.tree:
+                        path = f"{prefix}{e.path}"
+                        entries.append(_TreeEntry(path, e.type, e.sha))
+                        if e.type == "tree":
+                            pending.append((f"{path}/", e.sha))
+        logger.info(
+            f"Rebuilt the tree of {self._ghc.repo_name}@{self._ghc.commit} "
+            f"directory by directory: {read} directories in "
+            f"{time.monotonic() - started:.1f}s"
+        )
         return entries
 
     def _build_from_tree(
