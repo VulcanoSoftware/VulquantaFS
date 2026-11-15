@@ -36,6 +36,14 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v5
 
+      # Ubuntu 26.04 runners stack the docker-default AppArmor profile
+      # (docker-default//&unconfined), which denies signals between processes
+      # inside a container. `next build` kills its build workers, so the
+      # frontend image fails with "Error: kill EACCES" (moby/moby#54099).
+      # Runners are single-use VMs, so relaxing the sysctl here is safe.
+      - name: Allow signals inside build containers
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_unconfined=0
+
       - name: Prepare build
         id: prep
         env:
