@@ -13,15 +13,19 @@ jobs:
   docker:
     runs-on: ubuntu-latest
     if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    env:
+      # The Docker Hub namespace comes from the repository's own owner, so a
+      # fork that runs this workflow publishes to its own namespace, not the
+      # upstream one. A fork that wants a different Docker Hub namespace can
+      # set the repository variable DOCKERHUB_NAMESPACE.
+      DOCKERHUB_NAMESPACE: ${{ vars.DOCKERHUB_NAMESPACE || github.repository_owner }}
     strategy:
       matrix:
         include:
           - name: tgdcfs
             dockerfile: Dockerfile
-            repository: vulcanosoftware/tgdcfs
           - name: tgdcfs-fe
             dockerfile: Dockerfile.frontend
-            repository: vulcanosoftware/tgdcfs-fe
     steps:
       - name: Checkout code
         uses: actions/checkout@v5
@@ -62,5 +66,5 @@ jobs:
           platforms: linux/amd64,linux/arm64
           push: true
           tags: |
-            ${{ matrix.repository }}:latest
-            ${{ matrix.repository }}:${{ github.sha }}
+            ${{ env.DOCKERHUB_NAMESPACE }}/${{ matrix.name }}:latest
+            ${{ env.DOCKERHUB_NAMESPACE }}/${{ matrix.name }}:${{ github.sha }}
