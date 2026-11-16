@@ -76,7 +76,7 @@ filesystems:
 
 ### Multi-Source Worker Pipeline
 1. TGDCFS cuts the download request into logical pieces (`download_piece_size_kb: 4096`).
-2. Worker threads fetch pieces simultaneously from `tg-main` AND `tg-spare`.
+2. Concurrent async workers fetch pieces simultaneously from `tg-main` AND `tg-spare`.
 3. Output pieces are reassembled in order through a reorder window (`read_parallel_window: 8`).
 4. **Result**: Download speed equals the combined bandwidth of participating channels!
 

@@ -6,7 +6,7 @@ description: Detailed schema and reference guide for config.yaml.
 
 # ⚙️ Complete Configuration Reference (`config.yaml`)
 
-TGDCFS is configured using a single YAML file located at `$TGDCFS_DATA_DIR/config.yaml`.
+TGDCFS is configured using a single YAML file located at `$TGDCFS_DATA_DIR/config.yaml`. The `TGDCFS_CONFIG_FILE` environment variable overrides the file *name*; it is resolved relative to `TGDCFS_DATA_DIR`, not the working directory.
 
 ---
 
@@ -57,6 +57,7 @@ filesystems:
         repo: "your-username/tgdcfs-metadata"
         commit: "master"
         access_token: "ghp_yourPersonalAccessToken"
+        tree_fetch_concurrency: 8  # parallel directory reads when rebuilding a big tree
 
 tgdcfs:
   users:
@@ -67,6 +68,11 @@ tgdcfs:
       password: "GuestPassword123"
       readonly: true
 
+  jwt:
+    secret: "change-me-to-a-long-random-string"
+    algorithm: "HS256"
+    life: 604800
+
   server:
     host: "0.0.0.0"
     port: 1900
@@ -76,6 +82,10 @@ tgdcfs:
     host: "0.0.0.0"
     port: 2222
     host_key_file: "sftp_host_key"
+    # authorized_keys_dir: "sftp_authorized_keys"
+    # upload_buffer_size_mb: 64
+    # upload_buffer_dir: ""
+    # max_ahead_gap_mb: 1024
 
   encryption:
     enabled: true
@@ -111,9 +121,18 @@ Configures authentication tokens and connection parameters for Telegram and Disc
   - `api_id` *(int)*: Telegram API App ID from [my.telegram.org](https://my.telegram.org).
   - `api_hash` *(string)*: Telegram API App Hash.
   - `bot.tokens` *(list of strings)*: Telegram Bot tokens from [@BotFather](https://t.me/BotFather). Providing multiple tokens distributes download/upload operations across tokens.
+  - `bot.session_file` *(string)*: Telethon session file for the bot, relative to `TGDCFS_DATA_DIR` (default: `bot.session`).
+  - `lib` *(pyrogram | telethon)*: MTProto client library used by the Telegram backend (default: `telethon`).
+  - `account` *(optional object)*: A regular Telegram user account in addition to the bots, with `session_file` (relative to `TGDCFS_DATA_DIR`), `used_to_upload` and `used_to_download` flags.
+  - `delete_messages_on_remove` *(bool, default `false`)*: Delete the channel messages when a file is removed from the file system; without it messages are kept (best-effort deletion is gated on this flag).
 - **`discord`**:
   - `bot_tokens` *(list of strings)*: Discord Bot tokens from the Discord Developer Portal.
   - `max_file_size_bytes` *(int)*: Maximum attachment size per uploaded message (default: `10000000` = 10 MB). Adjust based on your Discord server boost tier (Level 0: 20 MB, Level 2: 50 MB, Level 3: 100 MB).
+  - `delete_messages_on_remove` *(bool, default `false`)*: Delete the channel messages when a file is removed from the file system.
+  - `upload_max_retries` *(int, default `10`)*: Retries per failed attachment upload.
+  - `upload_retry_interval` *(float, default `5.0`)*: Seconds between upload retries.
+  - `max_concurrent_uploads` *(int, default `max(3, number of bot tokens)`)*: Concurrent attachment uploads across the bot pool.
+  - `max_concurrent_downloads` *(int, default `3`)*: Concurrent attachment downloads across the bot pool.
 
 ---
 
@@ -139,7 +158,9 @@ Defines top-level virtual directories exposed via WebDAV/SFTP:
 - `strict` *(bool)*: If `true`, fails client write operation if any mirror write fails.
 - `write_ack` *(primary | cache)*:
   - `primary`: Client receives 201 Created after primary channel write finishes.
-  - `cache`: Client receives 201 Created as soon as upload lands in local cache disk directory.
+  - `cache`: Client receives 201 Created as soon as upload lands in local cache disk directory. Requires `tgdcfs.cache.enabled: true` and cannot be combined with `sync: tee` or `strict: true`.
+- `read_preference` *(list of strings)*: Order in which stores are tried for reads when `read_parallel` is off. Every name must be the file system's primary or one of its mirrors.
+- `allow_shared_store` *(bool, default `false`)*: Allow a store to be the primary of one file system and a mirror of another (or shared between file systems) without the loader rejecting it.
 
 ---
 
@@ -147,7 +168,28 @@ Defines top-level virtual directories exposed via WebDAV/SFTP:
 Main application parameters:
 - **`users`**: User accounts for WebDAV and SFTP authentication.
   - `readonly: true`: Users can list and download, but upload/delete operations return permission denied.
+  - When `users` is empty, unauthenticated requests are served as a read-only `anonymous` user.
+- **`jwt`** *(required)*: Bearer-token settings used by the Manager API, the Telegram Mini App and WebDAV clients that log in via `POST /login` (see [Management API](./management-api.md)). This section has no default; the config loader refuses to start without it.
+  - `secret` *(string)*: Secret used to sign the tokens. Use a long random string.
+  - `algorithm` *(string)*: JWT signing algorithm (e.g. `HS256`).
+  - `life` *(int)*: Token lifetime in seconds (`604800` = 7 days in `demo-config.yaml`).
+- **`server`**: Host and port of the HTTP server that serves WebDAV (`/webdav`), the Manager API (`/api`) and `POST /login`.
 - **`sftp`**: Optional SFTP interface configuration.
-- **`encryption`**: Client-side AES-256-GCM settings.
-- **`cache`**: Local disk cache configuration.
-- **`transfer`**: Fine-tuning piece size, concurrency workers, and buffers.
+  - `enabled` *(bool, default `false`)*, `host` *(default `0.0.0.0`)*, `port` *(default `2222`)*, `host_key_file` *(default `sftp_host_key`; ed25519, mode `0600`, created on first start)*.
+  - `authorized_keys_dir` *(optional)*: Directory with one `<username>` file per user, in the usual `authorized_keys` format, enabling public key login. The user must still exist under `users`, so the `readonly` flag keeps applying.
+  - `upload_buffer_size_mb` *(int, default `64`)*: How much of an incoming upload may sit ahead of the streamed position in memory before it spills over to `upload_buffer_dir`. Uploads stream straight into the cloud channel; the buffer only absorbs writes that run ahead.
+  - `upload_buffer_dir` *(optional)*: Spill directory for the upload buffer (the system temp directory when empty).
+  - `max_ahead_gap_mb` *(int, default `1024`)*: How far ahead of the streamed position a single write may jump before the upload fails. Within that bound writes may arrive in any order; a gap no write ever fills is zero-filled when the client closes the file.
+- **`encryption`**: Client-side AES-256-GCM settings (see [Security & At-Rest Encryption](./encryption.md)).
+- **`cache`**: Local disk cache configuration (see [Local Cache & Performance Tuning](./cache-and-performance.md)).
+- **`listing`**: Folder listing behaviour (see [Local Cache & Performance Tuning](./cache-and-performance.md)).
+- **`transfer`**: Fine-tuning piece size, concurrency workers, and buffers. Every value has a default, so the section can be left out entirely:
+  - `upload_workers_small` *(int, default `3`)* / `upload_workers_big` *(int, default `8`)*: Upload workers for files below/above 10 MB.
+  - `upload_part_size_kb` *(int, default `512`)*: Telegram part size; must divide 512 and not exceed it.
+  - `download_piece_size_kb` *(int, default `4096`)* and `download_pieces_in_flight` *(int, default `4`)*: Read piece size and concurrency; peak buffering per download is their product.
+  - `parallel_download_threshold_mb` *(int, default `10`)*: Minimum file size to trigger multi-source reads.
+  - `upload_parts_in_flight` *(int, default `1`)*: Parallel part uploads when the source is seekable (a version in the local cache).
+  - `read_parallel_window` *(int, default `8`)*: Piece reorder window for multi-source reads.
+  - `connection_pool_size` *(int, default `1`)*: MTProto connections each bot opens.
+  - `chunk_cache_mb` *(int, default `0` = off)*, `chunk_cache_readahead` *(int, default `2`)*, `chunk_cache_block_kb` *(int, default `1024`)*: In-memory cache for downloaded bytes.
+  - `tee_buffer_mb` *(int, default `64`)*: Bytes buffered per mirror during `sync: tee` writes.

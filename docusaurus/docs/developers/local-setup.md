@@ -144,10 +144,11 @@ docker run --rm \
 ```
 
 #### What the Smoke Test Verifies:
-1. **Runtime Imports**: Ensures all binary C extensions (`asyncssh`, `cryptography`, `argon2-cffi`, `uvloop`) import without missing dynamic libraries.
-2. **SFTP Server Initialization**: Starts AsyncSSH with a temporary in-memory configuration and generates host key files in `TGDCFS_DATA_DIR`.
-3. **Authentication Verification**: Connects via AsyncSSH to test valid credential acceptance and invalid credential rejection.
-4. **Custom UID / Non-Root Safety**: Verifies `TGDCFS_DATA_DIR` path resolution under arbitrary UIDs (`docker run --user 12345`).
+1. **Runtime Imports**: Imports the application inside the image — the image installs its packages with `--no-root`, so this is what catches dependencies missing from the runtime layer.
+2. **SFTP Server Initialization**: Starts AsyncSSH with a throwaway in-memory configuration (no Telegram login involved) and verifies the ed25519 host key is generated in `TGDCFS_DATA_DIR`.
+3. **Authentication Verification**: Connects via AsyncSSH with valid credentials and lists the empty virtual root, then asserts a wrong password is rejected.
+
+The custom-UID check (`docker run --user 12345`) is not part of the script itself; the `docker-preview.yml` workflow runs it separately after the smoke check.
 
 ---
 

@@ -12,11 +12,22 @@ TGDCFS provides a RESTful **Manager API** served on port `1900` under `/api`.
 
 ## Authentication
 
-When `tgdcfs.jwt` authentication is enabled, requests require a Bearer token in the `Authorization` header:
+Every request on the HTTP server — including `/api` — requires an `Authorization` header. Two schemes are accepted:
+
+- **Basic**: `Authorization: Basic <base64(username:password)>`, checked against the users configured under `tgdcfs.users`.
+- **Bearer**: `Authorization: Bearer <jwt_token>`, a JWT signed with the `tgdcfs.jwt` secret:
 
 ```http
 Authorization: Bearer <jwt_token>
 ```
+
+Tokens are issued by the login endpoint on the same server:
+
+#### `POST /login`
+
+Body: `{"username": "...", "password": "..."}`. Returns `{"token": "<jwt_token>"}`. The token carries the user's `readonly` flag and expires after `tgdcfs.jwt.life` seconds. `/login` itself requires no `Authorization` header. When no users are configured at all, an anonymous read-only token is returned without credentials.
+
+Read-only users may call read-only endpoints; write operations (such as `POST /api/cache/evict`, `POST /api/import` or replication retries) answer `403 Forbidden` for them.
 
 ---
 
