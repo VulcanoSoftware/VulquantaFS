@@ -36,7 +36,7 @@ Official Docker images are published to two registries under the publishing name
   - Backend image: `ghcr.io/<owner>/tgdcfs:latest`
   - Frontend image: `ghcr.io/<owner>/tgdcfs-fe:latest`
 
-The images are identical; pull from whichever registry you prefer. The [config generator](https://vulcanosoftware.github.io/tgdcfs/config-generator/) lets you pick the registry in its Docker command panel.
+The images are identical; pull from whichever registry you prefer. The [config generator](https://vulcanosoftware.github.io/tgdcfs/config-generator/) lets you pick the registry and the container engine (Docker or Podman) in its command panel. The `docker run` and `docker compose` commands below work the same under Podman: replace `docker` with `podman` and run the compose file with `podman-compose`.
 
 > **Note**: a GHCR package created by the workflow starts **private**. To let anyone pull it without a `docker login ghcr.io`, open the package's *Package settings* on GitHub and change its visibility to public.
 

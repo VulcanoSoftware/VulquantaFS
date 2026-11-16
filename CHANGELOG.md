@@ -30,6 +30,9 @@ the fact on the commits that shipped them.
 - The web frontend's home page links to the documentation next to the
   getting-started guide. The link is relative, so it follows the fork's own
   Pages site like the other buttons on the page.
+- Config generator: the Docker command panel has an engine switch, so the
+  shown commands and hints use `podman` and `podman-compose` instead of
+  Docker when Podman is selected. Docker stays the default.
 - This changelog, SemVer release tags and GitHub releases. A pushed tag
   `vX.Y.Z` publishes the release notes from this file and adds the version
   tags to the Docker images of that commit.
