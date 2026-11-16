@@ -189,11 +189,7 @@ jobs:
       DOCKERHUB_NAMESPACE: ${{ vars.DOCKERHUB_NAMESPACE || github.repository_owner }}
     strategy:
       matrix:
-        # The `env` context is not available in a matrix, so the namespace
-        # is spelled out here the same way the job-level env above does it.
-        repository:
-          - ${{ vars.DOCKERHUB_NAMESPACE || github.repository_owner }}/tgdcfs
-          - ${{ vars.DOCKERHUB_NAMESPACE || github.repository_owner }}/tgdcfs-fe
+        image: [tgdcfs, tgdcfs-fe]
     steps:
       - name: Checkout code
         uses: actions/checkout@v5
@@ -216,8 +212,10 @@ jobs:
         env:
           TAGS: ${{ needs.tags.outputs.tags }}
           WAIT: ${{ needs.tags.outputs.wait }}
-          REPOSITORY: ${{ matrix.repository }}
+          IMAGE: ${{ matrix.image }}
         run: |
+          # Docker Hub namespaces are lowercase; the GitHub owner may not be.
+          REPOSITORY="${DOCKERHUB_NAMESPACE,,}/${IMAGE}"
           if [ "${WAIT}" = true ]; then attempts=60; else attempts=1; fi
           for tag in ${TAGS}; do
             sha="$(git rev-list -n 1 "${tag}")"

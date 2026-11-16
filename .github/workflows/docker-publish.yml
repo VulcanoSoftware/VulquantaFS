@@ -38,6 +38,13 @@ jobs:
       - name: Allow signals inside build containers
         run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_unconfined=0
 
+      # Docker Hub namespaces are lowercase, but github.repository_owner keeps
+      # the case of the GitHub account name (VulcanoSoftware). Docker reads a
+      # first path component with capitals as a registry host name and tries
+      # to push to https://VulcanoSoftware/, so lowercase it for later steps.
+      - name: Lowercase the Docker Hub namespace
+        run: echo "DOCKERHUB_NAMESPACE=${DOCKERHUB_NAMESPACE,,}" >> "$GITHUB_ENV"
+
       - name: Set up Docker
         uses: docker/setup-docker-action@v5
         with:
