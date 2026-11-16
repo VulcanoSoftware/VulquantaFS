@@ -39,7 +39,7 @@ Whenever you overwrite or save changes to an existing file (for example, editing
 - TGDCFS **does not overwrite or destroy** the old file on Telegram/Discord.
 - Instead, it saves a new **version** of the file.
 - The previous versions remain safely preserved in history.
-- If you accidentally corrupt a file, earlier file versions can still be referenced and recovered.
+- If you accidentally corrupt a file, the earlier versions are still there: the metadata keeps every version's message layout and the old messages stay in the channel. Note that there is currently no WebDAV, SFTP or Mini App feature to list or restore old versions — recovery means reading the previous version's messages from the channel (for example during a disaster-recovery session).
 
 ---
 

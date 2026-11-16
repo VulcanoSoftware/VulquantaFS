@@ -17,7 +17,7 @@ TGDCFS reads configuration and environment settings from standard environment va
 | Variable | Default Value | Description |
 |---|---|---|
 | `TGDCFS_DATA_DIR` | `~/.tgdcfs` (`/home/tgdcfs/.tgdcfs` inside Docker) | Path to persistent data directory (holds sessions, host keys, queue files, cache). |
-| `TGDCFS_CONFIG_FILE` | `config.yaml` (relative to the working directory) | Path to the YAML configuration file. |
+| `TGDCFS_CONFIG_FILE` | `config.yaml` (resolved relative to `TGDCFS_DATA_DIR`) | Name of the YAML configuration file. |
 
 The encryption passphrase is not read from a fixed environment variable; it is resolved through the `encryption` section of `config.yaml`, in this priority order: `passphrase_env` (the *name* of an environment variable to read, e.g. `TGDCFS_MASTER_PASSPHRASE`), `passphrase_file` (a file containing the passphrase, useful for systemd `LoadCredential`), or inline `passphrase` (development only). The examples below assume `passphrase_env: "TGDCFS_MASTER_PASSPHRASE"` as set in the bundled `demo-config.yaml`.
 
@@ -33,6 +33,8 @@ Official Docker images are published on Docker Hub under the publishing namespac
 
 ### Running with `docker run`
 
+The image ships no configuration, so mount your `config.yaml` into the data directory (see the [configuration reference](./configuration.md)):
+
 ```bash
 docker run -d \
   --name tgdcfs \
@@ -41,6 +43,7 @@ docker run -d \
   -p 2222:2222 \
   -e TGDCFS_MASTER_PASSPHRASE="your-long-secret-passphrase" \
   -v ~/.tgdcfs:/home/tgdcfs/.tgdcfs \
+  -v "$PWD/config.yaml:/home/tgdcfs/.tgdcfs/config.yaml:ro" \
   <namespace>/tgdcfs:latest
 ```
 
@@ -65,6 +68,7 @@ services:
       - TGDCFS_MASTER_PASSPHRASE=${TGDCFS_MASTER_PASSPHRASE}
     volumes:
       - ./data:/home/tgdcfs/.tgdcfs
+      - ./config.yaml:/home/tgdcfs/.tgdcfs/config.yaml:ro
 
   frontend:
     image: <namespace>/tgdcfs-fe:latest

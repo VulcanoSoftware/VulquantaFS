@@ -22,8 +22,9 @@ TGDCFS includes a built-in **Telegram Mini App** interface. This web interface a
 
 ### 📂 File Explorer
 - **Browse Directories**: Navigate through folders in your configured file systems.
-- **File Details**: View file size, last modified date, and current file version.
-- **Media Preview & Streaming**: Preview images or stream videos directly without leaving Telegram.
+- **File Details**: View file size and last modified date for every entry.
+- **Download & Upload**: Download files to your device and upload files into the current directory.
+- **Folders & Deletion**: Create directories and delete files or folders.
 
 ### 🔄 Mirrors & Replication Status
 Tap on the **Mirrors and replication** icon in the header bar to inspect the background health of your files:

@@ -53,14 +53,24 @@ tgdcfs/
 │   │   ├── sftp/               # AsyncSSH SFTP server & user handling
 │   │   └── manager/            # Manager REST API endpoints (/api/*)
 │   └── tasks/                  # Task store & async task execution runner
-├── tests/                      # Full test suite
+├── tests/                      # Full test suite (79 modules)
 │   ├── fakes/                  # In-memory fake stores for offline testing
-│   ├── test_cache.py           # Cache unit tests
-│   ├── test_replication.py     # Replication engine unit tests
-│   └── ...                     # 75+ unit test modules
+│   ├── tgdcfs/                 # Unit tests mirroring the package layout
+│   │   ├── app/                #   WebDAV, SFTP, manager and cache app tests
+│   │   ├── auth/               #   Basic/Bearer authentication tests
+│   │   ├── backends/           #   Telegram & Discord store tests
+│   │   ├── config/             #   Config loader tests
+│   │   ├── core/               #   Cache, replication, mirror, ops tests
+│   │   ├── tasks/              #   Task store tests
+│   │   └── utils/              #   Chunk cache, prefetching, time tests
+│   ├── test_asgidav/           # WebDAV pipeline (asgidav) tests
+│   └── scripts/                # Helper script tests
 ├── scripts/                    # Helper scripts
-│   ├── docker_smoke_check.py   # Container smoke test script
-│   └── measure_transfer.py     # Download piece transfer benchmarking tool
+│   ├── changelog.py            # Release notes extraction from CHANGELOG.md
+│   ├── docker_smoke_check.py   # Container SFTP smoke test script
+│   ├── encrypt_metadata_names.py # One-off name decryption helper
+│   ├── measure_transfer.py     # Download piece transfer benchmarking tool
+│   └── sync_badges.py          # Regenerates the README badge block
 ├── tgdcfs-gh-pages/            # Next.js web frontend & Telegram Mini App
 └── docusaurus/                 # Docusaurus documentation website
 ```
@@ -79,6 +89,7 @@ class IStore(metaclass=ABCMeta):
     backend: str
 
     async def send_text(self, message: str) -> int: ...
+    async def edit_message_text(self, message_id: int, message: str) -> int: ...
     async def get_messages(self, ids: list[int]) -> list[Optional[MessageResp]]: ...
     async def search_messages(self, search: str) -> list[MessageResp]: ...
     async def upload(self, file_msg: UploadableFileMessage) -> List[SentFileMessage]: ...

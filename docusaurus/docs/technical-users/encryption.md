@@ -52,8 +52,8 @@ Each encrypted file begins with an inline **60-byte header** embedded inside the
 
 When `encrypt_names: true` is configured:
 
-1. **Telegram / Discord Messages**: Document attachments are renamed to random AES-GCM ciphertext tokens (e.g., `enc_a8f9c1...bin`).
-2. **GitHub Metadata Repository**: Directory structures and filenames inside the GitHub repo are encrypted into tokenized paths (`a8f9c1/3d2b...json`).
+1. **Telegram / Discord Messages**: Document attachments are renamed to random AES-GCM ciphertext tokens with the prefix `TGFS1_` (e.g., `TGFS1_a8f9c1...`). The random nonce means the same name encrypts differently every time.
+2. **GitHub Metadata Repository**: Directory structures and filenames inside the GitHub repo are encrypted into tokenized path segments with the prefix `TGFSP1_`. These use deterministic AES-SIV, so the same logical name always maps to the same on-repo path and navigation keeps working.
 3. **Commit Messages**: GitHub commit messages are obfuscated so repository observers cannot deduce directory activities.
 
 Inside WebDAV, SFTP, the Manager API, and the Telegram Mini App, file and directory names are decrypted on the fly and displayed normally to authenticated users.
