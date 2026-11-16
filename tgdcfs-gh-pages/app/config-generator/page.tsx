@@ -1192,7 +1192,7 @@ export default function ConfigGenerator() {
                   http://{config.tgdcfs.server.host}:{config.tgdcfs.server.port}
                 </code>{" "}
                 {"("}Used in the{" "}
-                <a href="https://xyvran.github.io/tgdcfs/telegram-mini-app/">
+                <a href="https://atomicdogohio.github.io/tgdcfs/telegram-mini-app/">
                   <u>Telegram Mini App</u>
                 </a>
                 {")"}.
@@ -1879,8 +1879,8 @@ export default function ConfigGenerator() {
             <Divider sx={{ my: 3 }} />
 
             <DockerRunPanel
-              image="xyvran/tgdcfs"
-              ghcrImage="ghcr.io/xyvran/tgdcfs"
+              image="atomicdogohio/tgdcfs"
+              ghcrImage="ghcr.io/atomicdogohio/tgdcfs"
               containerName="tgdcfs"
               dataDir="/home/tgdcfs/.tgdcfs"
               hostDirName=".tgdcfs"
