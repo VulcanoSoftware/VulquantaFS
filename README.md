@@ -17,8 +17,8 @@
 
 # TGDCFS
 
-Telegram and Discord as storage backends behind one WebDAV and SFTP
-server.
+**Telegram and Discord as storage backends behind one WebDAV and SFTP
+server.**
 
 tgdcfs is a copy of [tgfs](https://github.com/Xyvran/tgfs) (taken at
 commit `7464666`) that grows a second storage backend, Discord. Every
@@ -27,11 +27,49 @@ can be a Telegram channel or a Discord channel in either role. The
 design is described in
 [docs/design/architecture-plan.md](docs/design/architecture-plan.md);
 the Discord backend, cross-backend mirroring in both directions and
-background replication are in. The full documentation lives at
-<https://vulcanomail002-source.github.io/tgdcfs/docs/>.
+background replication are in.
 
-Many thanks to [WheatCarrier](https://github.com/TheodoreKrypton/tgfs)
-for creating the original tgfs project this repository is built upon.
+| | |
+|---|---|
+| **Documentation** | <https://vulcanomail002-source.github.io/tgdcfs/docs/> |
+| **Config generator** | <https://vulcanomail002-source.github.io/tgdcfs/config-generator/> |
+| **Getting started** | <https://vulcanomail002-source.github.io/tgdcfs/getting-started/> |
+| **Docker Hub** | <https://hub.docker.com/r/vulcanomail/tgdcfs> |
+
+## Quick start
+
+1. Create the Telegram bot and channels, and (optionally) the Discord
+   bot, following the
+   [getting-started guide](https://vulcanomail002-source.github.io/tgdcfs/getting-started/).
+2. Write your `config.yaml` in the browser with the
+   [config generator](https://vulcanomail002-source.github.io/tgdcfs/config-generator/)
+   — nothing you type leaves the page.
+3. Run the server:
+
+   ```bash
+   docker run -v ~/.tgdcfs:/home/tgdcfs/.tgdcfs -p 1900:1900 <OWNER>/tgdcfs
+   ```
+
+4. Point any WebDAV client at `http://localhost:1900/webdav` (or an
+   SFTP client at port 2222 once the
+   [SFTP interface](#sftp-interface) is enabled).
+
+## Contents
+
+- [Coming from tgfs](#coming-from-tgfs)
+- [Tested clients](#tested-clients)
+- [Features](#features)
+- [SFTP interface](#sftp-interface)
+- [Stores and file systems](#stores-and-file-systems)
+- [Discord backend](#discord-backend)
+- [Mirroring](#mirroring)
+- [Local cache](#local-cache)
+- [At-rest encryption](#at-rest-encryption)
+- [Transfer performance](#transfer-performance)
+- [Large folders](#large-folders)
+- [Web frontend](#web-frontend)
+- [Development](#development)
+- [Acknowledgements](#acknowledgements)
 
 ## Coming from tgfs
 
@@ -47,7 +85,7 @@ for creating the original tgfs project this repository is built upon.
 * The metadata format is unchanged; a channel written by tgfs is served
   by tgdcfs as is.
 
-## Tested Clients
+## Tested clients
 * [rclone](https://rclone.org/)
 * [Cyberduck](https://cyberduck.io/)
 * [WinSCP](https://winscp.net/)
@@ -1016,3 +1054,12 @@ The backend smoke check runs against any image, locally too:
 docker run --rm -v "$PWD/scripts:/app/scripts:ro" <OWNER>/tgdcfs:preview \
   python scripts/docker_smoke_check.py
 ```
+
+## Acknowledgements
+
+* Many thanks to [WheatCarrier](https://github.com/TheodoreKrypton/tgfs)
+  for creating the original tgfs project this repository is built upon.
+* Much of the code in TGDCFS is taken from
+  [dcfs](https://github.com/VulcanoSoftware/dcfs) by VulcanoSoftware —
+  thank you for publishing it. See for example
+  [73fdf3c](https://github.com/VulcanoSoftware/dcfs/commit/73fdf3c48a883a1f874cdc6069b5fceaad0451a7).
