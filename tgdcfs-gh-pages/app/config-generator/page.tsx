@@ -1880,6 +1880,7 @@ export default function ConfigGenerator() {
 
             <DockerRunPanel
               image="xyvran/tgdcfs"
+              ghcrImage="ghcr.io/xyvran/tgdcfs"
               containerName="tgdcfs"
               dataDir="/home/tgdcfs/.tgdcfs"
               hostDirName=".tgdcfs"

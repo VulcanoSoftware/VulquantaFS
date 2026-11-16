@@ -13,10 +13,13 @@ import { ConfigTextField } from "./ConfigTextField";
 
 type PathStyle = "unix" | "windows";
 type Variant = "run" | "compose";
+type Registry = "dockerhub" | "ghcr";
 
 interface DockerRunPanelProps {
-  // Image without a tag, e.g. "xyvran/tgdcfs".
+  // Docker Hub image without a tag, e.g. "xyvran/tgdcfs".
   image: string;
+  // GHCR image without a tag, e.g. "ghcr.io/xyvran/tgdcfs".
+  ghcrImage: string;
   // Container name and the directory the image reads its config from.
   containerName: string;
   dataDir: string;
@@ -50,6 +53,7 @@ const saveTextFile = (name: string, text: string) => {
 // when encryption reads one.
 export function DockerRunPanel({
   image,
+  ghcrImage,
   containerName,
   dataDir,
   hostDirName,
@@ -57,6 +61,7 @@ export function DockerRunPanel({
   envVars,
 }: DockerRunPanelProps) {
   const [variant, setVariant] = useState<Variant>("run");
+  const [registry, setRegistry] = useState<Registry>("dockerhub");
   const [pathStyle, setPathStyle] = useState<PathStyle>("unix");
   const [hostPath, setHostPath] = useState(defaultHostPath("unix", hostDirName));
   const [detached, setDetached] = useState(false);
@@ -77,6 +82,7 @@ export function DockerRunPanel({
   };
 
   const uniquePorts = Array.from(new Set(ports.filter((p) => p > 0)));
+  const selectedImage = registry === "ghcr" ? ghcrImage : image;
 
   const runCommand = [
     "docker run",
@@ -86,7 +92,7 @@ export function DockerRunPanel({
     ...uniquePorts.map((p) => `-p ${p}:${p}`),
     ...envVars.map((name) => `-e ${name}`),
     `-v "${hostPath}:${dataDir}"`,
-    `${image}:latest`,
+    `${selectedImage}:latest`,
   ].join(" ");
 
   // Compose reads the passphrase from a .env file next to it, so the
@@ -94,7 +100,7 @@ export function DockerRunPanel({
   const composeFile = [
     "services:",
     `  ${containerName}:`,
-    `    image: ${image}:latest`,
+    `    image: ${selectedImage}:latest`,
     `    container_name: ${containerName}`,
     "    pull_policy: always",
     "    restart: unless-stopped",
@@ -139,6 +145,20 @@ export function DockerRunPanel({
         >
           <ToggleButton value="run">docker run</ToggleButton>
           <ToggleButton value="compose">docker compose</ToggleButton>
+        </ToggleButtonGroup>
+      </Box>
+      <Box sx={{ display: "flex", alignItems: "center", gap: 2, mb: 2 }}>
+        <Typography variant="body2" color="text.secondary">
+          Registry:
+        </Typography>
+        <ToggleButtonGroup
+          value={registry}
+          exclusive
+          onChange={(_, value: Registry | null) => value && setRegistry(value)}
+          size="small"
+        >
+          <ToggleButton value="dockerhub">Docker Hub</ToggleButton>
+          <ToggleButton value="ghcr">GHCR</ToggleButton>
         </ToggleButtonGroup>
       </Box>
       <Box sx={{ display: "flex", alignItems: "center", gap: 2, mb: 2 }}>

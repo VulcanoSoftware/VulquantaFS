@@ -18,6 +18,15 @@ the fact on the commits that shipped them.
 
 ### Added
 
+- The Docker images are published to GHCR (`ghcr.io/<owner>/tgdcfs` and
+  `ghcr.io/<owner>/tgdcfs-fe`) next to Docker Hub, with the same `latest`,
+  commit, `preview` and release tags. GHCR publishing uses the workflow's
+  own `GITHUB_TOKEN`, so a fork without Docker Hub secrets still ships its
+  images; Docker Hub publishing is skipped with a warning there instead of
+  failing the workflow.
+- Config generator: the Docker command panel has a registry switch, so the
+  shown `docker run` command and `docker-compose.yml` pull the image from
+  Docker Hub or from GHCR.
 - This changelog, SemVer release tags and GitHub releases. A pushed tag
   `vX.Y.Z` publishes the release notes from this file and adds the version
   tags to the Docker images of that commit.
