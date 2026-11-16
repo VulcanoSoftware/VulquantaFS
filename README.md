@@ -30,26 +30,34 @@ technical architecture is described in the
 | | |
 |---|---|
 | **Documentation** | <https://vulcanomail002-source.github.io/tgdcfs/docs/> |
-| **Config generator** | <https://vulcanomail002-source.github.io/tgdcfs/config-generator/> |
 | **Getting started** | <https://vulcanomail002-source.github.io/tgdcfs/getting-started/> |
+| **Config generator** | <https://vulcanomail002-source.github.io/tgdcfs/config-generator/> |
 | **Docker Hub** | <https://hub.docker.com/r/vulcanomail/tgdcfs> |
 
-## Quick start
+## Features
 
-1. Create the Telegram bot and channels, and (optionally) the Discord
-   bot, following the
-   [getting-started guide](https://vulcanomail002-source.github.io/tgdcfs/getting-started/).
-2. Write your `config.yaml` in the browser with the
-   [config generator](https://vulcanomail002-source.github.io/tgdcfs/config-generator/)
-   — nothing you type leaves the page.
-3. Run the server:
+* WebDAV and SFTP servers over private Telegram and Discord channels
+* Unlimited file sizes: large files are chunked into parts but appear as
+  a single file, with live streaming of videos
+* Infinite versioning of files and folders
+* Optional at-rest encryption (AES-256-GCM), invisible to clients
+* Optional RAID-1-style channel redundancy with automatic failover
+* Optional local disk cache with write-back uploads and multi-source
+  downloads
+* Telegram Mini App with a file explorer and background task management
 
-   ```bash
-   docker run -v ~/.tgdcfs:/home/tgdcfs/.tgdcfs -p 1900:1900 <OWNER>/tgdcfs
-   ```
+## Getting started
 
-4. Point any WebDAV client at `http://localhost:1900/webdav` (or an
-   SFTP client at port 2222 once the SFTP interface is enabled).
+Create the Telegram app, bots and channels (and optionally the Discord
+bot) with the
+[getting-started guide](https://vulcanomail002-source.github.io/tgdcfs/getting-started/).
+Write your `config.yaml` in the browser with the
+[config generator](https://vulcanomail002-source.github.io/tgdcfs/config-generator/)
+— nothing you type leaves the page. Then run the server: the
+[deployment guide](https://vulcanomail002-source.github.io/tgdcfs/docs/technical-users/deployment/)
+covers Docker, docker-compose, systemd and Kubernetes, and
+[connecting clients](https://vulcanomail002-source.github.io/tgdcfs/docs/users/connecting-clients/)
+lists the tested WebDAV and SFTP apps.
 
 ## Coming from tgfs
 
@@ -65,42 +73,7 @@ technical architecture is described in the
 * The metadata format is unchanged; a channel written by tgfs is served
   by tgdcfs as is.
 
-## Tested clients
-
-* [rclone](https://rclone.org/)
-* [Cyberduck](https://cyberduck.io/)
-* [WinSCP](https://winscp.net/)
-* [Documents](https://readdle.com/documents) by Readdle
-* [VidHub](https://okaapps.com/product/1659622164)
-
-WinSCP, Cyberduck and rclone speak both protocols; the OpenSSH `sftp`
-command line and `sshfs` work against the SFTP interface as well.
-
-## Features
-
-* Upload and download files to/from a private Telegram channel via WebDAV
-* Uploads keep their modification time: clients that set it after the
-  upload (CarotDAV, Windows Explorer, WebDAV sync tools) are honoured via
-  PROPPATCH; the Windows attributes sent along with it are accepted and ignored
-* **Optional SFTP interface** serving the same tree next to WebDAV
-* Group files on Telegram channels into folders
-* Infinite versioning of files and folders (Folder versioning is only available when Metadata is maintained on Github repository)
-* Importing files that are already on Telegram (Only via the Telegram Mini App)
-* File size is unlimited (larger files are chunked into parts but appear as a single file to the user)
-* Live streaming of videos
-* **Optional at-rest encryption** (AES-256-GCM)
-* **Optional channel redundancy** (RAID-1-style mirroring to extra channels)
-* **Optional local cache** on the data volume: uploads are staged once for
-  every mirror, repeated reads are served from disk, and per file system
-  uploads can be acknowledged as soon as they are on the local disk and
-  distributed to every store in parallel
-* **Optional multi-source downloads**: one download pulls pieces from
-  the primary and every mirror at once
-
 ## Documentation
-
-Everything above the fold is the introduction; the extended guides live
-in the documentation site:
 
 | Topic | Guide |
 |---|---|
@@ -115,91 +88,18 @@ in the documentation site:
 | Fork setup: publish under your own name | [Fork Setup & Self-Publishing](https://vulcanomail002-source.github.io/tgdcfs/docs/developers/fork-setup/) |
 | Questions and known issues | [FAQ](https://vulcanomail002-source.github.io/tgdcfs/docs/users/faq/) |
 
-## Web frontend
-
-The Next.js app in `tgdcfs-gh-pages/` is published at
-<https://vulcanomail002-source.github.io/tgdcfs/> and as the `<OWNER>/tgdcfs-fe` image.
-The Docusaurus documentation under `docusaurus/` is published next to it
-at <https://vulcanomail002-source.github.io/tgdcfs/docs/>.
-It has:
-
-* the [config generator](https://vulcanomail002-source.github.io/tgdcfs/config-generator/)
-  for the stores and file systems layout: Telegram and Discord backends,
-  any number of stores, primary and mirror stores per file system with
-  copy mode, sync and strictness, metadata as pinned message or GitHub
-  repository, and the WebDAV, SFTP and manager settings. The YAML is
-  generated on the fly and can be copied or downloaded as `config.yaml`.
-  Tokens and passphrases stay in the browser.
-* the [getting-started guide](https://vulcanomail002-source.github.io/tgdcfs/getting-started/)
-  for creating the Telegram app and bots, the Discord bot and the
-  channels.
-* the Telegram Mini App with a file explorer, background tasks and a
-  "Mirrors and replication" view (queue, retry, backfill), served by the
-  manager.
-
-A push to `master` deploys the site through the "Deploy site to GitHub
-Pages" workflow; the image is built by the Docker workflows.
-
 ## Development
 
-Install the dependencies:
 ```bash
 poetry install
-```
-
-Run the app:
-```bash
 poetry run python main.py
 ```
 
-Typecheck && lint:
-```bash
-make mypy
-make ruff
-```
-
-Before committing and pushing, run the following command to install git hooks:
-```bash
-pre-commit install
-```
-
 The [developer guide](https://vulcanomail002-source.github.io/tgdcfs/docs/developers/)
-covers the local setup, the test suite and the CI workflows in detail.
-
-### Releases
-
-Changes are recorded in [CHANGELOG.md](CHANGELOG.md) under `[Unreleased]`, in
-the same commit as the change. Versions follow [SemVer](https://semver.org/);
-every release is a tag `vX.Y.Z` with a
-[GitHub release](https://github.com/Xyvran/tgdcfs/releases), and the Docker
-images carry `X.Y.Z` and `X.Y` next to the commit tag. The `OWNER` in these
-examples is the repository owner whose namespace the workflow targets:
-
-```bash
-docker pull <OWNER>/tgdcfs:0.6.1   # one release
-docker pull <OWNER>/tgdcfs:0.6     # newest patch release of 0.6
-```
-
-To cut a release on `master`: rename `[Unreleased]` to
-`[X.Y.Z] - YYYY-MM-DD`, set `version` in `pyproject.toml`, and push —
-the "Release" workflow tags the commit and publishes the release and the
-images.
-
-### Preview builds
-
-Pushing any branch other than `master` runs the full test suite and, in
-parallel, builds a Docker image from that exact commit so a change can be
-tried out on a real machine before it is merged:
-
-```bash
-docker pull <OWNER>/tgdcfs:preview-<commit>     # pinned to one commit
-docker pull <OWNER>/tgdcfs:preview              # whichever branch built last
-```
-
-Preview images are amd64 only and are smoke-checked before they reach the
-registry; see the
-[contribution guide](https://vulcanomail002-source.github.io/tgdcfs/docs/developers/contributing/)
-for the details.
+covers the local setup, the test suite, the CI workflows, the release
+process and the preview builds. Releases follow
+[SemVer](https://semver.org/) and are recorded in
+[CHANGELOG.md](CHANGELOG.md) under `[Unreleased]`.
 
 ## Acknowledgements
 
