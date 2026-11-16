@@ -27,7 +27,8 @@ can be a Telegram channel or a Discord channel in either role. The
 design is described in
 [docs/design/architecture-plan.md](docs/design/architecture-plan.md);
 the Discord backend, cross-backend mirroring in both directions and
-background replication are in.
+background replication are in. The full documentation lives at
+<https://vulcanomail002-source.github.io/tgdcfs/docs/>.
 
 Many thanks to [WheatCarrier](https://github.com/TheodoreKrypton/tgfs)
 for creating the original tgfs project this repository is built upon.
@@ -913,6 +914,8 @@ megabytes.
 
 The Next.js app in `tgdcfs-gh-pages/` is published at
 <https://vulcanomail002-source.github.io/tgdcfs/> and as the `<OWNER>/tgdcfs-fe` image.
+The Docusaurus documentation under `docusaurus/` is published next to it
+at <https://vulcanomail002-source.github.io/tgdcfs/docs/>.
 It has:
 
 * the [config generator](https://vulcanomail002-source.github.io/tgdcfs/config-generator/)
