@@ -6,7 +6,7 @@ description: High-level technical architecture of TGDCFS for sysadmins and self-
 
 # 🛠️ Technical Architecture Overview
 
-**TGDCFS** is a cloud filesystem bridge written in Python 3.13+ using **FastAPI**, **Uvicorn**, **Telethon**, **AsyncSSH**, and **discord.py**. It presents Telegram and Discord channels as unified **WebDAV** and **SFTP** storage backends.
+**TGDCFS** is a cloud filesystem bridge written in Python 3.13+ using **FastAPI**, **Uvicorn**, **Telethon** (or **Pyrogram**, via `backends.telegram.lib`), **AsyncSSH**, and **discord.py**. It presents Telegram and Discord channels as unified **WebDAV** and **SFTP** storage backends.
 
 ---
 
@@ -37,14 +37,14 @@ TGDCFS divides storage into three fundamental abstractions: **Backends**, **Stor
                                     v
 +-------------------------------------------------------------------------+
 |                           BACKEND DRIVERS                               |
-|  Telegram (Telethon / MTProto)     |  Discord (discord.py / REST API)   |
+|  Telegram (Telethon or Pyrogram / MTProto)     |  Discord (discord.py / REST API)   |
 +-------------------------------------------------------------------------+
 ```
 
 ### 1. Backends
 A **Backend** is the underlying cloud protocol driver. TGDCFS supports two backends:
-- **Telegram Backend**: Uploads chunked files up to 2 GiB per message (or 4 GiB with Premium) using MTProto RPC calls (`saveBigFilePart`).
-- **Discord Backend**: Uploads files into attachments up to `max_file_size_bytes` (typically 10 MB - 100 MB depending on Discord server boost level) via HTTP REST endpoints.
+- **Telegram Backend**: Uploads chunked files in messages of up to 2,097,152,000 bytes (512 KiB × 4000) using MTProto RPC calls (`saveBigFilePart`). Parts of up to 4,194,304,000 bytes are used only when a Telegram *user account* is configured under `backends.telegram.account` with `used_to_upload: true` and that account has Telegram Premium; bots alone are limited to the smaller size.
+- **Discord Backend**: Uploads files into attachments up to `max_file_size_bytes` (default 10 MB; set it to match your server: 20 MB unboosted, 50 MB at boost level 2, 100 MB at level 3) via HTTP REST endpoints.
 
 ### 2. Stores
 A **Store** is a specific private channel on Telegram or Discord associated with a unique channel ID. Each store has a unique internal key format:
@@ -65,7 +65,7 @@ TGDCFS maintains directory trees, file attributes, modification times, and chunk
 | Metadata Type | Description | Best Used For |
 |---|---|---|
 | `github_repo` | Stores encrypted directory metadata as JSON files in a private GitHub repository. | **Recommended for all production setups**, especially multi-backend setups (Discord + Telegram) or large trees. |
-| `pinned_message` | Stores the metadata as a single pinned message attachment inside the store channel itself. | Small trees or setups where external GitHub tokens are not desired. |
+| `pinned_message` *(default)* | Stores the metadata as a single pinned message attachment inside the store channel itself. | Small trees or setups where external GitHub tokens are not desired. A mirror whose messages are too small to hold the metadata blob (e.g. a Discord mirror of a Telegram primary) gets no pinned copy, so promoting such a mirror needs `github_repo`. |
 
 ---
 

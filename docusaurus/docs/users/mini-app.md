@@ -12,9 +12,11 @@ TGDCFS includes a built-in **Telegram Mini App** interface. This web interface a
 
 ## Accessing the Mini App
 
-1. Open your custom Telegram Bot in your Telegram app.
-2. Tap the **Menu Button** or the **Open App** button provided by the bot.
-3. The Mini App will load directly inside Telegram!
+The Mini App is a web page served by the TGDCFS frontend, separate from your TGDCFS server (the server does not set up a bot menu button itself). Open it in a browser, or inside Telegram if you configured it as the Mini App of your bot (for example through BotFather).
+
+1. Open the Mini App page.
+2. Enter the URL of your TGDCFS server (it must be `https://` when the page itself is served over HTTPS) and your username and password, or choose anonymous access when the server has no users configured.
+3. The file explorer loads once the login succeeds.
 
 ---
 
@@ -34,7 +36,7 @@ Tap on the **Mirrors and replication** icon in the header bar to inspect the bac
 - **Local Cache Management**: View current local cache usage and tap **Drop unpinned entries** if you need to free up disk space on your server.
 
 ### ⚙️ Background Tasks
-- Track ongoing uploads, video processing, or backfill tasks in real-time.
+- Track ongoing uploads, write-back distributions and backfill tasks, with progress and status messages.
 - View clear progress percentages and status messages.
 
 ---
@@ -43,6 +45,7 @@ Tap on the **Mirrors and replication** icon in the header bar to inspect the bac
 
 If you already have files uploaded to a Telegram channel before setting up TGDCFS, you can import them into your file system using the Mini App:
 
+0. The message must be in the Telegram channel that is the primary store of the file system you import into; forward it there first if it is not.
 1. Copy the Telegram message link or ID of the file in your channel.
 2. Open the Mini App and go to the target directory.
 3. Use the **Import** feature to add the file directly into your TGDCFS virtual file system without downloading and re-uploading the data!
