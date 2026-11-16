@@ -107,10 +107,12 @@ jobs:
           file: ./${{ matrix.dockerfile }}
           platforms: linux/amd64
           # Load into the local daemon first so the image can be exercised
-          # before anything reaches the registry.
+          # before anything reaches the registry. Tagging it with the GHCR
+          # name here is local only: the smoke tests below then find it
+          # without a pull, which a private GHCR package would deny.
           load: true
           push: false
-          tags: ${{ steps.prep.outputs.tags }}
+          tags: ${{ steps.prep.outputs.image }}
           cache-from: type=gha
           cache-to: type=gha,mode=max,ignore-error=true
 
