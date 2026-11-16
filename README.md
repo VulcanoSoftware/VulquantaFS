@@ -106,5 +106,4 @@ process and the preview builds. Releases follow
 * Many thanks to [WheatCarrier](https://github.com/TheodoreKrypton/tgfs)
   for creating the original tgfs project this repository is built upon.
 * Much of the code in TGDCFS is taken from
-  [dcfs](https://github.com/VulcanoSoftware/dcfs) by VulcanoSoftware commit
-  [73fdf3c](https://github.com/VulcanoSoftware/dcfs/commit/73fdf3c48a883a1f874cdc6069b5fceaad0451a7).
+  [dcfs](https://github.com/VulcanoSoftware/dcfs) by VulcanoSoftware.
