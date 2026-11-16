@@ -4,7 +4,7 @@
      script, not this block. -->
 [![Tests](https://img.shields.io/github/actions/workflow/status/vulcanomail002-source/tgdcfs/test.yml?branch=master&style=for-the-badge&label=tests)](https://github.com/vulcanomail002-source/tgdcfs/actions/workflows/test.yml)
 [![Docker build](https://img.shields.io/github/actions/workflow/status/vulcanomail002-source/tgdcfs/docker-publish.yml?branch=master&style=for-the-badge&label=docker%20build)](https://github.com/vulcanomail002-source/tgdcfs/actions/workflows/docker-publish.yml)
-[![Docker](https://img.shields.io/badge/docker-%230db7ed.svg?style=for-the-badge&logo=docker&logoColor=white)](https://hub.docker.com/r/vulcanomail/tgdcfs)
+[![Docker](https://img.shields.io/badge/docker-%230db7ed.svg?style=for-the-badge&logo=docker&logoColor=white)](https://hub.docker.com/r/vulcanomail002-source/tgdcfs)
 <!-- badges-end -->
 
 > **Fork note.** Nothing in this repository's workflows or badges is
@@ -158,10 +158,10 @@ as a top-level directory over WebDAV and SFTP: it has one *primary*
 store and any number of *mirror* stores, and the same store can play
 either role. Swapping primary and mirror is a config change.
 
-The [config generator](https://xyvran.github.io/tgdcfs/config-generator/)
+The [config generator](https://vulcanomail002-source.github.io/tgdcfs/config-generator/)
 writes this file in the browser, with the same validation rules the
 loader applies; nothing you type leaves the page. The
-[getting-started guide](https://xyvran.github.io/tgdcfs/getting-started/)
+[getting-started guide](https://vulcanomail002-source.github.io/tgdcfs/getting-started/)
 walks through the bots and channels it asks for.
 
 ```yaml
@@ -912,10 +912,10 @@ megabytes.
 ## Web frontend
 
 The Next.js app in `tgdcfs-gh-pages/` is published at
-<https://xyvran.github.io/tgdcfs/> and as the `<OWNER>/tgdcfs-fe` image.
+<https://vulcanomail002-source.github.io/tgdcfs/> and as the `<OWNER>/tgdcfs-fe` image.
 It has:
 
-* the [config generator](https://xyvran.github.io/tgdcfs/config-generator/)
+* the [config generator](https://vulcanomail002-source.github.io/tgdcfs/config-generator/)
   for the stores and file systems layout described above: Telegram and
   Discord backends, any number of stores, primary and mirror stores per
   file system with copy mode, sync and strictness, metadata as pinned
@@ -923,7 +923,7 @@ It has:
   settings. The YAML is generated on the fly and can be copied or
   downloaded as `config.yaml`. Tokens and passphrases stay in the
   browser.
-* the [getting-started guide](https://xyvran.github.io/tgdcfs/getting-started/)
+* the [getting-started guide](https://vulcanomail002-source.github.io/tgdcfs/getting-started/)
   for creating the Telegram app and bots, the Discord bot and the
   channels.
 * the Telegram Mini App with a file explorer, background tasks and a
