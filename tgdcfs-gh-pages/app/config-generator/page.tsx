@@ -1192,7 +1192,7 @@ export default function ConfigGenerator() {
                   http://{config.tgdcfs.server.host}:{config.tgdcfs.server.port}
                 </code>{" "}
                 {"("}Used in the{" "}
-                <a href="https://atomicdogohio.github.io/tgdcfs/telegram-mini-app/">
+                <a href="https://vulcanosoftware.github.io/tgdcfs/telegram-mini-app/">
                   <u>Telegram Mini App</u>
                 </a>
                 {")"}.
