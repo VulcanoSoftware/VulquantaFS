@@ -13,15 +13,19 @@ jobs:
   docker:
     runs-on: ubuntu-latest
     if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    env:
+      # The Docker Hub namespace comes from the repository's own owner, so a
+      # fork that runs this workflow publishes to its own namespace, not the
+      # upstream one. A fork that wants a different Docker Hub namespace can
+      # set the repository variable DOCKERHUB_NAMESPACE.
+      DOCKERHUB_NAMESPACE: ${{ vars.DOCKERHUB_NAMESPACE || github.repository_owner }}
     strategy:
       matrix:
         include:
           - name: tgdcfs
             dockerfile: Dockerfile
-            repository: vulcanosoftware/tgdcfs
           - name: tgdcfs-fe
             dockerfile: Dockerfile.frontend
-            repository: vulcanosoftware/tgdcfs-fe
     steps:
       - name: Checkout code
         uses: actions/checkout@v5
@@ -33,6 +37,13 @@ jobs:
       # Runners are single-use VMs, so relaxing the sysctl here is safe.
       - name: Allow signals inside build containers
         run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_unconfined=0
+
+      # Docker Hub namespaces are lowercase, but github.repository_owner keeps
+      # the case of the GitHub account name (VulcanoSoftware). Docker reads a
+      # first path component with capitals as a registry host name and tries
+      # to push to https://VulcanoSoftware/, so lowercase it for later steps.
+      - name: Lowercase the Docker Hub namespace
+        run: echo "DOCKERHUB_NAMESPACE=${DOCKERHUB_NAMESPACE,,}" >> "$GITHUB_ENV"
 
       - name: Set up Docker
         uses: docker/setup-docker-action@v5
@@ -62,5 +73,5 @@ jobs:
           platforms: linux/amd64,linux/arm64
           push: true
           tags: |
-            ${{ matrix.repository }}:latest
-            ${{ matrix.repository }}:${{ github.sha }}
+            ${{ env.DOCKERHUB_NAMESPACE }}/${{ matrix.name }}:latest
+            ${{ env.DOCKERHUB_NAMESPACE }}/${{ matrix.name }}:${{ github.sha }}

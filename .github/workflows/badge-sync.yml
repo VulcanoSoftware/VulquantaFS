@@ -1,0 +1,59 @@
+name: Sync README badges
+
+# Markdown is static, so the badges in README.md cannot ask GitHub who owns
+# the repository they live in. This workflow does it for them: it regenerates
+# the badge block (see scripts/sync_badges.py) from this repository's own
+# coordinates and commits the result when it differs.
+#
+# It runs on every branch push, not only the default branch: a repository's
+# trunk is not always its default branch (a fork can develop on a branch of
+# its own). The commit step is what keeps the noise down -- when the badges
+# already match the repository, nothing is committed, so after the first sync
+# a push costs one checkout and one diff. Branches created from a synced
+# trunk never see a commit from this workflow at all.
+#
+# On the upstream the regeneration is a no-op, so no commit ever appears
+# there. On a fork the very first push rewrites the badges to the fork, and
+# every later push leaves them alone. The commit message carries [skip ci]
+# so the workflow cannot run against its own commits.
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-readme-badges
+  cancel-in-progress: true
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+        # A ref name, not the default detached sha: the commit step below
+        # pushes back to the branch that triggered this run.
+        with:
+          ref: ${{ github.ref }}
+
+      - name: Regenerate the badge block and site links
+        env:
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          DOCKERHUB_NAMESPACE: ${{ vars.DOCKERHUB_NAMESPACE }}
+        run: python scripts/sync_badges.py
+
+      - name: Commit the new badges
+        run: |
+          if git diff --quiet README.md; then
+            echo "The badges already match ${GITHUB_REPOSITORY}."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add README.md
+          git commit -m "Sync README badges and site links to this repository [skip ci]"
+          git push origin "HEAD:${{ github.ref_name }}"

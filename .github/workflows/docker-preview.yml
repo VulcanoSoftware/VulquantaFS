@@ -22,16 +22,21 @@ jobs:
     runs-on: ubuntu-latest
     # Belt and braces: the release branch is served by docker-build-push.
     if: github.ref != 'refs/heads/master'
+    env:
+      # The Docker Hub namespace comes from the repository's own owner, so a
+      # fork that runs this workflow publishes to its own namespace, never
+      # the upstream one. Override with the repository variable
+      # DOCKERHUB_NAMESPACE when the Docker Hub namespace differs from the
+      # GitHub username.
+      DOCKERHUB_NAMESPACE: ${{ vars.DOCKERHUB_NAMESPACE || github.repository_owner }}
     strategy:
       fail-fast: false
       matrix:
         include:
           - name: tgdcfs
             dockerfile: Dockerfile
-            repository: vulcanosoftware/tgdcfs
           - name: tgdcfs-fe
             dockerfile: Dockerfile.frontend
-            repository: vulcanosoftware/tgdcfs-fe
     steps:
       - name: Checkout code
         uses: actions/checkout@v5
@@ -44,10 +49,19 @@ jobs:
       - name: Allow signals inside build containers
         run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_unconfined=0
 
+      # Docker Hub namespaces are lowercase, but github.repository_owner keeps
+      # the case of the GitHub account name (VulcanoSoftware). Docker reads a
+      # first path component with capitals as a registry host name and tries
+      # to push to https://VulcanoSoftware/, so lowercase it for later steps.
+      - name: Lowercase the Docker Hub namespace
+        run: echo "DOCKERHUB_NAMESPACE=${DOCKERHUB_NAMESPACE,,}" >> "$GITHUB_ENV"
+
       - name: Prepare build
         id: prep
         env:
-          REPOSITORY: ${{ matrix.repository }}
+          # A step's env values are literal text, not shell-expanded, so
+          # the namespace has to come from the env context here.
+          REPOSITORY: ${{ env.DOCKERHUB_NAMESPACE }}/${{ matrix.name }}
           DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
           DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
         run: |
@@ -164,6 +178,6 @@ jobs:
             echo "docker pull ${{ steps.prep.outputs.image }}"
             echo '```'
             echo
-            echo "Also tagged \`${{ matrix.repository }}:preview\`, which moves with every"
+            echo "Also tagged \`${{ env.DOCKERHUB_NAMESPACE }}/${{ matrix.name }}:preview\`, which moves with every"
             echo "feature-branch build. Use the commit-pinned tag above when that matters."
           } >> "$GITHUB_STEP_SUMMARY"

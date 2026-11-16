@@ -9,6 +9,7 @@ upload spares the mirror every download from the primary.
 
 import asyncio
 import os
+import threading
 import time
 from typing import cast
 
@@ -310,18 +311,36 @@ class TestBudget:
         assert entry_of(cache, "b").present_bytes() == 0
         assert not cache.has_range("b", 0, quarter - 1)
 
-    async def test_a_fill_in_flight_is_charged_before_it_lands(self, tmp_path):
+    async def test_a_fill_in_flight_is_charged_before_it_lands(
+        self, tmp_path, monkeypatch
+    ):
         """The budget is claimed when a write starts, not when it is on
         disk, so a concurrent admission cannot use the same bytes."""
         cache = make_cache(tmp_path, max_size_mb=1, block_kb=256)
         quarter = 256 * 1024
+
+        # Hold the write on the disk until the test lets go. Relying on a
+        # single event-loop tick made the write finish early under uvloop,
+        # which left the entry evictable and the admission below succeeded.
+        release = threading.Event()
+        pwrite = LocalCache._pwrite
+
+        def gated_pwrite(path: str, offset: int, data: bytes) -> None:
+            assert release.wait(timeout=10)
+            pwrite(path, offset, data)
+
+        monkeypatch.setattr(LocalCache, "_pwrite", staticmethod(gated_pwrite))
+
         assert cache.reserve("fs", "a", 4 * quarter) is not None
         started = cache.write_blocks("a", 0, b"a" * (4 * quarter))
         task = asyncio.ensure_future(started)
         await asyncio.sleep(0)  # the write is on its way to disk
 
-        assert cache.used_bytes() == 4 * quarter
-        assert cache.open_staging("fs", "b", quarter) is None
+        try:
+            assert cache.used_bytes() == 4 * quarter
+            assert cache.open_staging("fs", "b", quarter) is None
+        finally:
+            release.set()
         await task
         assert cache.used_bytes() == 4 * quarter
 
