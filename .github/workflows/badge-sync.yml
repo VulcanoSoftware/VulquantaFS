@@ -17,10 +17,10 @@ name: Sync README badges
 # every later push leaves them alone. The commit message carries [skip ci]
 # so the workflow cannot run against its own commits.
 #
-# Besides README.md the sync script also rewrites the Docker Hub and GHCR
-# image references and the Pages links inside the static frontend
-# (tgdcfs-gh-pages/app), so the config generator and the guides always show
-# images and URLs that belong to the repository they are served from.
+# Besides the badges the sync script repoints the Pages and Docker Hub links
+# in the README. The web frontend (tgdcfs-gh-pages) needs no rewrite: it
+# derives its Docker images and Pages links from the repository at build
+# time (see tgdcfs-gh-pages/next.config.ts).
 
 on:
   push:
@@ -53,12 +53,12 @@ jobs:
 
       - name: Commit the rewritten files
         run: |
-          if git diff --quiet README.md tgdcfs-gh-pages; then
-            echo "The badges, site links and image references already match ${GITHUB_REPOSITORY}."
+          if git diff --quiet README.md; then
+            echo "The badges and site links already match ${GITHUB_REPOSITORY}."
             exit 0
           fi
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add README.md tgdcfs-gh-pages
-          git commit -m "Sync README badges, site links and image references to this repository [skip ci]"
+          git add README.md
+          git commit -m "Sync README badges and site links to this repository [skip ci]"
           git push origin "HEAD:${{ github.ref_name }}"

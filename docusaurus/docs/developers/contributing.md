@@ -58,7 +58,7 @@ so a fork publishes to `<fork-owner>/tgdcfs` and `<fork-owner>/tgdcfs-fe`,
 never to the upstream namespace. If the Docker Hub namespace differs from
 the GitHub username, set the repository variable `DOCKERHUB_NAMESPACE`
 instead of editing the workflows. The images are also published to GHCR
-(`ghcr.io/<fork-owner>/tgdcfs` and `ghcr.io/<fork-owner>/tgdcfs-fe`) with
+(`ghcr.io/<fork-owner>/<fork-repo>/tgdcfs` and `ghcr.io/<fork-owner>/<fork-repo>/tgdcfs-fe`) with
 the workflow's own `GITHUB_TOKEN`, which needs no secrets at all — a fork
 without the Docker Hub secrets still ships its images there.
 

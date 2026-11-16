@@ -16,6 +16,23 @@ the fact on the commits that shipped them.
 
 ## [Unreleased]
 
+### Fixed
+
+- The Docker image names in the config generator's command panel and in
+  the getting-started guide follow the repository the site is built from.
+  They were hard-coded (and kept pointing at a foreign namespace, because
+  `scripts/sync_badges.py` only knew how to replace the upstream's names).
+  `next.config.ts` now derives the Docker Hub image, the GHCR image and the
+  Pages URL from `GITHUB_REPOSITORY` and `DOCKERHUB_NAMESPACE` at build
+  time, and the Pages workflow and the `tgdcfs-fe` image build pass them
+  in. The GHCR image is shown as `ghcr.io/<owner>/<repo>/tgdcfs`, the path
+  the workflows actually publish to.
+
+### Changed
+
+- `scripts/sync_badges.py` and the "Sync README badges" workflow only
+  touch `README.md` now; the web frontend sources are no longer rewritten.
+
 ### Added
 
 - The Docker images are published to GHCR (`ghcr.io/<owner>/tgdcfs` and

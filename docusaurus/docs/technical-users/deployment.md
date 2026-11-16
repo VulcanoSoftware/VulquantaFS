@@ -33,8 +33,8 @@ Official Docker images are published to two registries under the publishing name
   - Backend image: `<namespace>/tgdcfs:latest`
   - Frontend image: `<namespace>/tgdcfs-fe:latest`
 - **GHCR** (always, with the repository's own `GITHUB_TOKEN`):
-  - Backend image: `ghcr.io/<owner>/tgdcfs:latest`
-  - Frontend image: `ghcr.io/<owner>/tgdcfs-fe:latest`
+  - Backend image: `ghcr.io/<owner>/<repo>/tgdcfs:latest`
+  - Frontend image: `ghcr.io/<owner>/<repo>/tgdcfs-fe:latest`
 
 The images are identical; pull from whichever registry you prefer. The [config generator](https://vulcanosoftware.github.io/tgdcfs/config-generator/) lets you pick the registry and the container engine (Docker or Podman) in its command panel. The `docker run` and `docker compose` commands below work the same under Podman: replace `docker` with `podman` and run the compose file with `podman-compose`.
 
