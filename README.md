@@ -32,7 +32,7 @@ technical architecture is described in the
 | **Documentation** | <https://atomicdogohio.github.io/tgdcfs/docs/> |
 | **Getting started** | <https://atomicdogohio.github.io/tgdcfs/getting-started/> |
 | **Config generator** | <https://atomicdogohio.github.io/tgdcfs/config-generator/> |
-| **Docker Hub** | <https://hub.docker.com/r/vulcanomail/tgdcfs> |
+| **Docker Hub** | <https://hub.docker.com/r/atomicdogohio/tgdcfs> |
 
 ## Features
 

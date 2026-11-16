@@ -13,9 +13,10 @@ that points its badges at the fork.
 The script also rewrites the GitHub Pages URLs of the deployed web
 frontend and documentation (the site itself, the config generator, the
 current docs and the getting-started guide) to this repository's own
-Pages coordinates, so a fork's README never sends its readers to the
-upstream UI — and a renamed repository heals its own links on the next
-push.
+Pages coordinates, and the Docker Hub link in the README's site table
+to this repository's own namespace, so a fork's README never sends its
+readers to the upstream UI or image page — and a renamed repository
+heals its own links on the next push.
 
 The same rewrite runs over the web frontend sources in
 tgdcfs-gh-pages/app: their Pages links and their Docker image references
@@ -61,6 +62,11 @@ PAGES_SITE = "https://{}.github.io/{}".format(OWNER.lower(), REPO_NAME.lower())
 PAGES_LINK = re.compile(
     r"https://[A-Za-z0-9-]+\.github\.io/" + re.escape(REPO_NAME) + r"(?![\w-])"
 )
+# The Docker Hub URL in the README's site table. Like the Pages links it
+# is written by hand, so any namespace it carries — the upstream's, a
+# fork's own or a stale one — is normalized to this repository's own.
+DOCKERHUB_LINK = re.compile(r"https://hub\.docker\.com/r/[A-Za-z0-9-]+/tgdcfs(?![\w-])")
+DOCKERHUB_SITE = f"https://hub.docker.com/r/{NAMESPACE}/tgdcfs"
 
 # The Docker images the workflows publish: GHCR under the repository's own
 # coordinates (the GITHUB_TOKEN covers every fork) and Docker Hub under the
@@ -110,6 +116,7 @@ def main() -> None:
         sys.exit(f"{README}: the {START} / {END} markers were not found")
     text = pattern.sub(BLOCK, text, count=1)
     text = PAGES_LINK.sub(PAGES_SITE, text)
+    text = DOCKERHUB_LINK.sub(DOCKERHUB_SITE, text)
     README.write_text(text, encoding="utf-8")
     frontend_changed = rewrite_frontend()
     sys.stdout.write(
