@@ -52,7 +52,9 @@ jobs:
       - name: Prepare build
         id: prep
         env:
-          REPOSITORY: ${DOCKERHUB_NAMESPACE}/${{ matrix.name }}
+          # A step's env values are literal text, not shell-expanded, so
+          # the namespace has to come from the env context here.
+          REPOSITORY: ${{ env.DOCKERHUB_NAMESPACE }}/${{ matrix.name }}
           DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
           DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
         run: |
