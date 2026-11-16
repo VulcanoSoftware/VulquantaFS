@@ -16,9 +16,9 @@ type Variant = "run" | "compose";
 type Registry = "dockerhub" | "ghcr";
 
 interface DockerRunPanelProps {
-  // Docker Hub image without a tag, e.g. "xyvran/tgdcfs".
+  // Docker Hub image without a tag, e.g. "atomicdogohio/tgdcfs".
   image: string;
-  // GHCR image without a tag, e.g. "ghcr.io/xyvran/tgdcfs".
+  // GHCR image without a tag, e.g. "ghcr.io/atomicdogohio/tgdcfs".
   ghcrImage: string;
   // Container name and the directory the image reads its config from.
   containerName: string;

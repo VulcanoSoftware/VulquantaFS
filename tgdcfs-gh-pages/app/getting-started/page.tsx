@@ -437,7 +437,7 @@ export default function GettingStarted() {
                     {dockerConfig.sftpEnabled
                       ? ` -p ${dockerConfig.sftpPort}:${dockerConfig.sftpPort}`
                       : ""}{" "}
-                    xyvran/tgdcfs
+                    atomicdogohio/tgdcfs
                   </code>
                 </div>
 
