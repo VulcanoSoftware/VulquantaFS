@@ -17,9 +17,9 @@ TGDCFS reads configuration and environment settings from standard environment va
 | Variable | Default Value | Description |
 |---|---|---|
 | `TGDCFS_DATA_DIR` | `~/.tgdcfs` (`/home/tgdcfs/.tgdcfs` inside Docker) | Path to persistent data directory (holds sessions, host keys, queue files, cache). |
-| `TGDCFS_CONFIG_FILE` | `$TGDCFS_DATA_DIR/config.yaml` | Path to the YAML configuration file. |
-| `TGDCFS_MASTER_PASSPHRASE` | *(None)* | Secret passphrase used for deriving the AES-256-GCM master key when encryption is enabled. |
-| `TGDCFS_MASTER_PASSPHRASE_FILE` | *(None)* | File path containing the passphrase (useful for systemd `LoadCredential`). |
+| `TGDCFS_CONFIG_FILE` | `config.yaml` (relative to the working directory) | Path to the YAML configuration file. |
+
+The encryption passphrase is not read from a fixed environment variable; it is resolved through the `encryption` section of `config.yaml`, in this priority order: `passphrase_env` (the *name* of an environment variable to read, e.g. `TGDCFS_MASTER_PASSPHRASE`), `passphrase_file` (a file containing the passphrase, useful for systemd `LoadCredential`), or inline `passphrase` (development only). The examples below assume `passphrase_env: "TGDCFS_MASTER_PASSPHRASE"` as set in the bundled `demo-config.yaml`.
 
 *(Note: Legacy `TGFS_DATA_DIR` and `TGFS_CONFIG_FILE` environment variables are supported with a deprecation warning).*
 
@@ -27,9 +27,9 @@ TGDCFS reads configuration and environment settings from standard environment va
 
 ## 1. Docker Deployment (Recommended)
 
-Official Docker images are published on Docker Hub:
-- Backend image: `xyvran/tgdcfs:latest`
-- Frontend image: `xyvran/tgdcfs-fe:latest`
+Official Docker images are published on Docker Hub under the publishing namespace of the repository that built them (for this repository: the `DOCKERHUB_NAMESPACE` repository variable, or the GitHub owner by default). Substitute your namespace below:
+- Backend image: `<namespace>/tgdcfs:latest`
+- Frontend image: `<namespace>/tgdcfs-fe:latest`
 
 ### Running with `docker run`
 
@@ -41,7 +41,7 @@ docker run -d \
   -p 2222:2222 \
   -e TGDCFS_MASTER_PASSPHRASE="your-long-secret-passphrase" \
   -v ~/.tgdcfs:/home/tgdcfs/.tgdcfs \
-  xyvran/tgdcfs:latest
+  <namespace>/tgdcfs:latest
 ```
 
 ---
@@ -55,7 +55,7 @@ version: "3.8"
 
 services:
   tgdcfs:
-    image: xyvran/tgdcfs:latest
+    image: <namespace>/tgdcfs:latest
     container_name: tgdcfs
     restart: unless-stopped
     ports:
@@ -67,7 +67,7 @@ services:
       - ./data:/home/tgdcfs/.tgdcfs
 
   frontend:
-    image: xyvran/tgdcfs-fe:latest
+    image: <namespace>/tgdcfs-fe:latest
     container_name: tgdcfs-fe
     restart: unless-stopped
     ports:
@@ -110,7 +110,6 @@ Type=simple
 User=tgdcfs
 WorkingDirectory=/home/tgdcfs
 LoadCredential=master_passphrase:/etc/tgdcfs/master.passphrase
-Environment=TGDCFS_MASTER_PASSPHRASE_FILE=%d/master_passphrase
 ExecStart=/home/tgdcfs/.venv/bin/python main.py
 Restart=always
 RestartSec=5
@@ -119,7 +118,14 @@ RestartSec=5
 WantedBy=multi-user.target
 ```
 
-4. Enable and start service:
+4. Point the passphrase at the credential in `$TGDCFS_DATA_DIR/config.yaml`:
+```yaml
+encryption:
+  enabled: true
+  passphrase_file: /run/credentials/tgdcfs.service/master_passphrase
+```
+
+5. Enable and start service:
 ```bash
 sudo systemctl daemon-reload
 sudo systemctl enable --now tgdcfs
@@ -137,7 +143,7 @@ Inside `$TGDCFS_DATA_DIR` (e.g. `/home/tgdcfs/.tgdcfs`), TGDCFS maintains:
 ├── bot.session               # Telethon Telegram bot session
 ├── master.salt               # 16-byte Argon2id salt (CRITICAL: DO NOT DELETE)
 ├── sftp_host_key             # Generated ed25519 SSH host key
-├── sftp_authorized_keys/     # User public key files
+├── sftp_authorized_keys/     # User public key files (when authorized_keys_dir is configured)
 ├── replication_queue.json    # Persistent pending replication queue
 ├── cache/                    # Local cache files & block maps
 └── cache/index.json          # Cache index database
