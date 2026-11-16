@@ -27,9 +27,18 @@ The encryption passphrase is not read from a fixed environment variable; it is r
 
 ## 1. Docker Deployment (Recommended)
 
-Official Docker images are published on Docker Hub under the publishing namespace of the repository that built them (for this repository: the `DOCKERHUB_NAMESPACE` repository variable, or the GitHub owner by default). Substitute your namespace below:
-- Backend image: `<namespace>/tgdcfs:latest`
-- Frontend image: `<namespace>/tgdcfs-fe:latest`
+Official Docker images are published to two registries under the publishing namespace of the repository that built them (for this repository: the `DOCKERHUB_NAMESPACE` repository variable, or the GitHub owner by default):
+
+- **Docker Hub** (needs the `DOCKERHUB_USERNAME`/`DOCKERHUB_TOKEN` secrets):
+  - Backend image: `<namespace>/tgdcfs:latest`
+  - Frontend image: `<namespace>/tgdcfs-fe:latest`
+- **GHCR** (always, with the repository's own `GITHUB_TOKEN`):
+  - Backend image: `ghcr.io/<owner>/tgdcfs:latest`
+  - Frontend image: `ghcr.io/<owner>/tgdcfs-fe:latest`
+
+The images are identical; pull from whichever registry you prefer. The [config generator](https://vulcanosoftware.github.io/tgdcfs/config-generator/) lets you pick the registry and the container engine (Docker or Podman) in its command panel. The `docker run` and `docker compose` commands below work the same under Podman: replace `docker` with `podman` and run the compose file with `podman-compose`.
+
+> **Note**: a GHCR package created by the workflow starts **private**. To let anyone pull it without a `docker login ghcr.io`, open the package's *Package settings* on GitHub and change its visibility to public.
 
 ### Running with `docker run`
 
