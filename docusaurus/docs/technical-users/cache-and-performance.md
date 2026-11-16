@@ -95,7 +95,7 @@ tgdcfs:
     download_piece_size_kb: 4096     # Read piece size (4 MB)
     download_pieces_in_flight: 4     # Pieces fetched concurrently per download
     parallel_download_threshold_mb: 10 # Min file size to trigger multi-source read
-    upload_parts_in_flight: 2        # Parallel part uploads for seekable cache sources
+    upload_parts_in_flight: 1        # Parallel part uploads for seekable cache sources
     read_parallel_window: 8          # Piece reorder window
 ```
 

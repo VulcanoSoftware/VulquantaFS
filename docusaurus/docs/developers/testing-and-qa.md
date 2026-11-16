@@ -29,7 +29,7 @@ poetry run ruff check .
 
 ## 1. Running Unit Tests with `pytest`
 
-The test suite contains over 57 test modules covering all subsystems (`tests/`).
+The test suite contains over 75 test modules covering all subsystems (`tests/`).
 
 ### Basic Test Invocations
 
@@ -128,6 +128,6 @@ make ruff
 To verify that a built Docker image or container starts properly and serves SFTP/WebDAV requests:
 
 ```bash
-docker run --rm -v "$PWD/scripts:/app/scripts:ro" xyvran/tgdcfs:latest \
+docker run --rm -v "$PWD/scripts:/app/scripts:ro" <namespace>/tgdcfs:latest \
   python scripts/docker_smoke_check.py
 ```

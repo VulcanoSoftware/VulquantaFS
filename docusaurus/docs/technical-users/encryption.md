@@ -37,11 +37,12 @@ When `tgdcfs.encryption.enabled: true` is set, TGDCFS performs **client-side at-
 
 ### 3. Inline Header Format
 Each encrypted file begins with an inline **60-byte header** embedded inside the first message chunk:
-- 4 bytes: Magic bytes (`TGCR`)
-- 2 bytes: Version marker
+- 4 bytes: Magic bytes (`TGFS`, shared with tgfs so both read the same format)
+- 2 bytes: Header version
+- 2 bytes: Algorithm id (currently AES-256-GCM)
+- 4 bytes: Plaintext chunk size
 - 32 bytes: Per-file HKDF salt
-- 12 bytes: Header HMAC / Nonce
-- 10 bytes: Metadata flags
+- 16 bytes: Header MAC (truncated HMAC-SHA256 over the header body, keyed with the per-file key)
 
 > **Self-Healing Property**: Even if the metadata store (GitHub repo or pinned message) is completely lost, a file can be decrypted directly from the channel messages alone using your passphrase and `master.salt`!
 
