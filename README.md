@@ -27,7 +27,7 @@ can be a Telegram channel or a Discord channel in either role. The
 technical architecture is described in the
 [architecture overview](https://vulcanomail002-source.github.io/tgdcfs/docs/technical-users/).
 
-| | |
+|---|---|
 | **Documentation** | <https://vulcanomail002-source.github.io/tgdcfs/docs/> |
 | **Getting started** | <https://vulcanomail002-source.github.io/tgdcfs/getting-started/> |
 | **Config generator** | <https://vulcanomail002-source.github.io/tgdcfs/config-generator/> |
