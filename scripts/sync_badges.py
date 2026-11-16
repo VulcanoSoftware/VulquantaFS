@@ -11,9 +11,11 @@ never sees a commit from this script, while every fork gets one commit
 that points its badges at the fork.
 
 The script also rewrites the GitHub Pages URLs of the deployed web
-frontend (the site itself, the config generator and the getting-started
-guide) from the upstream Pages site to the fork's own, so a fork's README
-never sends its readers to the upstream UI.
+frontend and documentation (the site itself, the config generator, the
+current docs and the getting-started guide) to this repository's own
+Pages coordinates, so a fork's README never sends its readers to the
+upstream UI — and a renamed repository heals its own links on the next
+push.
 
 Run it by hand with the environment unset to regenerate the upstream
 badges, e.g. after editing the badge layout: the defaults below are the
@@ -46,10 +48,14 @@ NAMESPACE = (
     os.environ.get("DOCKERHUB_NAMESPACE") or REPOSITORY.split("/", 1)[0]
 ).lower()
 
-UPSTREAM_PAGES = "https://xyvran.github.io/tgdcfs"
 # GitHub Pages serves under lowercase owner and repository names.
 PAGES_SITE = "https://{}.github.io/{}".format(
     *[part.lower() for part in REPOSITORY.split("/", 1)]
+)
+# Any Pages URL for this repository name — the upstream's, this fork's, or
+# a stale one left by a rename — is normalized to the current coordinates.
+PAGES_LINK = re.compile(
+    r"https://[A-Za-z0-9-]+\.github\.io/" + re.escape(REPOSITORY.split("/", 1)[1]) + r"(?![\w-])"
 )
 
 BLOCK = f"""{START}
@@ -68,7 +74,7 @@ def main() -> None:
     if not pattern.search(text):
         sys.exit(f"{README}: the {START} / {END} markers were not found")
     text = pattern.sub(BLOCK, text, count=1)
-    text = text.replace(UPSTREAM_PAGES, PAGES_SITE)
+    text = PAGES_LINK.sub(PAGES_SITE, text)
     README.write_text(text, encoding="utf-8")
     sys.stdout.write(
         f"Badges now point at {REPOSITORY} (branch {BRANCH}, Docker Hub {NAMESPACE}), "
