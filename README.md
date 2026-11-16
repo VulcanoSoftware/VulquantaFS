@@ -4,7 +4,7 @@
      script, not this block. -->
 [![Tests](https://img.shields.io/github/actions/workflow/status/vulcanomail002-source/tgdcfs/test.yml?branch=master&style=for-the-badge&label=tests)](https://github.com/vulcanomail002-source/tgdcfs/actions/workflows/test.yml)
 [![Docker build](https://img.shields.io/github/actions/workflow/status/vulcanomail002-source/tgdcfs/docker-publish.yml?branch=master&style=for-the-badge&label=docker%20build)](https://github.com/vulcanomail002-source/tgdcfs/actions/workflows/docker-publish.yml)
-[![Docker](https://img.shields.io/badge/docker-%230db7ed.svg?style=for-the-badge&logo=docker&logoColor=white)](https://hub.docker.com/r/vulcanomail002-source/tgdcfs)
+[![Docker](https://img.shields.io/badge/docker-%230db7ed.svg?style=for-the-badge&logo=docker&logoColor=white)](https://hub.docker.com/r/vulcanomail/tgdcfs)
 <!-- badges-end -->
 
 > **Fork note.** Nothing in this repository's workflows or badges is
