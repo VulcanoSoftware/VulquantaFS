@@ -29,23 +29,36 @@ poetry run ruff check .
 
 ## 1. Running Unit Tests with `pytest`
 
-The test suite contains over 57 test modules covering all subsystems (`tests/`).
+The test suite contains over 75 test modules covering all subsystems (`tests/`).
 
 ### Basic Test Invocations
 
+The tests read a configuration through the environment. The Makefile targets set it for you:
+
+```bash
+make test   # TGDCFS_DATA_DIR=. TGDCFS_CONFIG_FILE=config-test.yaml pytest
+make cov    # same, with --cov --cov-report=term-missing
+```
+
+When invoking `pytest` directly, export the variables first — without them many test modules fail at collection because no config file is found:
+
+```bash
+TGDCFS_DATA_DIR=. TGDCFS_CONFIG_FILE=config-test.yaml poetry run pytest
+```
+
 Run the complete test suite:
 ```bash
-poetry run pytest
+make test
 ```
 
 Run a specific test file:
 ```bash
-poetry run pytest tests/test_cache.py
+poetry run pytest tests/tgdcfs/core/test_local_cache.py
 ```
 
 Run a specific test function with verbose output:
 ```bash
-poetry run pytest tests/test_replication.py -k "test_queue_retry" -v
+poetry run pytest tests/tgdcfs/core/test_replication.py -k "test_reads_fall_over_to_the_replica" -v
 ```
 
 Generate test coverage report:
@@ -64,31 +77,28 @@ TGDCFS provides a feature-rich in-memory fake store implementation in `tests/fak
 - Configurable capabilities (`max_part_bytes`, `max_text_chars`, `supports_server_copy`).
 - Fault injection: Simulate network timeouts, `FloodWait` rate limits, transient channel errors, or dead stores.
 
-Example unit test using `FakeStore`:
+Example unit test using `FakeStore` (`pytest-asyncio` runs in `auto` mode, so async tests need no marker):
 
 ```python
-import pytest
 from tests.fakes.store import FakeStore
-from tgdcfs.backends.base import StoreCapabilities
 
-@pytest.mark.asyncio
-async def test_fake_store_upload_and_download():
-    # Construct a fake store simulating a Discord channel (10 MB parts)
-    caps = StoreCapabilities(
+
+async def test_fake_store_send_and_fetch():
+    # A fake Discord channel: 10 MB parts, no server-side copy
+    store = FakeStore(
+        key="dc:123456",
+        backend_name="discord",
         max_part_bytes=10_000_000,
         max_text_chars=2000,
-        supports_server_copy=False,
-        supports_edit_media=True,
-        supports_bulk_delete=True,
-        delete_age_limit_days=14,
+        server_copy=False,
     )
-    store = FakeStore(key="dc:123456", caps=caps)
 
-    # Test uploading text and binary data
     msg_id = await store.send_text("Hello TGDCFS")
-    retrieved_text = await store.get_text(msg_id)
-    assert retrieved_text == "Hello TGDCFS"
+    [message] = await store.get_messages([msg_id])
+    assert message.text == "Hello TGDCFS"
 ```
+
+Fault injection is a set of method names: `store.fail.add("download_file")` makes the next `download_file` calls raise, which is how the replication and failover tests simulate network trouble.
 
 ---
 
@@ -128,6 +138,6 @@ make ruff
 To verify that a built Docker image or container starts properly and serves SFTP/WebDAV requests:
 
 ```bash
-docker run --rm -v "$PWD/scripts:/app/scripts:ro" xyvran/tgdcfs:latest \
+docker run --rm -v "$PWD/scripts:/app/scripts:ro" <namespace>/tgdcfs:latest \
   python scripts/docker_smoke_check.py
 ```

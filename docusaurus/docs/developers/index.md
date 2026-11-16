@@ -40,7 +40,6 @@ tgdcfs/
 │   │   ├── telegram/           # TelegramStore implementation (Telethon)
 │   │   └── discord/            # DiscordStore implementation (discord.py)
 │   ├── core/                   # Core filesystem domain logic
-│   │   ├── store.py            # Store wrapper
 │   │   ├── local_cache.py      # LocalCache, StagingWriter, VersionBytes
 │   │   ├── multisource.py      # MultiSourceRead parallel scheduler
 │   │   ├── replication.py      # Persistent ReplicationQueue & workers
@@ -54,14 +53,24 @@ tgdcfs/
 │   │   ├── sftp/               # AsyncSSH SFTP server & user handling
 │   │   └── manager/            # Manager REST API endpoints (/api/*)
 │   └── tasks/                  # Task store & async task execution runner
-├── tests/                      # Full test suite
+├── tests/                      # Full test suite (79 modules)
 │   ├── fakes/                  # In-memory fake stores for offline testing
-│   ├── test_cache.py           # Cache unit tests
-│   ├── test_replication.py     # Replication engine unit tests
-│   └── ...                     # 57+ unit test modules
+│   ├── tgdcfs/                 # Unit tests mirroring the package layout
+│   │   ├── app/                #   WebDAV, SFTP, manager and cache app tests
+│   │   ├── auth/               #   Basic/Bearer authentication tests
+│   │   ├── backends/           #   Telegram & Discord store tests
+│   │   ├── config/             #   Config loader tests
+│   │   ├── core/               #   Cache, replication, mirror, ops tests
+│   │   ├── tasks/              #   Task store tests
+│   │   └── utils/              #   Chunk cache, prefetching, time tests
+│   ├── test_asgidav/           # WebDAV pipeline (asgidav) tests
+│   └── scripts/                # Helper script tests
 ├── scripts/                    # Helper scripts
-│   ├── docker_smoke_check.py   # Container smoke test script
-│   └── measure_transfer.py     # Download piece transfer benchmarking tool
+│   ├── changelog.py            # Release notes extraction from CHANGELOG.md
+│   ├── docker_smoke_check.py   # Container SFTP smoke test script
+│   ├── encrypt_metadata_names.py # One-off name decryption helper
+│   ├── measure_transfer.py     # Download piece transfer benchmarking tool
+│   └── sync_badges.py          # Regenerates the README badge block
 ├── tgdcfs-gh-pages/            # Next.js web frontend & Telegram Mini App
 └── docusaurus/                 # Docusaurus documentation website
 ```
@@ -74,16 +83,23 @@ tgdcfs/
 `IStore` is the foundational abstraction that decouples repository logic from specific cloud backends:
 
 ```python
-class IStore(Protocol):
+class IStore(metaclass=ABCMeta):
     key: str
     caps: StoreCapabilities
+    backend: str
 
-    async def send_text(self, text: str) -> int: ...
-    async def get_text(self, message_id: int) -> Optional[str]: ...
-    async def upload(self, file_msg: UploadableFileMessage) -> list[SentFileMessage]: ...
-    async def download(self, message_id: int, begin: int, end: int) -> DownloadFileResp: ...
-    async def copy_within(self, ids: list[int]) -> list[int]: ...
-    async def copy_from(self, other: "IStore", ids: list[int]) -> Optional[list[int]]: ...
+    async def send_text(self, message: str) -> int: ...
+    async def edit_message_text(self, message_id: int, message: str) -> int: ...
+    async def get_messages(self, ids: list[int]) -> list[Optional[MessageResp]]: ...
+    async def search_messages(self, search: str) -> list[MessageResp]: ...
+    async def upload(self, file_msg: UploadableFileMessage) -> List[SentFileMessage]: ...
+    async def download_file(self, message_id: int, begin: int, end: int) -> DownloadFileResp: ...
+    async def replace_document(self, message_id: int, buffer: bytes, name: str) -> int: ...
+    async def copy_within(self, message_ids: List[int]) -> List[int]: ...
+    async def copy_from(self, source: "IStore", message_ids: List[int]) -> Optional[List[int]]: ...
+    async def delete_messages(self, message_ids: Iterable[int], force: bool = False) -> None: ...
+    async def pin_message(self, message_id: int) -> None: ...
+    async def get_pinned_message(self) -> MessageRespWithDocument: ...
 ```
 
 ### 2. `StoreFileContentRepository` (`tgdcfs/core/repository/`)

@@ -14,8 +14,8 @@ TGDCFS provides RAID-1 style channel redundancy. A single **File System** can mi
 
 When mirroring files between stores, TGDCFS handles differences in part limits automatically:
 
-- **Aligned Copies**: Used when primary and mirror stores have identical part size limits (e.g., Telegram primary to Telegram mirror). Every message in the primary store maps 1-to-1 with a message in the mirror store (`mirrors` map).
-- **Replicas**: Used when primary and mirror stores have different part size limits (e.g., a 2 GiB Telegram primary mirrored to a 20 MB Discord channel). TGDCFS cuts the file into Discord-sized pieces and tracks them in a compact `replicas` map.
+- **Aligned Copies**: Used when the mirror is in the same backend as the primary, or when every part of the primary fits in one message of the mirror (e.g., Telegram to Telegram, or a Discord primary to a Telegram mirror). Every message in the primary store maps 1-to-1 with a message in the mirror store (`mirrors` map).
+- **Replicas**: Used when the mirror is in another backend and the primary's parts do not fit one of its messages (e.g., a 2 GiB Telegram primary mirrored to a 20 MB Discord channel). TGDCFS cuts the file into Discord-sized pieces and tracks them in a compact `replicas` map.
 
 ---
 
@@ -41,7 +41,7 @@ Configured per file system under `filesystems.<fs>.sync`:
 
 ### 2. `background` *(default for cross-backend/reupload)*
 - Client PUT request receives `201 Created` as soon as primary store write succeeds.
-- Reupload tasks are added to the persistent background queue (`replication_queue.json`) and processed asynchronously by background worker threads.
+- Reupload tasks are added to the persistent background queue (`replication_queue.json`) and processed asynchronously by one background worker per file system, with a retry backoff after failures.
 
 ### 3. `tee`
 - Bytes read from the incoming client stream are duplicated in memory to bounded branch buffers (`tee_buffer_mb`, default 64 MB).
@@ -50,6 +50,8 @@ Configured per file system under `filesystems.<fs>.sync`:
 ---
 
 ## Failover Reads
+
+When a read from the primary fails, the primary is considered dead for 60 seconds (`primary_dead` on `/api/filesystems`) and reads prefer the mirrors in that window.
 
 If a message chunk or store becomes unreachable (e.g. FloodWait rate limit or network issue):
 - TGDCFS automatically fails over to available mirror stores or replicas chunk-by-chunk.
@@ -88,7 +90,7 @@ filesystems:
 ```bash
 docker start tgdcfs  # or sudo systemctl start tgdcfs
 ```
-*Note: TGDCFS relocates existing store keys on boot. Files remain fully readable from `tg-backup` immediately.*
+*Note: there is no relocation step on boot. When a file's descriptor is read, TGDCFS re-expresses it relative to the new primary, so files remain readable from `tg-backup` right away; the content copies are made by the backfill in the next step. This requires that `tg-backup` holds a copy of the metadata: with `pinned_message` metadata a mirror whose messages are too small for the metadata blob (a Discord mirror of a Telegram primary) has none, and promotion then needs `github_repo` metadata.*
 
 ### Step 4: Execute Backfill Task
 Trigger backfill via curl to ensure all version descriptors are updated and copies are promoted:

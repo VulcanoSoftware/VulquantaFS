@@ -30,6 +30,8 @@ When `tgdcfs.encryption.enabled: true` is set, TGDCFS performs **client-side at-
 - **Master Key**: Derived from your secret passphrase using **Argon2id** and a 16-byte random salt stored in `$TGDCFS_DATA_DIR/master.salt`.
 - **Per-File Key**: Generated for each uploaded file using **HKDF-SHA256** from the Master Key and a 32-byte cryptographically secure random salt generated per file.
 
+The Argon2id parameters are fixed in code (time cost 3, 64 MiB memory, parallelism 4, 32-byte output) and the HKDF info string is the constant `tgfs-file-key-v1` inherited from tgfs; neither is configurable, and changing them would make existing files unreadable.
+
 ### 2. Cipher & Chunking
 - **Cipher**: **AES-256-GCM** operating on **64 KiB chunks** (`chunk_size: 65536`).
 - **Nonces & Authentication**: Each 64 KiB chunk has its own 12-byte initialization vector (nonce) and 16-byte authentication tag (GCM tag).
@@ -37,11 +39,12 @@ When `tgdcfs.encryption.enabled: true` is set, TGDCFS performs **client-side at-
 
 ### 3. Inline Header Format
 Each encrypted file begins with an inline **60-byte header** embedded inside the first message chunk:
-- 4 bytes: Magic bytes (`TGCR`)
-- 2 bytes: Version marker
+- 4 bytes: Magic bytes (`TGFS`, shared with tgfs so both read the same format)
+- 2 bytes: Header version
+- 2 bytes: Algorithm id (currently AES-256-GCM)
+- 4 bytes: Plaintext chunk size
 - 32 bytes: Per-file HKDF salt
-- 12 bytes: Header HMAC / Nonce
-- 10 bytes: Metadata flags
+- 16 bytes: Header MAC (truncated HMAC-SHA256 over the header body, keyed with the per-file key)
 
 > **Self-Healing Property**: Even if the metadata store (GitHub repo or pinned message) is completely lost, a file can be decrypted directly from the channel messages alone using your passphrase and `master.salt`!
 
@@ -51,8 +54,8 @@ Each encrypted file begins with an inline **60-byte header** embedded inside the
 
 When `encrypt_names: true` is configured:
 
-1. **Telegram / Discord Messages**: Document attachments are renamed to random AES-GCM ciphertext tokens (e.g., `enc_a8f9c1...bin`).
-2. **GitHub Metadata Repository**: Directory structures and filenames inside the GitHub repo are encrypted into tokenized paths (`a8f9c1/3d2b...json`).
+1. **Telegram / Discord Messages**: Document attachments are renamed to random AES-GCM ciphertext tokens with the prefix `TGFS1_` (e.g., `TGFS1_a8f9c1...`). The random nonce means the same name encrypts differently every time.
+2. **GitHub Metadata Repository**: Directory structures and filenames inside the GitHub repo are encrypted into tokenized path segments with the prefix `TGFSP1_`. These use deterministic AES-SIV, so the same logical name always maps to the same on-repo path and navigation keeps working.
 3. **Commit Messages**: GitHub commit messages are obfuscated so repository observers cannot deduce directory activities.
 
 Inside WebDAV, SFTP, the Manager API, and the Telegram Mini App, file and directory names are decrypted on the fly and displayed normally to authenticated users.

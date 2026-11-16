@@ -12,7 +12,7 @@ TGDCFS makes storing files in Telegram and Discord feel like using a normal hard
 
 ## 📦 Large File Support (Chunking)
 
-Chat apps like Telegram and Discord limit the maximum size of a single uploaded file (for instance, 2 GiB on Telegram or 20 MB on Discord).
+Chat apps like Telegram and Discord limit the maximum size of a single uploaded file (for instance, about 2 GB on Telegram, or 10 to 100 MB on Discord depending on the configured limit).
 
 **How TGDCFS solves this for you:**
 - When you upload a large file (e.g., a 10 GB movie), TGDCFS automatically splits the file into smaller **chunks** or parts.
@@ -39,7 +39,7 @@ Whenever you overwrite or save changes to an existing file (for example, editing
 - TGDCFS **does not overwrite or destroy** the old file on Telegram/Discord.
 - Instead, it saves a new **version** of the file.
 - The previous versions remain safely preserved in history.
-- If you accidentally corrupt a file, earlier file versions can still be referenced and recovered.
+- If you accidentally corrupt a file, the earlier versions are still there: the metadata keeps every version's message layout and the old messages stay in the channel. Note that there is currently no WebDAV, SFTP or Mini App feature to list or restore old versions — recovery means reading the previous version's messages from the channel (for example during a disaster-recovery session).
 
 ---
 
