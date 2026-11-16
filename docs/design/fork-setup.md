@@ -23,13 +23,13 @@ Workflows use these like this:
 | `docker-preview.yml` | Same namespace, for `preview-<commit>` and `preview` tags |
 | `release.yml` | Same namespace, for `X.Y.Z` and `X.Y` release tags |
 | `test.yml` | Codecov `slug` for the coverage upload |
-| `badge-sync.yml` | The owner, repository and default branch in the README badges |
+| `badge-sync.yml` | The owner, repository and default branch in the README badges, and the GitHub Pages links in the README |
 
 A fork that runs these workflows therefore publishes to
 `<fork-owner>/tgdcfs` and `<fork-owner>/tgdcfs-fe`, not to the upstream
 namespace.
 
-### README badges
+### README badges and site links
 
 Markdown is static, so the badges at the top of `README.md` cannot ask
 GitHub who owns the repository they live in. The "Sync README badges"
@@ -41,7 +41,11 @@ workflow solves this:
    `github.repository`, the default branch and the Docker Hub namespace
    (`vars.DOCKERHUB_NAMESPACE` with a fallback to the owner, lowercased
    because Docker Hub namespaces are lowercase).
-3. When the result differs from what is committed, the workflow commits it
+3. The same script rewrites the GitHub Pages URLs of the deployed web
+   frontend — the site itself, the config generator and the
+   getting-started guide — from the upstream Pages site to the fork's
+   own (`https://<fork-owner>.github.io/tgdcfs/`).
+4. When the result differs from what is committed, the workflow commits it
    with `[skip ci]`, so it cannot run against its own commits.
 
 On the upstream the regeneration is byte-identical to what is committed,
