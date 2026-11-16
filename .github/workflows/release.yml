@@ -189,9 +189,11 @@ jobs:
       DOCKERHUB_NAMESPACE: ${{ vars.DOCKERHUB_NAMESPACE || github.repository_owner }}
     strategy:
       matrix:
+        # The `env` context is not available in a matrix, so the namespace
+        # is spelled out here the same way the job-level env above does it.
         repository:
-          - ${{ env.DOCKERHUB_NAMESPACE }}/tgdcfs
-          - ${{ env.DOCKERHUB_NAMESPACE }}/tgdcfs-fe
+          - ${{ vars.DOCKERHUB_NAMESPACE || github.repository_owner }}/tgdcfs
+          - ${{ vars.DOCKERHUB_NAMESPACE || github.repository_owner }}/tgdcfs-fe
     steps:
       - name: Checkout code
         uses: actions/checkout@v5
