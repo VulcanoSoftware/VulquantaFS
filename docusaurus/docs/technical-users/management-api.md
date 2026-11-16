@@ -12,7 +12,7 @@ TGDCFS provides a RESTful **Manager API** served on port `1900` under `/api`.
 
 ## Authentication
 
-Every request on the HTTP server — including `/api` — requires an `Authorization` header. Two schemes are accepted:
+Every request on the HTTP server — including `/api` and `/webdav` — requires an `Authorization` header (only `OPTIONS` and `POST /login` are exempt). Two schemes are accepted:
 
 - **Basic**: `Authorization: Basic <base64(username:password)>`, checked against the users configured under `tgdcfs.users`.
 - **Bearer**: `Authorization: Bearer <jwt_token>`, a JWT signed with the `tgdcfs.jwt` secret:
@@ -48,7 +48,7 @@ Returns an object keyed by store name with backend, channel, serialization key, 
     "primary_of": ["media"],
     "mirror_of": [],
     "capabilities": {
-      "max_part_bytes": 2147483648,
+      "max_part_bytes": 2097152000,
       "max_text_chars": 4096,
       "supports_server_copy": true,
       "supports_edit_media": true
@@ -57,7 +57,7 @@ Returns an object keyed by store name with backend, channel, serialization key, 
 }
 ```
 
-The `capabilities` entry is omitted for stores whose file system failed to start. Primary-store health (`primary_dead`) is reported per file system on `/api/filesystems`.
+The `capabilities` entry is omitted for stores whose file system failed to start. `primary_dead` on `/api/filesystems` is a circuit breaker, not a live probe: it is `true` for 60 seconds after a read from the primary store failed, during which reads prefer the mirrors.
 
 #### `GET /api/filesystems`
 Returns an object keyed by file system name with primary/mirror stores, mirroring settings, and primary-store health.
@@ -113,7 +113,7 @@ Reports local disk cache status. When the cache is disabled, returns `{"enabled"
 ```
 
 #### `POST /api/cache/evict`
-Triggers an immediate cache eviction pass, dropping every cache entry no mirror is waiting for. Returns the number of evicted entries plus the post-eviction stats.
+Triggers an immediate cache eviction pass (`400` when the cache is disabled), dropping every cache entry no mirror is waiting for. Returns the number of evicted entries plus the post-eviction stats.
 
 ---
 
@@ -129,10 +129,10 @@ Clears the backoff of failed replication items so the workers retry them now. Pa
 Redundancy overview per file system, keyed by mirror store key (kept for the tgfs manager UI; `/api/filesystems` is the fuller view).
 
 #### `POST /api/redundancy/backfill/{filesystem}`
-Triggers a full scan and backfill task for the specified file system. Pass `?verify=true` to re-verify existing copies. Returns `{"task_id": "..."}`; progress is reported through `/api/tasks` (type `mirror_backfill`).
+Triggers a full scan and backfill task for the specified file system (`404` for an unknown file system, `400` when it has no mirror stores). Pass `?verify=true` to re-verify existing copies. Returns `{"task_id": "..."}`; progress is reported through `/api/tasks` (type `mirror_backfill`).
 
 #### `GET /api/tasks`
-Returns real-time status of active and historical background tasks (backfill, distribution, cache sweep). Pass `?path=<path>` to filter tasks under a specific path.
+Returns the status of active and historical tasks. Task types: `upload`, `download`, `mirror_backfill` and `distribution` (moving a `write_ack: cache` upload from the local cache into the stores). Tasks are only created for uploads, backfills and distributions today; `download` is defined but not created yet. Pass `?path=<path>` to filter tasks under a specific path.
 
 #### `GET /api/tasks/{task_id}`
 Returns a single task; `404` when unknown.
@@ -144,14 +144,20 @@ Deletes a task record; `404` when unknown.
 Looks up a Telegram message (used by the Mini App import flow); returns id, file size, caption and MIME type.
 
 #### `POST /api/import`
-Imports a pre-existing Telegram message document into the virtual file system. Body: `directory`, `name`, `channel_id`, `message_id`.
+Imports a pre-existing Telegram message document into the virtual file system. Body: `directory`, `name`, `channel_id`, `message_id`. The message must already be in the primary Telegram channel of the file system that owns `directory`; otherwise the call answers `400` (forward the message to that channel first).
 
 ---
 
 ## Health Monitoring
 
-Use `/api/stores` or `/api/filesystems` for automated health probes in Kubernetes or Docker health checks:
+`/api/stores` and `/api/filesystems` report the configuration (plus the circuit-breaker flag above); they do not contact Telegram or Discord. A probe on them only shows that the HTTP server is up. Like every request they need an `Authorization` header, so a bare `curl -f` answers `401`:
 
 ```bash
-curl -f http://localhost:1900/api/stores || exit 1
+curl -f -u probe_user:probe_password http://localhost:1900/api/stores || exit 1
 ```
+
+When `tgdcfs.users` is empty, any Basic credentials are accepted (as the read-only `anonymous` user), but the header must still be present.
+
+### Transport security and CORS
+
+The server speaks plain HTTP: there is no TLS option in `config.yaml`. Basic credentials and bearer tokens travel unencrypted unless you put a TLS-terminating reverse proxy in front. The HTTP server also answers CORS requests from any origin (with credentials allowed), which is what lets the hosted Mini App talk to your server.

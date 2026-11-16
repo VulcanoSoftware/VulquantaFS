@@ -30,6 +30,8 @@ When `tgdcfs.encryption.enabled: true` is set, TGDCFS performs **client-side at-
 - **Master Key**: Derived from your secret passphrase using **Argon2id** and a 16-byte random salt stored in `$TGDCFS_DATA_DIR/master.salt`.
 - **Per-File Key**: Generated for each uploaded file using **HKDF-SHA256** from the Master Key and a 32-byte cryptographically secure random salt generated per file.
 
+The Argon2id parameters are fixed in code (time cost 3, 64 MiB memory, parallelism 4, 32-byte output) and the HKDF info string is the constant `tgfs-file-key-v1` inherited from tgfs; neither is configurable, and changing them would make existing files unreadable.
+
 ### 2. Cipher & Chunking
 - **Cipher**: **AES-256-GCM** operating on **64 KiB chunks** (`chunk_size: 65536`).
 - **Nonces & Authentication**: Each 64 KiB chunk has its own 12-byte initialization vector (nonce) and 16-byte authentication tag (GCM tag).

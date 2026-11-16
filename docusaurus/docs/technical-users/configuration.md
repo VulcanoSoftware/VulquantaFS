@@ -117,13 +117,15 @@ tgdcfs:
 ### 1. `backends` Section
 Configures authentication tokens and connection parameters for Telegram and Discord:
 
+The `telegram` block can be left out for a Discord-only setup (no store may then use the `telegram` backend). Singular `bot.token` and `discord.bot_token` are accepted next to the lists.
+
 - **`telegram`**:
   - `api_id` *(int)*: Telegram API App ID from [my.telegram.org](https://my.telegram.org).
   - `api_hash` *(string)*: Telegram API App Hash.
   - `bot.tokens` *(list of strings)*: Telegram Bot tokens from [@BotFather](https://t.me/BotFather). Providing multiple tokens distributes download/upload operations across tokens.
   - `bot.session_file` *(string)*: Telethon session file for the bot, relative to `TGDCFS_DATA_DIR` (default: `bot.session`).
   - `lib` *(pyrogram | telethon)*: MTProto client library used by the Telegram backend (default: `telethon`).
-  - `account` *(optional object)*: A regular Telegram user account in addition to the bots, with `session_file` (relative to `TGDCFS_DATA_DIR`), `used_to_upload` and `used_to_download` flags.
+  - `account` *(optional object)*: A regular Telegram user account in addition to the bots, with `session_file` (relative to `TGDCFS_DATA_DIR`), `used_to_upload` and `used_to_download` flags. Parts above the bot limit (up to 4,194,304,000 bytes) are only uploaded when this account has `used_to_upload: true` and Telegram Premium.
   - `delete_messages_on_remove` *(bool, default `false`)*: Delete the channel messages when a file is removed from the file system; without it messages are kept (best-effort deletion is gated on this flag).
 - **`discord`**:
   - `bot_tokens` *(list of strings)*: Discord Bot tokens from the Discord Developer Portal.
@@ -151,24 +153,26 @@ Defines top-level virtual directories exposed via WebDAV/SFTP:
   - `auto`: Uses zero-bandwidth server-side copy (forwarding) when possible, falls back to reuploading.
   - `forward`: Requires server-side forwarding (Telegram to Telegram only).
   - `reupload`: Re-downloads and streams uploaded bytes to mirror store.
-- `sync` *(inline | background | tee)*:
+- `sync` *(inline | background | tee)*: when omitted it is `background` if some mirror has to re-upload (another backend, or any Discord store involved) and `inline` otherwise (Telegram-to-Telegram forwarding).
   - `inline`: Writes wait for primary and mirror operations to finish before responding to client.
   - `background`: Responds after primary write completes; queues mirror operations to background queue.
-  - `tee`: Uploads to primary and reuploading mirrors simultaneously from incoming byte stream.
-- `strict` *(bool)*: If `true`, fails client write operation if any mirror write fails.
+  - `tee`: Uploads to primary and reuploading mirrors simultaneously from incoming byte stream; mirrors that can be filled by server-side forwarding are still copied inline.
+- `strict` *(bool, default `false`)*: If `true`, fails the client write if any mirror write fails. Requires `sync: inline`; the loader refuses it with any other `sync`.
 - `write_ack` *(primary | cache)*:
   - `primary`: Client receives 201 Created after primary channel write finishes.
   - `cache`: Client receives 201 Created as soon as upload lands in local cache disk directory. Requires `tgdcfs.cache.enabled: true` and cannot be combined with `sync: tee` or `strict: true`.
 - `read_preference` *(list of strings)*: Order in which stores are tried for reads when `read_parallel` is off. Every name must be the file system's primary or one of its mirrors.
-- `allow_shared_store` *(bool, default `false`)*: Allow a store to be the primary of one file system and a mirror of another (or shared between file systems) without the loader rejecting it.
+- `allow_shared_store` *(bool, default `false`)*: Allow a store that is the primary of one file system to also be a mirror of another. A store can never be the primary of two file systems, with or without this flag.
+- `metadata` *(object)*: `type` is `pinned_message` (default) or `github_repo` (which then requires a `github_repo` block).
 
 ---
 
 ### 4. `tgdcfs` Section
 Main application parameters:
+- **`users`** and **`server`** are required keys (like `jwt`); `users` may be an empty mapping.
 - **`users`**: User accounts for WebDAV and SFTP authentication.
   - `readonly: true`: Users can list and download, but upload/delete operations return permission denied.
-  - When `users` is empty, unauthenticated requests are served as a read-only `anonymous` user.
+  - When `users` is empty, every login is served as a read-only `anonymous` user. SFTP needs no credentials then; HTTP/WebDAV still requires an `Authorization` header, but accepts any credentials in it.
 - **`jwt`** *(required)*: Bearer-token settings used by the Manager API, the Telegram Mini App and WebDAV clients that log in via `POST /login` (see [Management API](./management-api.md)). This section has no default; the config loader refuses to start without it.
   - `secret` *(string)*: Secret used to sign the tokens. Use a long random string.
   - `algorithm` *(string)*: JWT signing algorithm (e.g. `HS256`).
@@ -181,7 +185,7 @@ Main application parameters:
   - `upload_buffer_dir` *(optional)*: Spill directory for the upload buffer (the system temp directory when empty).
   - `max_ahead_gap_mb` *(int, default `1024`)*: How far ahead of the streamed position a single write may jump before the upload fails. Within that bound writes may arrive in any order; a gap no write ever fills is zero-filled when the client closes the file.
 - **`encryption`**: Client-side AES-256-GCM settings (see [Security & At-Rest Encryption](./encryption.md)).
-- **`cache`**: Local disk cache configuration (see [Local Cache & Performance Tuning](./cache-and-performance.md)).
+- **`cache`** (off unless `enabled: true`): Local disk cache configuration (see [Local Cache & Performance Tuning](./cache-and-performance.md)).
 - **`listing`**: Folder listing behaviour (see [Local Cache & Performance Tuning](./cache-and-performance.md)).
 - **`transfer`**: Fine-tuning piece size, concurrency workers, and buffers. Every value has a default, so the section can be left out entirely:
   - `upload_workers_small` *(int, default `3`)* / `upload_workers_big` *(int, default `8`)*: Upload workers for files below/above 10 MB.
@@ -193,3 +197,9 @@ Main application parameters:
   - `connection_pool_size` *(int, default `1`)*: MTProto connections each bot opens.
   - `chunk_cache_mb` *(int, default `0` = off)*, `chunk_cache_readahead` *(int, default `2`)*, `chunk_cache_block_kb` *(int, default `1024`)*: In-memory cache for downloaded bytes.
   - `tee_buffer_mb` *(int, default `64`)*: Bytes buffered per mirror during `sync: tee` writes.
+
+---
+
+### Config written for tgfs
+
+A `config.yaml` in the tgfs layout is translated on load: the top-level `tgfs:` block is read as `tgdcfs:` (deprecation warning), `telegram:` as `backends.telegram`, `telegram.private_file_channel` becomes the primary stores, `tgfs.metadata.<channel>` names each file system and `telegram.redundancy.mirrors` lists its mirrors. This layout cannot be combined with `stores`/`filesystems`.

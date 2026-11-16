@@ -12,7 +12,7 @@ TGDCFS makes storing files in Telegram and Discord feel like using a normal hard
 
 ## 📦 Large File Support (Chunking)
 
-Chat apps like Telegram and Discord limit the maximum size of a single uploaded file (for instance, 2 GiB on Telegram or 20 MB on Discord).
+Chat apps like Telegram and Discord limit the maximum size of a single uploaded file (for instance, about 2 GB on Telegram, or 10 to 100 MB on Discord depending on the configured limit).
 
 **How TGDCFS solves this for you:**
 - When you upload a large file (e.g., a 10 GB movie), TGDCFS automatically splits the file into smaller **chunks** or parts.

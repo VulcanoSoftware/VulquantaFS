@@ -17,7 +17,7 @@ Before starting, ensure your system has the following installed:
 - **Git**: Version 2.30+
 - **Python**: Version **3.13** or higher (`python3 --version`)
 - **Poetry**: Version **2.0** or higher (`poetry --version`)
-- **Node.js**: Version **20.0+** (only required if working on the Next.js frontend or Docusaurus site)
+- **Node.js**: Version **24+** for the Next.js frontend (`tgdcfs-gh-pages`), **20+** for the Docusaurus site; only needed when working on those
 
 ---
 

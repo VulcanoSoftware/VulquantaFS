@@ -137,6 +137,12 @@ sudo systemctl enable --now tgdcfs
 
 ---
 
+## TLS
+
+The HTTP server (WebDAV, Manager API, `/login`) has no TLS settings. Terminate TLS in a reverse proxy in front of port `1900` if clients connect over untrusted networks. SFTP is encrypted by SSH itself.
+
+---
+
 ## Data Directory Structure
 
 Inside `$TGDCFS_DATA_DIR` (e.g. `/home/tgdcfs/.tgdcfs`), TGDCFS maintains:

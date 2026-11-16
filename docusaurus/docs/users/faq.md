@@ -22,7 +22,7 @@ When uploading files over WebDAV or SFTP, your client finishes sending data to T
 ---
 
 ### Can I share files with others?
-Yes! You can share access by providing a read-only WebDAV/SFTP user account, or by leaving `tgdcfs.users` empty, which serves unauthenticated visitors as a read-only `anonymous` user. The Mini App itself does not generate public share links; anyone you share with connects with their own WebDAV/SFTP credentials.
+Yes! You can share access by providing a read-only WebDAV/SFTP user account, or by leaving `tgdcfs.users` empty, which serves every login (any credentials over WebDAV, none over SFTP) as a read-only `anonymous` user. The Mini App itself does not generate public share links; anyone you share with connects with their own WebDAV/SFTP credentials.
 
 ---
 

@@ -27,8 +27,8 @@ The following clients are officially tested and verified:
 WebDAV allows your computer or phone to mount TGDCFS like a cloud folder or external drive.
 
 ### Connection Details Needed
-- **Server URL**: `http://your-server-ip:1900/webdav` (or HTTPS if configured)
-- **Username**: Your configured username (or leave blank if anonymous access is enabled)
+- **Server URL**: `http://your-server-ip:1900/webdav` (the server itself speaks plain HTTP; use a TLS reverse proxy for HTTPS)
+- **Username**: Your configured username (when `users` is empty, any username works and you get read-only access; the client must still send credentials)
 - **Password**: Your configured password
 
 ---
@@ -67,7 +67,7 @@ WebDAV allows your computer or phone to mount TGDCFS like a cloud folder or exte
 
 ## 2. Connecting via SFTP
 
-TGDCFS provides a full-featured SFTP server on port `2222` (or your configured port).
+TGDCFS provides an SFTP server (SCP is accepted too) on port `2222` (or your configured port). File permissions, ownership and timestamps are accepted but not stored, and symbolic and hard links are not supported.
 
 ### Connection Details Needed
 - **Protocol**: SFTP (SSH File Transfer Protocol)
@@ -117,6 +117,10 @@ rclone ls tgdcfs-sftp:
 ```
 
 ---
+
+## Locking
+
+WebDAV `LOCK` requests are answered with a fixed dummy lock token; no real locking takes place, so two clients writing the same file are not protected from each other.
 
 ## Common Connection Troubleshooting
 

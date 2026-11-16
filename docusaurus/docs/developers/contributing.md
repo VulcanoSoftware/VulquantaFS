@@ -125,7 +125,7 @@ Go to the [Xyvran/tgdcfs GitHub Repository](https://github.com/Xyvran/tgdcfs) an
 
 ## Deep Dive: GitHub Actions CI/CD Workflows
 
-TGDCFS uses 5 distinct GitHub Actions workflows in `.github/workflows/`:
+TGDCFS uses 6 GitHub Actions workflows in `.github/workflows/`: the five described below plus `badge-sync.yml` ("Sync README badges", see [Fork Setup](./fork-setup.md)).
 
 ### 1. Test and Coverage (`.github/workflows/test.yml`)
 - **Triggers**: On every `push` (all branches) and `pull_request` targeting `master`.
