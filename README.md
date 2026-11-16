@@ -15,7 +15,7 @@
 > set the repository variable `DOCKERHUB_NAMESPACE` as described in
 > [Fork setup](docs/design/fork-setup.md).
 
-# tgdcfs
+# TGDCFS
 
 Telegram and Discord as storage backends behind one WebDAV and SFTP
 server.
