@@ -2,18 +2,29 @@ import {themes as prismThemes} from 'prism-react-renderer';
 import type {Config} from '@docusaurus/types';
 import type * as Preset from '@docusaurus/preset-classic';
 
-const baseUrl = process.env.DOCS_BASE_URL || (process.env.VERCEL ? '/' : '/tgdcfs/docs/');
+// The documentation is hosted on GitHub Pages next to the web frontend,
+// under the same repository's coordinates: https://<owner>.github.io/<repo>/docs/.
+// Everything below follows GITHUB_REPOSITORY (set by the Pages workflow), so a
+// fork publishes its own docs without editing this file.
+const [owner, repo] = (process.env.GITHUB_REPOSITORY || 'Xyvran/tgdcfs').split('/');
+const ownerLower = owner.toLowerCase();
+const repoLower = repo.toLowerCase();
+const pagesHost = `https://${ownerLower}.github.io`;
+const pagesUrl = `${pagesHost}/${repoLower}`;
+const dockerHubNamespace = (process.env.DOCKERHUB_NAMESPACE || ownerLower).toLowerCase();
+
+const baseUrl = process.env.DOCS_BASE_URL || `/${repoLower}/docs/`;
 
 const config: Config = {
   title: 'TGDCFS',
   tagline: 'Telegram & Discord as WebDAV and SFTP Storage Backends',
   favicon: 'img/favicon.ico',
 
-  url: process.env.VERCEL ? 'https://tgdcfs-docs.vercel.app' : 'https://xyvran.github.io',
+  url: pagesHost,
   baseUrl: baseUrl,
 
-  organizationName: 'Xyvran',
-  projectName: 'tgdcfs',
+  organizationName: owner,
+  projectName: repo,
 
   onBrokenLinks: 'throw',
 
@@ -35,7 +46,7 @@ const config: Config = {
         docs: {
           sidebarPath: './sidebars.ts',
           routeBasePath: '/',
-          editUrl: 'https://github.com/Xyvran/tgdcfs/tree/master/docusaurus/',
+          editUrl: `https://github.com/${owner}/${repo}/tree/master/docusaurus/`,
         },
         blog: false,
         theme: {
@@ -76,7 +87,7 @@ const config: Config = {
           label: '💻 Developers',
         },
         {
-          href: 'https://github.com/Xyvran/tgdcfs',
+          href: `https://github.com/${owner}/${repo}`,
           label: 'GitHub',
           position: 'right',
         },
@@ -107,15 +118,15 @@ const config: Config = {
           items: [
             {
               label: 'GitHub Repository',
-              href: 'https://github.com/Xyvran/tgdcfs',
+              href: `https://github.com/${owner}/${repo}`,
             },
             {
               label: 'Config Generator',
-              href: 'https://xyvran.github.io/tgdcfs/config-generator/',
+              href: `${pagesUrl}/config-generator/`,
             },
             {
               label: 'Getting Started Guide',
-              href: 'https://xyvran.github.io/tgdcfs/getting-started/',
+              href: `${pagesUrl}/getting-started/`,
             },
           ],
         },
@@ -124,11 +135,11 @@ const config: Config = {
           items: [
             {
               label: 'Apache 2.0 License',
-              href: 'https://github.com/Xyvran/tgdcfs/blob/master/LICENSE',
+              href: `https://github.com/${owner}/${repo}/blob/master/LICENSE`,
             },
             {
               label: 'Docker Hub',
-              href: 'https://hub.docker.com/r/xyvran/tgdcfs',
+              href: `https://hub.docker.com/r/${dockerHubNamespace}/tgdcfs`,
             },
           ],
         },
