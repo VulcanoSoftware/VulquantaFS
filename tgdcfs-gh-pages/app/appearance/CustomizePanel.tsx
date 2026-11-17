@@ -61,6 +61,7 @@ export function CustomizePanel() {
     setAccent,
     setBackground,
     setEffects,
+    setFullWidth,
     resetAppearance,
   } = useAppearance();
   const [anchorEl, setAnchorEl] = useState<HTMLElement | null>(null);
@@ -185,6 +186,25 @@ export function CustomizePanel() {
           </ToggleButton>
           <ToggleButton value="solid" sx={toggleSx}>
             Solid
+          </ToggleButton>
+        </ToggleButtonGroup>
+
+        <Typography sx={labelSx}>Layout width</Typography>
+        <ToggleButtonGroup
+          exclusive
+          size="small"
+          value={settings.fullWidth ? "full" : "normal"}
+          onChange={(_, value: "full" | "normal" | null) => {
+            if (value !== null) setFullWidth(value === "full");
+          }}
+          fullWidth
+          sx={{ mb: 2.5 }}
+        >
+          <ToggleButton value="normal" sx={toggleSx}>
+            Normal
+          </ToggleButton>
+          <ToggleButton value="full" sx={toggleSx}>
+            Full width
           </ToggleButton>
         </ToggleButtonGroup>
 

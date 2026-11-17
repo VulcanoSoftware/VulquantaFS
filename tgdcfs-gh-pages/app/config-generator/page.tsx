@@ -722,7 +722,10 @@ export default function ConfigGenerator() {
 
   return (
     <div className="dcfs-page">
-      <Container maxWidth="lg" sx={{ py: 6 }}>
+      <Container
+        maxWidth={mounted && settings.fullWidth ? false : "lg"}
+        sx={{ py: 6 }}
+      >
         <Typography
           variant="h3"
           component="h1"
