@@ -24,6 +24,7 @@ import { useCallback, useEffect, useState } from "react";
 import { Prism as SyntaxHighlighter } from "react-syntax-highlighter";
 import { vscDarkPlus } from "react-syntax-highlighter/dist/esm/styles/prism";
 import { DOCKERHUB_IMAGE, GHCR_IMAGE, PAGES_URL } from "../lib/coordinates";
+import { CustomizePanel } from "../appearance/CustomizePanel";
 import { BotTokenField } from "./components/BotTokenField";
 import { ConfigTextField } from "./components/ConfigTextField";
 import { DockerRunPanel } from "./components/DockerRunPanel";
@@ -713,10 +714,17 @@ export default function ConfigGenerator() {
   };
 
   return (
-    <Container maxWidth="lg" sx={{ py: 4 }}>
-      <Typography variant="h3" component="h1" gutterBottom align="center">
-        TGDCFS Config Generator
-      </Typography>
+    <div className="dcfs-page">
+      <Container maxWidth="lg" sx={{ py: 6 }}>
+        <Typography
+          variant="h3"
+          component="h1"
+          gutterBottom
+          align="center"
+          className="dcfs-gradient-text"
+        >
+          TGDCFS Config Generator
+        </Typography>
 
       <Typography
         variant="h6"
@@ -758,7 +766,7 @@ export default function ConfigGenerator() {
         }}
       >
         <Box sx={{ flex: 1 }}>
-          <Paper sx={{ p: 3 }}>
+          <Paper className="dcfs-glass dcfs-fade-in" sx={{ p: { xs: 2, md: 4 } }}>
             <FormSection title="Stores" showDivider={false}>
               <Typography variant="body2" color="text.secondary">
                 A store is one channel of one backend: a private Telegram
@@ -1816,6 +1824,7 @@ export default function ConfigGenerator() {
 
         <Box sx={{ width: { xs: "100%", md: "400px" }, flexShrink: 0 }}>
           <Paper
+            className="dcfs-glass"
             sx={{
               p: 3,
               position: "sticky",
@@ -1862,14 +1871,55 @@ export default function ConfigGenerator() {
               />
             </Box>
 
-            <Card variant="outlined">
-              <CardContent sx={{ p: 0 }}>
+            <Card
+              variant="outlined"
+              sx={{
+                borderColor: "rgba(148, 163, 184, 0.2)",
+                backgroundColor: "rgba(10, 16, 30, 0.8)",
+                borderRadius: 2,
+                overflow: "hidden",
+              }}
+            >
+              <CardContent sx={{ p: 0, "&:last-child": { pb: 0 } }}>
+                <Box
+                  sx={{
+                    display: "flex",
+                    alignItems: "center",
+                    gap: 0.5,
+                    px: 1.5,
+                    py: 1,
+                    borderBottom: "1px solid rgba(148, 163, 184, 0.15)",
+                  }}
+                >
+                  {["#ff5f57", "#febc2e", "#28c840"].map((color) => (
+                    <Box
+                      key={color}
+                      sx={{
+                        width: 10,
+                        height: 10,
+                        borderRadius: "50%",
+                        backgroundColor: color,
+                      }}
+                    />
+                  ))}
+                  <Typography
+                    variant="caption"
+                    sx={{
+                      ml: 1,
+                      color: "#64748b",
+                      fontFamily: "var(--font-geist-mono), monospace",
+                    }}
+                  >
+                    config.yaml
+                  </Typography>
+                </Box>
                 <SyntaxHighlighter
                   language="yaml"
                   style={vscDarkPlus}
                   customStyle={{
                     fontSize: "0.75rem",
                     margin: 0,
+                    background: "transparent",
                   }}
                 >
                   {generateYaml()}
@@ -1900,6 +1950,8 @@ export default function ConfigGenerator() {
           </Paper>
         </Box>
       </Box>
-    </Container>
+      </Container>
+      <CustomizePanel />
+    </div>
   );
 }

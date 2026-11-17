@@ -218,10 +218,11 @@ export function DockerRunPanel({
       )}
       <Box
         sx={{
-          bgcolor: "#1e1e1e",
+          bgcolor: "rgba(10, 16, 30, 0.8)",
           color: "grey.100",
           p: 2,
-          borderRadius: 1,
+          borderRadius: 2,
+          border: "1px solid rgba(var(--dcfs-accent-rgb), 0.25)",
         }}
       >
         <Typography
