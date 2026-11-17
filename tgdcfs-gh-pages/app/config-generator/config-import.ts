@@ -19,8 +19,10 @@ import {
   ConfigData,
   DiscordConfig,
   FilesystemConfig,
+  GITLAB_DEFAULTS,
   LISTING_DEFAULTS,
   ListingConfig,
+  MetadataEntry,
   MetadataType,
   MirrorMode,
   StoreConfig,
@@ -31,6 +33,7 @@ import {
   defaultConfig,
   needsReupload,
   newFilesystem,
+  newMetadataEntry,
 } from "./types";
 
 export interface ImportedConfig {
@@ -109,27 +112,80 @@ class Notes {
   }
 }
 
-const METADATA_TYPES: readonly MetadataType[] = ["pinned_message", "github_repo"];
+const METADATA_TYPES: readonly MetadataType[] = [
+  "pinned_message",
+  "github_repo",
+  "gitlab_repo",
+];
 const MIRROR_MODES: readonly MirrorMode[] = ["auto", "forward", "reupload"];
 const SYNC_MODES: readonly SyncMode[] = ["inline", "background", "tee"];
 const WRITE_ACKS: readonly WriteAck[] = ["primary", "cache"];
 
-const readMetadata = (
+// One metadata store, as the primary ``metadata`` block or as an entry
+// of ``metadata_mirrors``.
+const readMetadataEntry = (
   path: string,
   raw: unknown,
   notes: Notes
-): FilesystemConfig["metadata"] => {
+): MetadataEntry => {
   const data = asMapping(raw);
-  notes.unknownKeys(path, data, ["name", "type", "github_repo"]);
+  notes.unknownKeys(path, data, [
+    "name",
+    "type",
+    "store",
+    "github_repo",
+    "gitlab_repo",
+  ]);
+  const entry = newMetadataEntry();
+  entry.type = notes.choice(
+    `${path}.type`,
+    data.type,
+    METADATA_TYPES,
+    "pinned_message"
+  );
+  entry.store = asString(data.store).trim();
   const github = asMapping(data.github_repo);
-  return {
-    type: notes.choice(`${path}.type`, data.type, METADATA_TYPES, "pinned_message"),
-    github_repo: {
-      repo: asString(github.repo),
-      commit: asString(github.commit, "master"),
-      access_token: asString(github.access_token),
-    },
+  notes.unknownKeys(`${path}.github_repo`, github, [
+    "repo",
+    "commit",
+    "access_token",
+  ]);
+  entry.github_repo = {
+    repo: asString(github.repo),
+    commit: asString(github.commit, "master"),
+    access_token: asString(github.access_token),
   };
+  const gitlab = asMapping(data.gitlab_repo);
+  notes.unknownKeys(`${path}.gitlab_repo`, gitlab, [
+    "repo",
+    "branch",
+    "access_token",
+    "base_url",
+    "file_path",
+  ]);
+  entry.gitlab_repo = {
+    repo: asString(gitlab.repo),
+    branch: asString(gitlab.branch, "master"),
+    access_token: asString(gitlab.access_token),
+    base_url: asString(gitlab.base_url, GITLAB_DEFAULTS.base_url),
+    file_path: asString(gitlab.file_path, GITLAB_DEFAULTS.file_path),
+  };
+  return entry;
+};
+
+const readMetadataMirrors = (
+  path: string,
+  raw: unknown,
+  notes: Notes
+): MetadataEntry[] => {
+  if (raw === undefined) return [];
+  if (!Array.isArray(raw)) {
+    notes.add(`${path} must be a list; it was left out`);
+    return [];
+  }
+  return raw.map((entry, index) =>
+    readMetadataEntry(`${path}[${index}]`, entry, notes)
+  );
 };
 
 // ``stores`` and ``filesystems`` as written today.
@@ -170,6 +226,7 @@ const readStoresAndFilesystems = (
       "read_sources",
       "allow_shared_store",
       "metadata",
+      "metadata_mirrors",
     ]);
     const fs = newFilesystem(name, asString(data.primary).trim());
     fs.mirrors = asList(data.mirrors);
@@ -184,7 +241,12 @@ const readStoresAndFilesystems = (
     fs.read_parallel = asBoolean(data.read_parallel, false);
     fs.read_sources = asList(data.read_sources);
     fs.allow_shared_store = asBoolean(data.allow_shared_store, false);
-    fs.metadata = readMetadata(`${path}.metadata`, data.metadata, notes);
+    fs.metadata = readMetadataEntry(`${path}.metadata`, data.metadata, notes);
+    fs.metadata_mirrors = readMetadataMirrors(
+      `${path}.metadata_mirrors`,
+      data.metadata_mirrors,
+      notes
+    );
     // Left out, sync is derived from the stores, as the loader does it.
     const derived: SyncMode =
       needsReupload(fs, stores) && !fs.strict ? "background" : "inline";
@@ -282,7 +344,7 @@ const readLegacyStoresAndFilesystems = (
     // tgfs allowed a mirror to be another channel's primary; keep that
     // where it is in use.
     fs.allow_shared_store = mirrors.some((m) => channels.includes(m));
-    fs.metadata = readMetadata(`tgdcfs.metadata.${channel}`, meta, notes);
+    fs.metadata = readMetadataEntry(`tgdcfs.metadata.${channel}`, meta, notes);
     // tgfs always mirrored inside the write. The form leaves the choice
     // to the loader, which copies a re-uploading mirror in the background.
     fs.sync = needsReupload(fs, stores) && !fs.strict ? "background" : "inline";
