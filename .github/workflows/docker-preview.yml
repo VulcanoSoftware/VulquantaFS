@@ -113,6 +113,11 @@ jobs:
           load: true
           push: false
           tags: ${{ steps.prep.outputs.image }}
+          # next.config.ts derives the Docker images and the Pages URL shown
+          # in the web frontend from these; the backend image ignores them.
+          build-args: |
+            GITHUB_REPOSITORY=${{ github.repository }}
+            DOCKERHUB_NAMESPACE=${{ env.DOCKERHUB_NAMESPACE }}
           cache-from: type=gha
           cache-to: type=gha,mode=max,ignore-error=true
 
@@ -188,6 +193,11 @@ jobs:
           platforms: linux/amd64
           push: true
           tags: ${{ steps.prep.outputs.push_tags }}
+          # next.config.ts derives the Docker images and the Pages URL shown
+          # in the web frontend from these; the backend image ignores them.
+          build-args: |
+            GITHUB_REPOSITORY=${{ github.repository }}
+            DOCKERHUB_NAMESPACE=${{ env.DOCKERHUB_NAMESPACE }}
           # Everything is already in the cache from the build above, so this
           # only uploads layers.
           cache-from: type=gha

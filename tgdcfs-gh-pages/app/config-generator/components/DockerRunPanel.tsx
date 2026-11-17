@@ -17,9 +17,9 @@ type Registry = "dockerhub" | "ghcr";
 type Engine = "docker" | "podman";
 
 interface DockerRunPanelProps {
-  // Docker Hub image without a tag, e.g. "atomicdogohio/tgdcfs".
+  // Docker Hub image without a tag, e.g. "vulcanosoftware/tgdcfs".
   image: string;
-  // GHCR image without a tag, e.g. "ghcr.io/atomicdogohio/tgdcfs".
+  // GHCR image without a tag, e.g. "ghcr.io/vulcanosoftware/tgdcfs/tgdcfs".
   ghcrImage: string;
   // Container name and the directory the image reads its config from.
   containerName: string;

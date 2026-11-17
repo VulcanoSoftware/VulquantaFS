@@ -109,3 +109,8 @@ jobs:
           platforms: linux/amd64,linux/arm64
           push: true
           tags: ${{ steps.tags.outputs.tags }}
+          # next.config.ts derives the Docker images and the Pages URL shown
+          # in the web frontend from these; the backend image ignores them.
+          build-args: |
+            GITHUB_REPOSITORY=${{ github.repository }}
+            DOCKERHUB_NAMESPACE=${{ env.DOCKERHUB_NAMESPACE }}

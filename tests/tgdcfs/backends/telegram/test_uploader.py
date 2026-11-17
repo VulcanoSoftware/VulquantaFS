@@ -402,7 +402,11 @@ class TestErrorHandling:
 
         await uploader.upload()
 
-        sleep.assert_awaited_once_with(17.0)
+        # The patch replaces asyncio.sleep for the whole process, so any other
+        # sleep that happens to run meanwhile (a polling loop of a task another
+        # test left behind) is recorded too. Only the flood wait is asserted.
+        flood_waits = [c for c in sleep.await_args_list if c == mocker.call(17.0)]
+        assert len(flood_waits) == 1
 
 
 class TestConcurrencyAndWorkers:
