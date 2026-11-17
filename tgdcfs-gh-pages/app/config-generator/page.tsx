@@ -59,6 +59,9 @@ import {
   isValidStoreName,
   needsReupload,
   newFilesystem,
+  newMetadataEntry,
+  GITLAB_DEFAULTS,
+  MetadataEntry,
 } from "./types";
 
 // Type-safe path mapping for updateConfig
@@ -82,6 +85,48 @@ type ConfigUpdatePaths = {
   "tgdcfs.encryption": EncryptionConfig;
   "tgdcfs.cache": CacheConfig;
   "tgdcfs.listing": ListingConfig;
+};
+
+// One metadata store as it reaches the YAML: only the fields of the
+// chosen type, and the GitLab base_url/file_path only when they differ
+// from the loader's defaults.
+type MetadataEntryYaml = {
+  type: string;
+  store?: string;
+  github_repo?: { repo: string; commit: string; access_token: string };
+  gitlab_repo?: {
+    repo: string;
+    branch: string;
+    access_token: string;
+    base_url?: string;
+    file_path?: string;
+  };
+};
+
+const metadataEntryYaml = (entry: MetadataEntry): MetadataEntryYaml => {
+  const yaml: MetadataEntryYaml = { type: entry.type };
+  if (entry.type === "pinned_message" && entry.store.trim() !== "") {
+    yaml.store = entry.store.trim();
+  }
+  if (entry.type === "github_repo") {
+    yaml.github_repo = entry.github_repo;
+  }
+  if (entry.type === "gitlab_repo") {
+    const baseUrl = entry.gitlab_repo.base_url.trim();
+    const filePath = entry.gitlab_repo.file_path.trim();
+    yaml.gitlab_repo = {
+      repo: entry.gitlab_repo.repo,
+      branch: entry.gitlab_repo.branch,
+      access_token: entry.gitlab_repo.access_token,
+      ...(baseUrl !== "" && baseUrl !== GITLAB_DEFAULTS.base_url
+        ? { base_url: baseUrl }
+        : {}),
+      ...(filePath !== "" && filePath !== GITLAB_DEFAULTS.file_path
+        ? { file_path: filePath }
+        : {}),
+    };
+  }
+  return yaml;
 };
 
 const generateRandomSecret = (): string => {
@@ -384,21 +429,46 @@ export default function ConfigGenerator() {
     updateConfig("filesystems", filesystems);
   };
 
-  const updateFilesystemGitHubRepo = (
+  const updateFilesystemMetadata = (index: number, entry: MetadataEntry) => {
+    const filesystems = [...config.filesystems];
+    filesystems[index] = { ...filesystems[index], metadata: entry };
+    updateConfig("filesystems", filesystems);
+  };
+
+  const updateFilesystemMetadataMirror = (
     index: number,
-    field: keyof FilesystemConfig["metadata"]["github_repo"],
-    value: string
+    mirrorIndex: number,
+    entry: MetadataEntry
+  ) => {
+    const filesystems = [...config.filesystems];
+    const mirrors = [...filesystems[index].metadata_mirrors];
+    mirrors[mirrorIndex] = entry;
+    filesystems[index] = { ...filesystems[index], metadata_mirrors: mirrors };
+    updateConfig("filesystems", filesystems);
+  };
+
+  const addFilesystemMetadataMirror = (index: number) => {
+    const filesystems = [...config.filesystems];
+    filesystems[index] = {
+      ...filesystems[index],
+      metadata_mirrors: [
+        ...filesystems[index].metadata_mirrors,
+        newMetadataEntry(),
+      ],
+    };
+    updateConfig("filesystems", filesystems);
+  };
+
+  const removeFilesystemMetadataMirror = (
+    index: number,
+    mirrorIndex: number
   ) => {
     const filesystems = [...config.filesystems];
     filesystems[index] = {
       ...filesystems[index],
-      metadata: {
-        ...filesystems[index].metadata,
-        github_repo: {
-          ...filesystems[index].metadata.github_repo,
-          [field]: value,
-        },
-      },
+      metadata_mirrors: filesystems[index].metadata_mirrors.filter(
+        (_, i) => i !== mirrorIndex
+      ),
     };
     updateConfig("filesystems", filesystems);
   };
@@ -477,10 +547,8 @@ export default function ConfigGenerator() {
         read_parallel?: boolean;
         read_sources?: string[];
         allow_shared_store?: boolean;
-        metadata: {
-          type: string;
-          github_repo?: { repo: string; commit: string; access_token: string };
-        };
+        metadata: MetadataEntryYaml;
+        metadata_mirrors?: MetadataEntryYaml[];
       };
     } = {};
     config.filesystems
@@ -496,6 +564,12 @@ export default function ConfigGenerator() {
           needsReupload(fs, config.stores) && !fs.strict ? "background" : "inline";
         const writeBack =
           config.tgdcfs.cache.enabled && !fs.strict && fs.write_ack === "cache";
+        const metadataMirrors = fs.metadata_mirrors.filter(
+          (entry) =>
+            entry.type !== "pinned_message" ||
+            entry.store.trim() === "" ||
+            entry.store.trim() in stores
+        );
         filesystems[fs.name.trim()] = {
           primary: fs.primary,
           ...(mirrors.length > 0
@@ -516,19 +590,29 @@ export default function ConfigGenerator() {
               }
             : {}),
           ...(writeBack ? { write_ack: "cache" } : {}),
-          metadata: {
-            type: fs.metadata.type,
-            ...(fs.metadata.type === "github_repo"
-              ? { github_repo: fs.metadata.github_repo }
-              : {}),
-          },
+          metadata: metadataEntryYaml(fs.metadata),
+          // A pinned mirror naming a store that is gone from the config
+          // would fail to load; dropped like a file mirror would be.
+          ...(metadataMirrors.length > 0
+            ? {
+                metadata_mirrors: metadataMirrors.map(metadataEntryYaml),
+              }
+            : {}),
         };
       });
 
-    const pinnedOnTelegram = config.filesystems.some(
-      (fs) =>
-        fs.metadata.type === "pinned_message" &&
-        config.stores.find((s) => s.name === fs.primary)?.backend === "telegram"
+    // The user account is needed for pinning, so also when a metadata
+    // mirror pins the tree in a Telegram store.
+    const pinnedOnTelegram = config.filesystems.some((fs) =>
+      [fs.metadata, ...fs.metadata_mirrors].some((entry) => {
+        if (entry.type !== "pinned_message") return false;
+        const storeName =
+          entry.store.trim() !== "" ? entry.store.trim() : fs.primary;
+        return (
+          config.stores.find((s) => s.name === storeName)?.backend ===
+          "telegram"
+        );
+      })
     );
 
     const configForYaml = {
@@ -831,8 +915,15 @@ export default function ConfigGenerator() {
                   onUpdate={(field, value) =>
                     updateFilesystem(index, field, value)
                   }
-                  onUpdateGitHubRepo={(field, value) =>
-                    updateFilesystemGitHubRepo(index, field, value)
+                  onUpdateMetadata={(entry) =>
+                    updateFilesystemMetadata(index, entry)
+                  }
+                  onUpdateMetadataMirror={(mirrorIndex, entry) =>
+                    updateFilesystemMetadataMirror(index, mirrorIndex, entry)
+                  }
+                  onAddMetadataMirror={() => addFilesystemMetadataMirror(index)}
+                  onRemoveMetadataMirror={(mirrorIndex) =>
+                    removeFilesystemMetadataMirror(index, mirrorIndex)
                   }
                   onDelete={
                     config.filesystems.length > 1

@@ -11,12 +11,56 @@ export interface StoreConfig {
   channel: string;
 }
 
-export type MetadataType = "pinned_message" | "github_repo";
+export type MetadataType = "pinned_message" | "github_repo" | "gitlab_repo";
 export type MirrorMode = "auto" | "forward" | "reupload";
 export type SyncMode = "inline" | "background" | "tee";
 // When a write is answered: once the primary store has it, or once the
 // local cache has it and a worker moves it into the stores (write-back).
 export type WriteAck = "primary" | "cache";
+
+// One metadata store: the primary one or an entry of metadata_mirrors.
+// Every field is kept on the form so switching the type never loses what
+// was typed; only the fields of the chosen type reach the YAML.
+export interface MetadataEntry {
+  type: MetadataType;
+  // pinned_message only: the store whose channel holds the pinned
+  // document; empty means the file system's primary store. A pinned copy
+  // in a Telegram store and one in a Discord store are two separate
+  // metadata stores this way.
+  store: string;
+  github_repo: {
+    repo: string;
+    commit: string;
+    access_token: string;
+  };
+  gitlab_repo: {
+    repo: string;
+    branch: string;
+    access_token: string;
+    base_url: string;
+    file_path: string;
+  };
+}
+
+// The loader's defaults; base_url and file_path are left out of the YAML
+// when they equal them.
+export const GITLAB_DEFAULTS = {
+  base_url: "https://gitlab.com",
+  file_path: "metadata.json",
+};
+
+export const newMetadataEntry = (): MetadataEntry => ({
+  type: "pinned_message",
+  store: "",
+  github_repo: { repo: "", commit: "master", access_token: "" },
+  gitlab_repo: {
+    repo: "",
+    branch: "master",
+    access_token: "",
+    base_url: GITLAB_DEFAULTS.base_url,
+    file_path: GITLAB_DEFAULTS.file_path,
+  },
+});
 
 export interface FilesystemConfig {
   name: string;
@@ -31,14 +75,11 @@ export interface FilesystemConfig {
   read_parallel: boolean;
   read_sources: string[];
   allow_shared_store: boolean;
-  metadata: {
-    type: MetadataType;
-    github_repo: {
-      repo: string;
-      commit: string;
-      access_token: string;
-    };
-  };
+  // The metadata stores form a redundancy set of their own: the primary
+  // metadata store plus every mirror holds a full copy of the directory
+  // tree, and a read fails over to the next one when a store fails.
+  metadata: MetadataEntry;
+  metadata_mirrors: MetadataEntry[];
 }
 
 export interface DiscordConfig {
@@ -177,10 +218,8 @@ export const newFilesystem = (
   read_parallel: false,
   read_sources: [],
   allow_shared_store: false,
-  metadata: {
-    type: "pinned_message",
-    github_repo: { repo: "", commit: "master", access_token: "" },
-  },
+  metadata: newMetadataEntry(),
+  metadata_mirrors: [],
 });
 
 // The form as it opens: one Telegram store, one file system on it, and
