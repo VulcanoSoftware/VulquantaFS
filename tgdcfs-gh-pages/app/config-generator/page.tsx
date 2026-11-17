@@ -334,12 +334,20 @@ export default function ConfigGenerator() {
     stores[index] = { ...stores[index], [field]: value };
     let filesystems = config.filesystems;
     if (field === "name" && oldName !== value) {
-      // Keep file systems pointing at the renamed store.
+      // Keep file systems pointing at the renamed store, including the
+      // pinned-message metadata stores that name one.
       filesystems = config.filesystems.map((fs) => ({
         ...fs,
         primary: fs.primary === oldName ? value : fs.primary,
         mirrors: fs.mirrors.map((m) => (m === oldName ? value : m)),
         read_sources: fs.read_sources.map((m) => (m === oldName ? value : m)),
+        metadata:
+          fs.metadata.store === oldName
+            ? { ...fs.metadata, store: value }
+            : fs.metadata,
+        metadata_mirrors: fs.metadata_mirrors.map((m) =>
+          m.store === oldName ? { ...m, store: value } : m
+        ),
       }));
     }
     setConfig({ ...config, stores, filesystems });
@@ -546,6 +554,73 @@ export default function ConfigGenerator() {
         "A mirror is the primary of another file system; allow the shared store below or pick another mirror"
       );
     }
+    return errors;
+  };
+
+  // The key the loader builds for one metadata store; two entries with the
+  // same key would overwrite each other's writes.
+  const metadataStoreKey = (entry: MetadataEntry, primaryName: string): string => {
+    if (entry.type === "pinned_message") {
+      return `pinned_message@${entry.store.trim() || primaryName}`;
+    }
+    if (entry.type === "github_repo") {
+      return `github_repo@${entry.github_repo.repo.trim()}@${entry.github_repo.commit.trim()}`;
+    }
+    return `gitlab_repo@${entry.gitlab_repo.repo.trim()}@${entry.gitlab_repo.branch.trim()}`;
+  };
+
+  // The rules the loader enforces on the metadata stores of one file
+  // system, checked live so an impossible combination is visible before
+  // the config is generated.
+  const getFilesystemMetadataErrors = (index: number): string[] => {
+    const fs = config.filesystems[index];
+    const errors: string[] = [];
+    const primaryName = fs.primary.trim();
+    const fsStores = [fs.primary, ...fs.mirrors];
+    const seenPinned = new Set<string>();
+    const seenKeys = new Set<string>();
+    [fs.metadata, ...fs.metadata_mirrors].forEach((entry, i) => {
+      const label = i === 0 ? "Primary metadata store" : `Metadata mirror ${i}`;
+      if (entry.type === "pinned_message") {
+        const target = entry.store.trim() || primaryName;
+        if (primaryName !== "") {
+          if (seenPinned.has(target)) {
+            errors.push(
+              `${label}: two pinned-message stores point at store '${target}'; a channel holds only one pinned message`
+            );
+          } else {
+            seenPinned.add(target);
+          }
+          if (!fsStores.includes(target)) {
+            errors.push(
+              `${label}: store '${target}' is neither the primary nor a mirror of this file system`
+            );
+          }
+        }
+      }
+      if (
+        entry.type === "github_repo" &&
+        (!entry.github_repo.repo.trim() || !entry.github_repo.access_token.trim())
+      ) {
+        errors.push(
+          `${label}: the GitHub repository needs a repository and an access token`
+        );
+      }
+      if (
+        entry.type === "gitlab_repo" &&
+        (!entry.gitlab_repo.repo.trim() || !entry.gitlab_repo.access_token.trim())
+      ) {
+        errors.push(
+          `${label}: the GitLab repository needs a repository and an access token`
+        );
+      }
+      const key = metadataStoreKey(entry, primaryName);
+      if (seenKeys.has(key)) {
+        errors.push(`${label}: metadata store '${key}' is listed twice`);
+      } else {
+        seenKeys.add(key);
+      }
+    });
     return errors;
   };
 
@@ -956,6 +1031,7 @@ export default function ConfigGenerator() {
                   nameErrors={getFilesystemNameErrors(index)}
                   primaryErrors={getFilesystemPrimaryErrors(index)}
                   mirrorErrors={getFilesystemMirrorErrors(index)}
+                  metadataErrors={getFilesystemMetadataErrors(index)}
                   needsSharedStore={filesystemNeedsSharedStore(index)}
                   cacheEnabled={config.tgdcfs.cache.enabled}
                 />

@@ -49,7 +49,15 @@ the fact on the commits that shipped them.
   layout automatically on the first push. The config generator offers
   the layout for both hosts and reads it back from an existing config.
 - The config generator also gained the `file_path` option for GitHub's
-  document layout, matching the GitLab store.
+  document layout, matching the GitLab store. The file path is only shown
+  (and written) for the document layout, where it means something. The
+  generator now checks the metadata stores of a file system the way the
+  loader does -- two pinned-message stores on one store, the same
+  repository twice, a pinned store outside the file system, a missing
+  repository or access token -- and shows the problem inline; the store
+  picker of a pinned-message store only offers the file system's own
+  stores, and renaming a store keeps the pinned-message stores pointing
+  at it.
 - The Docker images are published to GHCR (`ghcr.io/<owner>/tgdcfs` and
   `ghcr.io/<owner>/tgdcfs-fe`) next to Docker Hub, with the same `latest`,
   commit, `preview` and release tags. GHCR publishing uses the workflow's

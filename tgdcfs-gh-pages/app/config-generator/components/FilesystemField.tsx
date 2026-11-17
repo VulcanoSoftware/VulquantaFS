@@ -41,6 +41,7 @@ interface FilesystemFieldProps {
   nameErrors?: string[];
   primaryErrors?: string[];
   mirrorErrors?: string[];
+  metadataErrors?: string[];
   // Set when a mirror is the primary of another file system.
   needsSharedStore?: boolean;
   // Whether the local cache is on; write-back (write_ack: cache) needs it.
@@ -65,12 +66,16 @@ const metadataDescription = (type: MetadataType): string => {
 
 interface MetadataStoreEditorProps {
   entry: MetadataEntry;
+  // The stores this file system may pin its metadata in: its primary and
+  // its mirrors. The loader refuses any other store.
+  fsStores: StoreConfig[];
   stores: StoreConfig[];
   onChange: (entry: MetadataEntry) => void;
 }
 
 function MetadataStoreEditor({
   entry,
+  fsStores,
   stores,
   onChange,
 }: MetadataStoreEditorProps) {
@@ -121,7 +126,7 @@ function MetadataStoreEditor({
               onChange={(e) => update({ store: e.target.value })}
             >
               <MenuItem value="">Primary store (default)</MenuItem>
-              {stores.map((store) => (
+              {fsStores.map((store) => (
                 <MenuItem key={store.name} value={store.name}>
                   {storeLabel(store)}
                 </MenuItem>
@@ -258,13 +263,6 @@ function MetadataStoreEditor({
               helperText="For a self-hosted GitLab; default: https://gitlab.com"
               style={{ flex: 1 }}
             />
-            <ConfigTextField
-              label="File Path"
-              value={entry.gitlab_repo.file_path}
-              onChange={(e) => updateGitlab("file_path", e.target.value)}
-              helperText="Document layout, or a document left by an older release; default: metadata.json"
-              width={220}
-            />
             <FormControl size="small" sx={{ minWidth: 220 }}>
               <InputLabel>Layout</InputLabel>
               <Select
@@ -281,6 +279,15 @@ function MetadataStoreEditor({
                 <MenuItem value="document">{layoutLabel("document")}</MenuItem>
               </Select>
             </FormControl>
+            {entry.gitlab_repo.layout === "document" && (
+              <ConfigTextField
+                label="File Path"
+                value={entry.gitlab_repo.file_path}
+                onChange={(e) => updateGitlab("file_path", e.target.value)}
+                helperText="Where the JSON document lives; a document left by an older release is migrated from here too. Default: metadata.json"
+                style={{ flex: 1 }}
+              />
+            )}
           </Box>
         </>
       )}
@@ -303,6 +310,7 @@ export function FilesystemField({
   nameErrors = [],
   primaryErrors = [],
   mirrorErrors = [],
+  metadataErrors = [],
   needsSharedStore = false,
   cacheEnabled = false,
 }: FilesystemFieldProps) {
@@ -372,6 +380,9 @@ export function FilesystemField({
       </Typography>
       <MetadataStoreEditor
         entry={filesystem.metadata}
+        fsStores={namedStores.filter((s) =>
+          [filesystem.primary, ...filesystem.mirrors].includes(s.name)
+        )}
         stores={namedStores}
         onChange={onUpdateMetadata}
       />
@@ -396,6 +407,9 @@ export function FilesystemField({
           <Box sx={{ flex: 1 }}>
             <MetadataStoreEditor
               entry={entry}
+              fsStores={namedStores.filter((s) =>
+                [filesystem.primary, ...filesystem.mirrors].includes(s.name)
+              )}
               stores={namedStores}
               onChange={(updated) => onUpdateMetadataMirror(index, updated)}
             />
@@ -425,6 +439,13 @@ export function FilesystemField({
         carry on with the others and the store is caught up once it returns.
         Two pinned-message stores on the same store are not allowed.
       </Typography>
+      {metadataErrors.length > 0 && (
+        <Typography variant="body2" color="error" sx={{ mb: 2, pl: 2 }}>
+          {metadataErrors.map((error, index) => (
+            <Box key={index}>{error}</Box>
+          ))}
+        </Typography>
+      )}
 
       <Typography variant="subtitle2" sx={{ mb: 1 }}>
         Mirrors
