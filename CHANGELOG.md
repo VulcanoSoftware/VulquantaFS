@@ -18,6 +18,19 @@ the fact on the commits that shipped them.
 
 ### Fixed
 
+- The metadata store constructors no longer touch the network. The
+  GitHub stores resolved their repository with a blocking call in
+  `__init__`, on the event loop, while the configuration loaded: with
+  api.github.com unreachable, PyGithub's retry cycle froze the whole
+  server before the replicated metadata layer even existed, and a
+  perfectly healthy GitLab mirror never got the chance to serve. The
+  repositories now resolve lazily on the first API call, which runs on a
+  worker thread; a failure there surfaces as that store's read error, so
+  the layer fails over to the next store and the heal worker catches the
+  unavailable store up once it answers again. The GitHub metadata
+  clients also cap PyGithub's retry cycle at three attempts, which turns
+  a dead GitHub from roughly three minutes of silence at boot into
+  about one.
 - The Docker image names in the config generator's command panel and in
   the getting-started guide follow the repository the site is built from.
   They were hard-coded (and kept pointing at a foreign namespace, because

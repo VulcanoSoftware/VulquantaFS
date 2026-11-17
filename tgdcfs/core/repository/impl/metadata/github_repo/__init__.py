@@ -9,7 +9,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import Iterable, NamedTuple, Optional, Sequence, Set
 
-from github import Github, GithubException, InputGitTreeElement
+from github import Github, GithubException, GithubRetry, InputGitTreeElement
 from github.ContentFile import ContentFile
 from github.Repository import Repository
 
@@ -65,10 +65,16 @@ class GithubRepoMetadataRepository(IMetaDataRepository):
         super().__init__()
         self._stats_loads: dict[int, asyncio.Future[bool]] = {}
 
-        gh = Github(config.access_token)
+        gh = Github(config.access_token, lazy=True, retry=GithubRetry(total=3))
         # Injectable for a store that speaks the PyGithub surface without
         # being GitHub (the GitLab tree mirror); the default client talks
-        # to GitHub itself.
+        # to GitHub itself. The lazy flag keeps construction off the
+        # network: the repository resolves on its first API call, which
+        # runs on a worker thread. An unreachable GitHub at boot must
+        # surface as this store's read error -- so the replicated layer
+        # fails over to a healthy mirror and the heal worker catches this
+        # store up once it answers again -- never as a minutes-long
+        # blocking call on the event loop before the layer even exists.
         if repo is None:
             repo = gh.get_repo(config.repo)
 
