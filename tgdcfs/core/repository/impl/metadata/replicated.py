@@ -176,8 +176,12 @@ class ReplicatedMetadataRepository(IMetaDataRepository):
             # The primary gets its regular write (a github repo primary has
             # already written incrementally while the tree was mutated); the
             # mirrors always get the full sync, since they may have missed
-            # any of those incremental writes while they were down.
-            ok, error = await self._write(store, full=i > 0)
+            # any of those incremental writes while they were down. A primary
+            # that could not serve the tree at boot (it was down or empty)
+            # gets the full sync too: its regular write is a no-op for a tree
+            # store, and everything it missed while it was unavailable has
+            # to land before the next mutation goes through incrementally.
+            ok, error = await self._write(store, full=i > 0 or store.key in self._stale)
             any_store_ok = any_store_ok or ok
             if error:
                 errors.append(error)

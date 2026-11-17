@@ -23,6 +23,7 @@ import {
   LISTING_DEFAULTS,
   ListingConfig,
   MetadataEntry,
+  MetadataLayout,
   MetadataType,
   MirrorMode,
   StoreConfig,
@@ -117,6 +118,7 @@ const METADATA_TYPES: readonly MetadataType[] = [
   "github_repo",
   "gitlab_repo",
 ];
+const LAYOUTS: readonly MetadataLayout[] = ["tree", "document"];
 const MIRROR_MODES: readonly MirrorMode[] = ["auto", "forward", "reupload"];
 const SYNC_MODES: readonly SyncMode[] = ["inline", "background", "tee"];
 const WRITE_ACKS: readonly WriteAck[] = ["primary", "cache"];
@@ -149,11 +151,20 @@ const readMetadataEntry = (
     "repo",
     "commit",
     "access_token",
+    "layout",
+    "file_path",
   ]);
   entry.github_repo = {
     repo: asString(github.repo),
     commit: asString(github.commit, "master"),
     access_token: asString(github.access_token),
+    layout: notes.choice(
+      `${path}.github_repo.layout`,
+      github.layout,
+      LAYOUTS,
+      "tree"
+    ),
+    file_path: asString(github.file_path, GITLAB_DEFAULTS.file_path),
   };
   const gitlab = asMapping(data.gitlab_repo);
   notes.unknownKeys(`${path}.gitlab_repo`, gitlab, [
@@ -162,6 +173,7 @@ const readMetadataEntry = (
     "access_token",
     "base_url",
     "file_path",
+    "layout",
   ]);
   entry.gitlab_repo = {
     repo: asString(gitlab.repo),
@@ -169,6 +181,12 @@ const readMetadataEntry = (
     access_token: asString(gitlab.access_token),
     base_url: asString(gitlab.base_url, GITLAB_DEFAULTS.base_url),
     file_path: asString(gitlab.file_path, GITLAB_DEFAULTS.file_path),
+    layout: notes.choice(
+      `${path}.gitlab_repo.layout`,
+      gitlab.layout,
+      LAYOUTS,
+      "tree"
+    ),
   };
   return entry;
 };

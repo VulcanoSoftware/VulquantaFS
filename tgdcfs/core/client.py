@@ -5,6 +5,8 @@ from tgdcfs.config import (
     Config,
     EncryptionConfig,
     FilesystemConfig,
+    MetadataConfig,
+    MetadataLayout,
     MetadataType,
     StoreConfig,
 )
@@ -204,17 +206,8 @@ class Client:
                 store, fc_repo, mirror_group=mirror_group
             )
         else:
-            if (github_repo_config := metadata_cfg.github_repo) is None:
-                raise ValueError(
-                    f"configuration filesystems -> {filesystem.name} -> metadata "
-                    f"-> github_repo is required."
-                )
-            from tgdcfs.core.repository.impl.metadata.github_repo import (
-                GithubRepoMetadataRepository,
-            )
-
-            metadata_repo = GithubRepoMetadataRepository(
-                github_repo_config, name_key=path_name_key
+            metadata_repo = cls._build_repo_metadata_repo(
+                metadata_cfg, path_name_key, metadata_blob_key
             )
 
         write_back = filesystem.write_ack == "cache" and cache is not None
@@ -303,6 +296,60 @@ class Client:
         )
 
     @staticmethod
+    def _build_repo_metadata_repo(
+        cfg: MetadataConfig,
+        path_name_key: Optional[bytes],
+        metadata_blob_key: Optional[bytes],
+    ) -> IMetaDataRepository:
+        """A git repository metadata store in its configured layout.
+
+        ``tree`` (the default for both GitHub and GitLab) mirrors the tree
+        into the repository's own directory structure and writes
+        incrementally; ``document`` keeps the whole tree in one JSON file
+        that is rewritten on every push, the pinned-message shape.
+        """
+        if cfg.type == MetadataType.GITHUB_REPO:
+            if cfg.github_repo is None:
+                raise ValueError(
+                    "configuration filesystems -> metadata -> github_repo "
+                    "is required."
+                )
+            if cfg.github_repo.layout == MetadataLayout.DOCUMENT:
+                from tgdcfs.core.repository.impl.metadata.github_document import (
+                    GithubDocumentMetadataRepository,
+                )
+
+                return GithubDocumentMetadataRepository(
+                    cfg.github_repo, blob_key=metadata_blob_key
+                )
+            from tgdcfs.core.repository.impl.metadata.github_repo import (
+                GithubRepoMetadataRepository,
+            )
+
+            return GithubRepoMetadataRepository(cfg.github_repo, name_key=path_name_key)
+        if cfg.gitlab_repo is None:
+            raise ValueError(
+                "configuration filesystems -> metadata -> gitlab_repo " "is required."
+            )
+        if cfg.gitlab_repo.layout == MetadataLayout.DOCUMENT:
+            from tgdcfs.core.repository.impl.metadata.gitlab_repo import (
+                GitlabRepoMetadataRepository,
+            )
+
+            return GitlabRepoMetadataRepository(
+                cfg.gitlab_repo, blob_key=metadata_blob_key
+            )
+        from tgdcfs.core.repository.impl.metadata.gitlab_tree import (
+            GitlabTreeRepoMetadataRepository,
+        )
+
+        return GitlabTreeRepoMetadataRepository(
+            cfg.gitlab_repo,
+            name_key=path_name_key,
+            blob_key=metadata_blob_key,
+        )
+
+    @staticmethod
     async def _build_replicated_metadata(
         filesystem: FilesystemConfig,
         config: Config,
@@ -313,12 +360,6 @@ class Client:
         encryption_cfg: Optional[EncryptionConfig],
     ) -> IMetaDataRepository:
         """One primary plus the redundant metadata stores of a file system."""
-        from tgdcfs.core.repository.impl.metadata.github_repo import (
-            GithubRepoMetadataRepository,
-        )
-        from tgdcfs.core.repository.impl.metadata.gitlab_repo import (
-            GitlabRepoMetadataRepository,
-        )
         from tgdcfs.core.repository.impl.metadata.replicated import (
             MetadataStore,
             ReplicatedMetadataRepository,
@@ -340,23 +381,9 @@ class Client:
                     # unreachable primary would look like a fresh install.
                     create_if_missing=False,
                 )
-            elif cfg.type == MetadataType.GITHUB_REPO:
-                if cfg.github_repo is None:
-                    raise ValueError(
-                        f"configuration filesystems -> {filesystem.name} -> "
-                        f"metadata -> github_repo is required."
-                    )
-                repo = GithubRepoMetadataRepository(
-                    cfg.github_repo, name_key=path_name_key
-                )
             else:
-                if cfg.gitlab_repo is None:
-                    raise ValueError(
-                        f"configuration filesystems -> {filesystem.name} -> "
-                        f"metadata -> gitlab_repo is required."
-                    )
-                repo = GitlabRepoMetadataRepository(
-                    cfg.gitlab_repo, blob_key=metadata_blob_key
+                repo = Client._build_repo_metadata_repo(
+                    cfg, path_name_key, metadata_blob_key
                 )
             stores.append(MetadataStore(key=cfg.key, repo=repo, primary=i == 0))
         return ReplicatedMetadataRepository(stores)

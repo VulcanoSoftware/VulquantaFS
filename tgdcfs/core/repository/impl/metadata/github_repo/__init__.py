@@ -11,6 +11,7 @@ from typing import Iterable, NamedTuple, Optional, Sequence, Set
 
 from github import Github, GithubException, InputGitTreeElement
 from github.ContentFile import ContentFile
+from github.Repository import Repository
 
 from tgdcfs.config import GithubRepoConfig, expand_path
 from tgdcfs.core.model import FileStat, TGFSDirectory, TGFSFileRef, TGFSMetadata
@@ -55,12 +56,21 @@ def _blob_sha(content: str) -> str:
 
 
 class GithubRepoMetadataRepository(IMetaDataRepository):
-    def __init__(self, config: GithubRepoConfig, name_key: Optional[bytes] = None):
+    def __init__(
+        self,
+        config: GithubRepoConfig,
+        name_key: Optional[bytes] = None,
+        repo: Optional[Repository] = None,
+    ):
         super().__init__()
         self._stats_loads: dict[int, asyncio.Future[bool]] = {}
 
         gh = Github(config.access_token)
-        repo = gh.get_repo(config.repo)
+        # Injectable for a store that speaks the PyGithub surface without
+        # being GitHub (the GitLab tree mirror); the default client talks
+        # to GitHub itself.
+        if repo is None:
+            repo = gh.get_repo(config.repo)
 
         self._timestamps = DirTimestampStore(
             repo=repo,
@@ -77,6 +87,71 @@ class GithubRepoMetadataRepository(IMetaDataRepository):
             timestamps=self._timestamps,
             tree_fetch_concurrency=config.tree_fetch_concurrency,
         )
+
+    # -- the shared tree -----------------------------------------------------
+    #
+    # The replicated layer hands every store the same tree object, loaded
+    # from whichever store could serve it. Mutations persist through the
+    # ``GithubDirectory`` nodes (the incremental writes) and ``push_full``
+    # diffs whatever tree it is given, so a tree that arrived as plain
+    # ``TGFSDirectory`` nodes -- loaded from a pinned message or a document
+    # store -- is converted in place: same object, store-backed nodes, with
+    # the mirrors, store key, stat and dates of every file ref and folder
+    # preserved.
+
+    @property
+    def metadata(self) -> Optional[TGFSMetadata]:
+        return self._metadata
+
+    @metadata.setter
+    def metadata(self, value: Optional[TGFSMetadata]) -> None:
+        self._metadata = None if value is None else self._as_github_tree(value)
+
+    def _as_github_tree(self, metadata: TGFSMetadata) -> TGFSMetadata:
+        if isinstance(metadata.dir, GithubDirectory):
+            return metadata
+        plain_root = metadata.dir
+        root = GithubDirectory(
+            self._ghc, name="root", parent=None, children=[], files=[]
+        )
+        root.created_at = plain_root.created_at
+        root.modified_at = plain_root.modified_at
+        self._convert_directory(plain_root, root)
+        metadata.dir = root
+        return metadata
+
+    def _convert_directory(
+        self, source: TGFSDirectory, target: GithubDirectory
+    ) -> None:
+        for child in source.find_dirs():
+            # New nodes follow the configured name key, like freshly created
+            # directories do; the plaintext names of a document store get
+            # encrypted on the way out.
+            node = GithubDirectory(
+                self._ghc,
+                name=child.name,
+                parent=target,
+                stored_encrypted=None,
+                defer_timestamps=True,
+            )
+            target.children.append(node)
+            node.created_at = child.created_at
+            node.modified_at = child.modified_at
+            self._convert_directory(child, node)
+        for fr in source.find_files():
+            # Built directly instead of via ``attach_file_ref``, which loses
+            # the mirrors, store key and stat of a loaded ref.
+            target.files.append(
+                TGFSFileRef(
+                    message_id=fr.message_id,
+                    name=fr.name,
+                    location=target,
+                    mirrors=dict(fr.mirrors),
+                    store=fr.store,
+                    stat=fr.stat,
+                    stat_epoch=fr.stat_epoch,
+                )
+            )
 
     async def push(self) -> None:
         pass

@@ -35,6 +35,21 @@ the fact on the commits that shipped them.
 
 ### Added
 
+- Repository metadata stores (GitHub and GitLab) now have a `layout`
+  option. `tree` (the default for both) mirrors the directory tree into
+  the repository's own directory structure, one blob per directory,
+  written incrementally -- the shape `github_repo` has always used.
+  `document` keeps the whole tree in one JSON file that is rewritten on
+  every push, the same shape the pinned-message store uses, and is
+  AES-GCM encrypted when at-rest encryption is on. GitLab's tree layout
+  speaks the same engine as the GitHub store (incremental writes, diff
+  sync, per-folder stats files, directory dates) through a REST facade,
+  so both hosts behave identically; a GitLab repository that still holds
+  the single-document layout of an older release is migrated to the tree
+  layout automatically on the first push. The config generator offers
+  the layout for both hosts and reads it back from an existing config.
+- The config generator also gained the `file_path` option for GitHub's
+  document layout, matching the GitLab store.
 - The Docker images are published to GHCR (`ghcr.io/<owner>/tgdcfs` and
   `ghcr.io/<owner>/tgdcfs-fe`) next to Docker Hub, with the same `latest`,
   commit, `preview` and release tags. GHCR publishing uses the workflow's

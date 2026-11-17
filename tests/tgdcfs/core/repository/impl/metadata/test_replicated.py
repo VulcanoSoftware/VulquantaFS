@@ -142,11 +142,12 @@ class TestLoad:
 
         assert layer.metadata is mirror_tree
         # The push that follows init wrote the mirror's tree back into the
-        # primary, so nothing is stale any more.
+        # primary, so nothing is stale any more. The primary missed the
+        # incremental writes while it was down, so it gets the full sync.
         assert layer.stale_stores() == []
         assert primary.stored is mirror_tree
-        assert primary.push_calls == 1
-        assert primary.push_full_calls == 0
+        assert primary.push_full_calls == 1
+        assert primary.push_calls == 0
 
     async def test_every_store_empty_bootstraps_a_fresh_tree(self):
         primary = FakeMetadataRepo("primary", empty=True)

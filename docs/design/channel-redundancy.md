@@ -358,8 +358,20 @@ metadata write goes to all of them.
   Telegram channel and one in the Discord channel are therefore two
   separate, individually configurable stores.
 - `github_repo` and `gitlab_repo` keep the tree off the channels
-  entirely. `gitlab_repo` stores the whole tree as one document (AES-GCM
-  encrypted when at-rest encryption is on) in a GitLab repository.
+  entirely, and both offer the same two layouts (`layout:`):
+  - `tree` (the default for both) mirrors the tree into the repository's
+    own directory structure, one blob per directory, written
+    incrementally -- the shape `github_repo` has always used. The GitLab
+    store speaks the PyGithub engine through a REST facade
+    (`gitlab_tree.py`), so both behave identically.
+  - `document` keeps the whole tree as one JSON file (`metadata.json`,
+    AES-GCM encrypted when at-rest encryption is on) that is rewritten
+    on every push -- the same shape the pinned-message store uses, a
+    drop-in redundant copy next to any other metadata store.
+  - A GitLab repository that still holds the single-document layout of
+    an older release is migrated automatically: the tree layout reads
+    the document until the first push has mirrored the tree, then
+    removes it.
 - A store that is temporarily unreachable is skipped: writes and reads
   continue with the stores that are up. The layer marks the store
   *stale* and a background task (every 30 s) re-writes it until it takes

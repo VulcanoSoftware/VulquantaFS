@@ -88,6 +88,14 @@ filesystems:
         repo: 'tgdcfs-demo/tgdcfs-demo'
         commit: 'master'
         access_token: hidden
+        # How the tree is stored: 'tree' (default) mirrors it into the
+        # repository's own directory structure, one blob per directory,
+        # written incrementally; 'document' keeps the whole tree in one
+        # JSON file that is rewritten on every push, the same shape the
+        # pinned-message store uses.
+        # layout: 'tree'
+        # Where the document layout keeps the JSON document.
+        # file_path: 'metadata.json'
         # How many directories the startup reads in parallel when the
         # metadata repo is too big for one recursive tree call (default
         # 8). Higher is faster but bursts harder against GitHub's rate
@@ -108,6 +116,12 @@ filesystems:
     #       repo: 'tgdcfs-demo/tgdcfs-demo'
     #       branch: 'master'
     #       access_token: hidden
+    #       # How the tree is stored: 'tree' (default, the same shape the
+    #       # GitHub repo store uses) or 'document' (one JSON file,
+    #       # rewritten on every push). A repository that still holds the
+    #       # single-document layout of an older release is migrated to
+    #       # the tree layout automatically.
+    #       # layout: 'tree'
     #       # base_url: 'https://gitlab.example.com'  # self-hosted
     #       # file_path: 'metadata.json'
 
