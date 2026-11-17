@@ -195,12 +195,17 @@ class GithubRepoConfig:
 class MetadataType(Enum):
     PINNED_MESSAGE = "pinned_message"
     GITHUB_REPO = "github_repo"
+    GITLAB_REPO = "gitlab_repo"
 
 
-class MetadataConfigDict(TypedDict):
+class MetadataConfigDict(TypedDict, total=False):
     name: str
     type: str
+    # ``pinned_message`` only: the store whose channel holds the pinned
+    # metadata document. Empty means the file system's primary store.
+    store: str
     github_repo: Optional[Dict]
+    gitlab_repo: Optional[Dict]
 
 
 @dataclass
@@ -208,6 +213,13 @@ class MetadataConfig:
     name: str
     type: MetadataType
     github_repo: Optional[GithubRepoConfig]
+    # ``pinned_message`` only: name of the store (``stores:`` entry) whose
+    # channel holds the pinned metadata document. ``None`` means the file
+    # system's primary store; :meth:`FilesystemConfig.from_dict` fills it.
+    # This is what makes a pinned copy in a Telegram channel and one in a
+    # Discord channel two separate, individually configurable stores.
+    store: Optional[str] = None
+    gitlab_repo: Optional["GitlabRepoConfig"] = None
 
     @classmethod
     def from_dict(cls, data: MetadataConfigDict) -> Self:
@@ -219,6 +231,7 @@ class MetadataConfig:
                 name=data.get("name", "default"),
                 type=MetadataType.PINNED_MESSAGE,
                 github_repo=None,
+                store=data.get("store") or None,
             )
         if data["type"] == MetadataType.GITHUB_REPO.value:
             if not (gh_repo_config := data.get("github_repo")):
@@ -230,8 +243,89 @@ class MetadataConfig:
                 type=MetadataType.GITHUB_REPO,
                 github_repo=GithubRepoConfig.from_dict(gh_repo_config),
             )
+        if data["type"] == MetadataType.GITLAB_REPO.value:
+            if not (gl_repo_config := data.get("gitlab_repo")):
+                raise ValueError(
+                    "GitLab repo configuration is required for GITLAB_REPO type"
+                )
+            return cls(
+                name=data.get("name", "default"),
+                type=MetadataType.GITLAB_REPO,
+                github_repo=None,
+                gitlab_repo=GitlabRepoConfig.from_dict(gl_repo_config),
+            )
         raise ValueError(
             f"Unknown metadata type: {data['type']}, available options: {', '.join(e.value for e in MetadataType)}"
+        )
+
+    @property
+    def key(self) -> str:
+        """Stable identifier of this metadata store within its file system.
+
+        Used for logs, the manager API and the stale-store bookkeeping of
+        the replicated metadata layer. Two stores of one file system never
+        share a key (validated on load).
+        """
+        if self.type == MetadataType.PINNED_MESSAGE:
+            return f"pinned_message@{self.store or 'primary'}"
+        if self.type == MetadataType.GITHUB_REPO:
+            if self.github_repo is None:
+                return "github_repo@<unconfigured>"
+            return f"github_repo@{self.github_repo.repo}@{self.github_repo.commit}"
+        if self.gitlab_repo is None:
+            return "gitlab_repo@<unconfigured>"
+        return f"gitlab_repo@{self.gitlab_repo.repo}@{self.gitlab_repo.branch}"
+
+
+@dataclass
+class GitlabRepoConfig:
+    """A GitLab repository holding the metadata as one JSON document.
+
+    Unlike ``github_repo`` (which mirrors the tree into the repo's own
+    directory structure), ``gitlab_repo`` keeps the whole tree in a single
+    file -- ``metadata.json`` by default -- and rewrites it on every push,
+    the same shape the pinned-message store uses. That keeps it small and
+    makes it a drop-in redundant copy next to any other metadata store.
+
+    ``repo`` is ``group/project`` (URL-quoted for the API) or a numeric
+    project id. ``base_url`` points at a self-hosted GitLab; it defaults
+    to gitlab.com. ``access_token`` needs ``api`` or ``write_repository``
+    scope.
+    """
+
+    repo: str
+    branch: str
+    access_token: str
+    base_url: str = "https://gitlab.com"
+    file_path: str = "metadata.json"
+
+    DEFAULT_BASE_URL = "https://gitlab.com"
+    DEFAULT_FILE_PATH = "metadata.json"
+
+    @classmethod
+    def from_dict(cls, data: dict) -> Self:
+        if not (repo := data.get("repo")):
+            raise ValueError("metadata.gitlab_repo.repo is required")
+        if not (branch := data.get("branch")):
+            raise ValueError("metadata.gitlab_repo.branch is required")
+        if not (access_token := data.get("access_token")):
+            raise ValueError("metadata.gitlab_repo.access_token is required")
+        base_url = str(data.get("base_url") or cls.DEFAULT_BASE_URL).rstrip("/")
+        if not base_url.startswith(("http://", "https://")):
+            raise ValueError(
+                f"metadata.gitlab_repo.base_url must be an http(s) URL, got {base_url}"
+            )
+        file_path = str(data.get("file_path") or cls.DEFAULT_FILE_PATH).strip("/")
+        if not file_path or file_path.endswith("/"):
+            raise ValueError(
+                f"metadata.gitlab_repo.file_path must name a file, got {file_path!r}"
+            )
+        return cls(
+            repo=str(repo),
+            branch=str(branch),
+            access_token=str(access_token),
+            base_url=base_url,
+            file_path=file_path,
         )
 
 
@@ -977,6 +1071,13 @@ class FilesystemConfig:
     strict: bool
     read_preference: List[str]
     metadata: MetadataConfig
+    # Redundant metadata stores (RAID-1 like the file stores): every push
+    # goes to the primary metadata store and to each of these; a store
+    # that is temporarily unreachable is skipped and re-synced once it is
+    # back. Empty: the primary metadata store only, and a ``pinned_message``
+    # one keeps maintaining its pinned copies in the mirror stores the way
+    # it always did (the explicit list below replaces that behaviour).
+    metadata_mirrors: List[MetadataConfig] = field(default_factory=list)
     allow_shared_store: bool = False
     # True when ``sync`` was not configured and may be replaced by the
     # value derived from the stores.
@@ -1045,6 +1146,15 @@ class FilesystemConfig:
         }
         metadata_data.update(data.get("metadata") or {})  # type: ignore[typeddict-item]
         metadata = MetadataConfig.from_dict(metadata_data)
+        if metadata.type == MetadataType.PINNED_MESSAGE and not metadata.store:
+            metadata.store = str(primary)
+        metadata_mirrors = [
+            MetadataConfig.from_dict(m) for m in (data.get("metadata_mirrors") or [])
+        ]
+        for mirror in metadata_mirrors:
+            if mirror.type == MetadataType.PINNED_MESSAGE and not mirror.store:
+                mirror.store = str(primary)
+        _validate_metadata_stores(name, metadata, metadata_mirrors)
         return cls(
             name=name,
             primary=str(primary),
@@ -1054,12 +1164,18 @@ class FilesystemConfig:
             strict=strict,
             read_preference=[str(s) for s in (data.get("read_preference") or [])],
             metadata=metadata,
+            metadata_mirrors=metadata_mirrors,
             allow_shared_store=bool(data.get("allow_shared_store", False)),
             sync_is_default=sync_is_default,
             write_ack=write_ack,  # type: ignore[arg-type]
             read_parallel=bool(data.get("read_parallel", False)),
             read_sources=[str(s) for s in (data.get("read_sources") or [])],
         )
+
+    @property
+    def metadata_stores(self) -> List[MetadataConfig]:
+        """Every metadata store of this file system, primary first."""
+        return [self.metadata, *self.metadata_mirrors]
 
     @property
     def store_names(self) -> List[str]:
@@ -1165,7 +1281,42 @@ def _legacy_stores_and_filesystems(
             # tgfs allowed any channel arrangement; keep that.
             allow_shared_store=True,
         )
+        # For the manager API's sake the pinned store names its channel.
+        metadata.store = store_name(channel)
     return stores, filesystems
+
+
+def _validate_metadata_stores(
+    fs_name: str,
+    metadata: MetadataConfig,
+    metadata_mirrors: List[MetadataConfig],
+) -> None:
+    """The metadata stores of one file system must not collide.
+
+    A channel holds exactly one pinned message, so two ``pinned_message``
+    stores cannot share a store; two entries for the same git repository
+    and branch would overwrite each other's commits.
+    """
+    stores = [metadata, *metadata_mirrors]
+    seen_pinned: Dict[str, str] = {}
+    seen_keys: Dict[str, str] = {}
+    for entry in stores:
+        if entry.type == MetadataType.PINNED_MESSAGE:
+            target = entry.store or ""
+            if target in seen_pinned:
+                raise ValueError(
+                    f"filesystems.{fs_name}: two pinned_message metadata stores "
+                    f"point at store '{target}'; a channel holds only one pinned "
+                    f"message, so they cannot be separate stores"
+                )
+            seen_pinned[target] = entry.key
+        key = entry.key
+        if key in seen_keys:
+            raise ValueError(
+                f"filesystems.{fs_name}: metadata store '{key}' is listed "
+                f"twice (primary and/or metadata_mirrors)"
+            )
+        seen_keys[key] = fs_name
 
 
 def _validate_filesystems(
@@ -1187,6 +1338,17 @@ def _validate_filesystems(
                 raise ValueError(
                     f"filesystems.{fs.name}: read_sources names '{store_name}', "
                     f"which is neither its primary nor one of its mirrors"
+                )
+        for entry in fs.metadata_stores:
+            if (
+                entry.type == MetadataType.PINNED_MESSAGE
+                and (store := entry.store) is not None
+                and store not in fs.store_names
+            ):
+                raise ValueError(
+                    f"filesystems.{fs.name}: metadata store '{entry.key}' points "
+                    f"at store '{store}', which is neither the file system's "
+                    f"primary nor one of its mirrors"
                 )
         if (other := primaries.get(fs.primary)) is not None:
             raise ValueError(

@@ -19,6 +19,8 @@ class TestManagerApp:
             supports_server_copy=True,
         )
         client.mirror_group = None
+        client.metadata_api = mocker.Mock()
+        client.metadata_api.stale_stores.return_value = []
         return client
 
     @pytest.fixture
@@ -86,6 +88,15 @@ class TestManagerApp:
                 "read_sources": [],
                 "write_ack": "primary",
                 "metadata": "pinned_message",
+                "metadata_stores": [
+                    {
+                        "role": "primary",
+                        "type": "pinned_message",
+                        "name": "Test-Channel",
+                        "store": "tg-123456",
+                    }
+                ],
+                "metadata_stale": [],
                 "primary_dead": False,
             }
         }

@@ -93,6 +93,23 @@ filesystems:
         # 8). Higher is faster but bursts harder against GitHub's rate
         # limit.
         # tree_fetch_concurrency: 8
+    # Redundant metadata stores: every metadata write goes to the store
+    # above (the primary) and to each of these. A store that is
+    # temporarily unreachable is skipped and re-synced once it is back
+    # (a background task retries every 30 s), and on a restart the tree
+    # is loaded from the first store that answers. Any combination of a
+    # pinned message in a specific store's channel, a GitHub repo and a
+    # GitLab repo is allowed; two pinned stores cannot share one channel.
+    # metadata_mirrors:
+    #   - type: pinned_message
+    #     store: demo-mirror
+    #   - type: gitlab_repo
+    #     gitlab_repo:
+    #       repo: 'tgdcfs-demo/tgdcfs-demo'
+    #       branch: 'master'
+    #       access_token: hidden
+    #       # base_url: 'https://gitlab.example.com'  # self-hosted
+    #       # file_path: 'metadata.json'
 
 tgdcfs:
   users:

@@ -111,9 +111,37 @@ class IMetaDataRepository(metaclass=ABCMeta):
     async def push(self) -> None:
         pass
 
+    async def push_full(self) -> None:
+        """Write the whole current tree to this store, however much of it
+        is already there.
+
+        For a blob store this is what ``push`` already does. For a store
+        that writes incrementally (``github_repo``) it re-syncs everything
+        the incremental writes missed -- which is how a store that was
+        unreachable for a while gets healed. The replicated layer uses it
+        for mirrors and for healing; the default delegates to ``push``.
+        """
+        await self.push()
+
     @abstractmethod
     async def get(self) -> TGFSMetadata:
         pass
+
+    async def heal(self) -> None:
+        """Re-sync every store this repository knows to be behind.
+
+        Only the replicated layer has several stores to reconcile; the
+        default has nothing to do.
+        """
+        return
+
+    def stale_stores(self) -> List[str]:
+        """Keys of the stores that missed a write and await healing."""
+        return []
+
+    async def close(self) -> None:
+        """Release backend resources; the default has nothing to release."""
+        return
 
     def root(self) -> TGFSDirectory:
         if not self.metadata:
