@@ -20,11 +20,13 @@ import {
   Typography,
 } from "@mui/material";
 import yaml from "js-yaml";
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { Prism as SyntaxHighlighter } from "react-syntax-highlighter";
 import { vscDarkPlus } from "react-syntax-highlighter/dist/esm/styles/prism";
 import { DOCKERHUB_IMAGE, GHCR_IMAGE, PAGES_URL } from "../lib/coordinates";
+import { ColumnResizeHandle } from "../appearance/ColumnResizeHandle";
 import { CustomizePanel } from "../appearance/CustomizePanel";
+import { DEFAULT_SETTINGS, useAppearance } from "../appearance/AppearanceProvider";
 import { BotTokenField } from "./components/BotTokenField";
 import { ConfigTextField } from "./components/ConfigTextField";
 import { DockerRunPanel } from "./components/DockerRunPanel";
@@ -93,6 +95,11 @@ const generateRandomSecret = (): string => {
 };
 
 export default function ConfigGenerator() {
+  const { settings, mounted, setSidebarWidth } = useAppearance();
+  const columnsRef = useRef<HTMLDivElement>(null);
+  const [dragWidth, setDragWidth] = useState<number | null>(null);
+  const sidebarWidth = mounted ? dragWidth ?? settings.sidebarWidth : 400;
+
   const [withUserAccountUpload, setWithUserAccountUpload] = useState(false);
   const [withUserAccountDownload, setWithUserAccountDownload] = useState(false);
 
@@ -759,13 +766,15 @@ export default function ConfigGenerator() {
       )}
 
       <Box
+        ref={columnsRef}
         sx={{
           display: "flex",
-          gap: 3,
+          gap: 2,
+          alignItems: "stretch",
           flexDirection: { xs: "column", md: "row" },
         }}
       >
-        <Box sx={{ flex: 1 }}>
+        <Box sx={{ flex: 1, minWidth: 0 }}>
           <Paper className="dcfs-glass dcfs-fade-in" sx={{ p: { xs: 2, md: 4 } }}>
             <FormSection title="Stores" showDivider={false}>
               <Typography variant="body2" color="text.secondary">
@@ -1822,7 +1831,27 @@ export default function ConfigGenerator() {
           </Paper>
         </Box>
 
-        <Box sx={{ width: { xs: "100%", md: "400px" }, flexShrink: 0 }}>
+        <ColumnResizeHandle
+          containerRef={columnsRef}
+          width={sidebarWidth}
+          onChange={setDragWidth}
+          onCommit={(width) => {
+            setDragWidth(null);
+            setSidebarWidth(width);
+          }}
+          onReset={() => {
+            setDragWidth(null);
+            setSidebarWidth(DEFAULT_SETTINGS.sidebarWidth);
+          }}
+        />
+
+        <Box
+          sx={{
+            width: { xs: "100%", md: sidebarWidth },
+            maxWidth: { md: "calc(100% - 522px)" },
+            flexShrink: 0,
+          }}
+        >
           <Paper
             className="dcfs-glass"
             sx={{
