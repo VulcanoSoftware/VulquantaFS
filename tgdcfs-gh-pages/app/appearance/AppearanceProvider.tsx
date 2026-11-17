@@ -15,6 +15,7 @@ export interface AppearanceSettings {
   background: BackgroundStyle;
   effects: boolean;
   sidebarWidth: number;
+  fullWidth: boolean;
 }
 
 export const ACCENT_PRESETS: { name: string; value: string }[] = [
@@ -35,6 +36,7 @@ export const DEFAULT_SETTINGS: AppearanceSettings = {
   background: "aurora",
   effects: true,
   sidebarWidth: 400,
+  fullWidth: false,
 };
 
 function hexToRgbTriplet(hex: string): string {
@@ -63,6 +65,7 @@ interface AppearanceContextValue {
   setBackground: (background: BackgroundStyle) => void;
   setEffects: (effects: boolean) => void;
   setSidebarWidth: (width: number) => void;
+  setFullWidth: (fullWidth: boolean) => void;
   resetAppearance: () => void;
 }
 
@@ -117,6 +120,8 @@ export function AppearanceProvider({
       setEffects: (effects) => setSettings((prev) => ({ ...prev, effects })),
       setSidebarWidth: (sidebarWidth) =>
         setSettings((prev) => ({ ...prev, sidebarWidth })),
+      setFullWidth: (fullWidth) =>
+        setSettings((prev) => ({ ...prev, fullWidth })),
       resetAppearance: () => setSettings(DEFAULT_SETTINGS),
     }),
     [settings, mounted]
