@@ -8,7 +8,7 @@ from tgdcfs.core.repository.impl.metadata.pinned_message import (
     PinnedMessageMetadataRepository,
 )
 from tgdcfs.core.repository.interface import IFileContentRepository
-from tgdcfs.errors import MetadataNotInitialized, NoPinnedMessage
+from tgdcfs.errors import MetadataNotInitialized, NoPinnedMessage, NoStoredMetadata
 from tgdcfs.reqres import (
     FileMessageFromBuffer,
     MessageRespWithDocument,
@@ -310,3 +310,99 @@ class TestPinnedMessageMetadataRepository:
         )
         mock_fc_repo.save.assert_not_called()
         mock_message_api.pin_message.assert_not_called()
+
+
+class TestMirrorRepository:
+    """A pinned repository inside the replicated metadata layer: it must
+    report "no data" instead of bootstrapping an empty tree."""
+
+    @pytest.fixture
+    def mock_message_api(self, mocker):
+        store = mocker.AsyncMock(spec=TelegramStore)
+        store.key = "tg:111"
+        store.caps = StoreCapabilities(
+            max_part_bytes=1 << 30, max_text_chars=4096, supports_server_copy=True
+        )
+        return store
+
+    @pytest.fixture
+    def mock_fc_repo(self, mocker):
+        return mocker.AsyncMock(spec=IFileContentRepository)
+
+    @pytest.fixture
+    def repository(self, mock_message_api, mock_fc_repo):
+        return PinnedMessageMetadataRepository(mock_message_api, mock_fc_repo)
+
+    @pytest.fixture
+    def sample_metadata(self) -> TGFSMetadata:
+        return TGFSMetadata(TGFSDirectory.root_dir())
+
+    @pytest.fixture
+    def sample_pinned_message(self) -> MessageRespWithDocument:
+        document = Document(
+            size=1024,
+            id=456,
+            access_hash=789,
+            file_reference=b"test_reference",
+            mime_type="application/json",
+        )
+        return MessageRespWithDocument(message_id=123, text="", document=document)
+
+    @pytest.fixture
+    def mirror_repository(self, mock_message_api, mock_fc_repo):
+        return PinnedMessageMetadataRepository(
+            mock_message_api, mock_fc_repo, create_if_missing=False
+        )
+
+    @pytest.mark.asyncio
+    async def test_get_without_a_pinned_message_raises_no_stored_metadata(
+        self, mirror_repository, mock_message_api, mock_fc_repo
+    ):
+        mock_message_api.get_pinned_message.side_effect = NoPinnedMessage()
+
+        with pytest.raises(NoStoredMetadata, match="tg:111"):
+            await mirror_repository.get()
+
+        mock_fc_repo.save.assert_not_called()
+        mock_message_api.pin_message.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_get_with_a_pinned_message_still_reads_it(
+        self,
+        mirror_repository,
+        mock_message_api,
+        mock_fc_repo,
+        sample_pinned_message,
+        sample_metadata,
+    ):
+        mock_message_api.get_pinned_message.return_value = sample_pinned_message
+
+        async def mock_content_iterator():
+            yield json.dumps(sample_metadata.to_dict()).encode()
+
+        mock_fc_repo.get.return_value = mock_content_iterator()
+
+        result = await mirror_repository.get()
+
+        assert isinstance(result, TGFSMetadata)
+        assert mirror_repository._message_id == 123
+
+    @pytest.mark.asyncio
+    async def test_default_repository_still_bootstraps(
+        self, repository, mock_message_api, mock_fc_repo, sample_pinned_message
+    ):
+        mock_message_api.get_pinned_message.side_effect = [
+            NoPinnedMessage(),
+            sample_pinned_message,
+        ]
+        mock_fc_repo.save.return_value = [SentFileMessage(message_id=123, size=1024)]
+
+        async def mock_content_iterator():
+            yield json.dumps(TGFSMetadata(TGFSDirectory.root_dir()).to_dict()).encode()
+
+        mock_fc_repo.get.return_value = mock_content_iterator()
+
+        result = await repository.get()
+
+        assert isinstance(result, TGFSMetadata)
+        mock_fc_repo.save.assert_called_once()

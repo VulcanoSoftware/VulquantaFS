@@ -5,7 +5,14 @@ import logging
 
 import pytest
 
-from tgdcfs.config import Config, FilesystemConfig, MetadataType, StoreConfig
+from tgdcfs.config import (
+    Config,
+    FilesystemConfig,
+    GitlabRepoConfig,
+    MetadataConfig,
+    MetadataType,
+    StoreConfig,
+)
 
 TELEGRAM = {
     "api_id": 12345,
@@ -533,3 +540,199 @@ class TestLegacyLayout:
         del data["tgfs"]["metadata"]["-1002"]
         config = Config.from_dict(data)
         assert list(config.filesystems) == ["media"]
+
+
+class TestMetadataMirrors:
+    """Redundant metadata stores: parsing, defaults and the collision
+    rules between the stores of one file system."""
+
+    def test_no_mirrors_is_the_classic_setup(self):
+        fs = FilesystemConfig.from_dict("media", {"primary": "tg-main"})
+        assert fs.metadata_mirrors == []
+        assert fs.metadata_stores == [fs.metadata]
+
+    def test_pinned_store_defaults_to_the_primary(self):
+        fs = FilesystemConfig.from_dict(
+            "media",
+            {"primary": "tg-main", "metadata": {"type": "pinned_message"}},
+        )
+        assert fs.metadata.store == "tg-main"
+
+        # A lone pinned mirror defaults to the primary as well.
+        fs = FilesystemConfig.from_dict(
+            "media",
+            {
+                "primary": "tg-main",
+                "metadata": {
+                    "type": "github_repo",
+                    "github_repo": {
+                        "repo": "owner/repo",
+                        "commit": "main",
+                        "access_token": "t",
+                    },
+                },
+                "metadata_mirrors": [{"type": "pinned_message"}],
+            },
+        )
+        assert fs.metadata_mirrors[0].store == "tg-main"
+
+    def test_a_pinned_mirror_can_target_a_mirror_store(self):
+        fs = FilesystemConfig.from_dict(
+            "media",
+            {
+                "primary": "tg-main",
+                "mirrors": ["dc-spare"],
+                "metadata": {"type": "pinned_message"},
+                "metadata_mirrors": [{"type": "pinned_message", "store": "dc-spare"}],
+            },
+        )
+        # Telegram and Discord pinned messages are two separate stores.
+        assert fs.metadata.key == "pinned_message@tg-main"
+        assert fs.metadata_mirrors[0].key == "pinned_message@dc-spare"
+
+    def test_github_and_gitlab_mirrors(self):
+        fs = FilesystemConfig.from_dict(
+            "media",
+            {
+                "primary": "tg-main",
+                "metadata": {"type": "pinned_message"},
+                "metadata_mirrors": [
+                    {
+                        "type": "github_repo",
+                        "github_repo": {
+                            "repo": "owner/repo",
+                            "commit": "main",
+                            "access_token": "t",
+                        },
+                    },
+                    {
+                        "type": "gitlab_repo",
+                        "gitlab_repo": {
+                            "repo": "group/project",
+                            "branch": "main",
+                            "access_token": "t",
+                        },
+                    },
+                ],
+            },
+        )
+        assert fs.metadata_mirrors[0].type == MetadataType.GITHUB_REPO
+        assert fs.metadata_mirrors[0].key == "github_repo@owner/repo@main"
+        assert fs.metadata_mirrors[1].type == MetadataType.GITLAB_REPO
+        assert fs.metadata_mirrors[1].key == "gitlab_repo@group/project@main"
+        assert len(fs.metadata_stores) == 3
+
+    def test_two_pinned_stores_on_one_channel_are_rejected(self):
+        with pytest.raises(ValueError, match="two pinned_message metadata stores"):
+            FilesystemConfig.from_dict(
+                "media",
+                {
+                    "primary": "tg-main",
+                    "metadata": {"type": "pinned_message"},
+                    "metadata_mirrors": [{"type": "pinned_message"}],
+                },
+            )
+
+    def test_a_pinned_store_outside_the_filesystem_is_rejected(self):
+        data = current_layout(
+            filesystems={
+                "media": {
+                    "primary": "tg-main",
+                    "mirrors": ["tg-spare"],
+                    "metadata": {"type": "pinned_message"},
+                    "metadata_mirrors": [
+                        {"type": "pinned_message", "store": "tg-elsewhere"}
+                    ],
+                },
+            }
+        )
+        with pytest.raises(ValueError, match="neither the file system's primary"):
+            Config.from_dict(data)
+
+    def test_the_same_git_repo_twice_is_rejected(self):
+        gh = {"repo": "owner/repo", "commit": "main", "access_token": "t"}
+        with pytest.raises(ValueError, match="listed twice"):
+            FilesystemConfig.from_dict(
+                "media",
+                {
+                    "primary": "tg-main",
+                    "metadata": {"type": "github_repo", "github_repo": gh},
+                    "metadata_mirrors": [{"type": "github_repo", "github_repo": gh}],
+                },
+            )
+
+    def test_a_gitlab_repo_without_a_gitlab_block_is_rejected(self):
+        with pytest.raises(ValueError, match="GitLab repo configuration is required"):
+            FilesystemConfig.from_dict(
+                "media",
+                {
+                    "primary": "tg-main",
+                    "metadata_mirrors": [{"type": "gitlab_repo"}],
+                },
+            )
+
+
+class TestGitlabRepoConfig:
+    def test_from_dict(self):
+        config = GitlabRepoConfig.from_dict(
+            {
+                "repo": "group/project",
+                "branch": "main",
+                "access_token": "glpat-token",
+            }
+        )
+        assert config.repo == "group/project"
+        assert config.branch == "main"
+        assert config.access_token == "glpat-token"
+        assert config.base_url == "https://gitlab.com"
+        assert config.file_path == "metadata.json"
+
+    def test_overrides(self):
+        config = GitlabRepoConfig.from_dict(
+            {
+                "repo": "group/project",
+                "branch": "main",
+                "access_token": "glpat-token",
+                "base_url": "https://gitlab.example.com/",
+                "file_path": "/backups/meta.json",
+            }
+        )
+        assert config.base_url == "https://gitlab.example.com"
+        assert config.file_path == "backups/meta.json"
+
+    @pytest.mark.parametrize("missing", ["repo", "branch", "access_token"])
+    def test_required_fields(self, missing):
+        data = {
+            "repo": "group/project",
+            "branch": "main",
+            "access_token": "glpat-token",
+        }
+        del data[missing]
+        with pytest.raises(ValueError, match=missing):
+            GitlabRepoConfig.from_dict(data)
+
+    def test_a_non_http_base_url_is_rejected(self):
+        with pytest.raises(ValueError, match="http"):
+            GitlabRepoConfig.from_dict(
+                {
+                    "repo": "group/project",
+                    "branch": "main",
+                    "access_token": "t",
+                    "base_url": "ftp://gitlab.example.com",
+                }
+            )
+
+    def test_a_directory_file_path_is_rejected(self):
+        with pytest.raises(ValueError, match="file"):
+            GitlabRepoConfig.from_dict(
+                {
+                    "repo": "group/project",
+                    "branch": "main",
+                    "access_token": "t",
+                    "file_path": "/",
+                }
+            )
+
+    def test_gitlab_is_listed_among_the_metadata_types(self):
+        with pytest.raises(ValueError, match="gitlab_repo"):
+            MetadataConfig.from_dict({"type": "carrier-pigeon"})

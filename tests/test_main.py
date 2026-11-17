@@ -166,8 +166,10 @@ class TestMain:
         mock_clients = mocker.Mock()
         stats = mocker.Mock()
         stats.close = mocker.AsyncMock()
+        metadata_api = mocker.Mock()
+        metadata_api.close = mocker.AsyncMock()
         mock_clients.values.return_value = [
-            mocker.Mock(file_api=mocker.Mock(stats=stats))
+            mocker.Mock(file_api=mocker.Mock(stats=stats), metadata_api=metadata_api)
         ]
         mock_app = mocker.Mock()
 

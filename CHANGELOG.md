@@ -77,6 +77,26 @@ the fact on the commits that shipped them.
   directories are now read in parallel instead of one round trip after
   another, and the load logs how many directories it read and how long
   the fallback took.
+- Redundant metadata (RAID-1 for the metadata, like the file stores have
+  for the file bytes). A file system can list extra metadata stores under
+  `metadata_mirrors`: any combination of a pinned message in a specific
+  store's channel (`store: <name>` -- a Telegram pinned message and a
+  Discord pinned message are two separate, individually configurable
+  stores), a `github_repo` and a new `gitlab_repo` type. Every metadata
+  write goes to the primary store and to each mirror; a store that is
+  temporarily unreachable is skipped and marked stale, writes and reads
+  continue with the stores that are up, and a background task (every 30 s,
+  plus once right after start) re-writes the stale stores until they take
+  the tree again. On a restart the tree is loaded from the first store
+  that answers, preferring the primary, so a store that was down still
+  serves its last consistent copy. `gitlab_repo` keeps the whole tree as
+  one document (`metadata.json` by default, AES-256-GCM encrypted when
+  at-rest encryption is on) in a GitLab repository -- gitlab.com or a
+  self-hosted instance via `base_url`. Without `metadata_mirrors` nothing
+  changes: the classic single-store behaviour (including the pinned
+  copies a pinned-message metadata store keeps in the mirror channels)
+  is preserved. The manager API reports the stores that still await
+  healing.
 
 ### Changed
 

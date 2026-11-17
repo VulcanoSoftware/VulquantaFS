@@ -6,9 +6,10 @@ from tgdcfs.core.mirror import MirrorGroup
 from tgdcfs.core.model import TGFSDirectory, TGFSFileVersion, TGFSMetadata
 from tgdcfs.core.repository.interface import IFileContentRepository, IMetaDataRepository
 from tgdcfs.errors import (
+    MetadataBlobTooLarge,
     MetadataNotInitialized,
     NoPinnedMessage,
-    TechnicalError,
+    NoStoredMetadata,
 )
 from tgdcfs.reqres import (
     FileMessageFromBuffer,
@@ -18,10 +19,14 @@ from tgdcfs.reqres import (
 
 
 class PinnedMessageMetadataRepository(IMetaDataRepository):
-    """The directory tree as a pinned document in the primary store.
+    """The directory tree as a pinned document in one store.
 
-    Backend-agnostic; the mirror group keeps a pinned copy in every
-    mirror store so any of them can be promoted to primary.
+    Backend-agnostic. With a ``mirror_group`` (the classic single-metadata
+    setup) it also keeps a pinned copy in every mirror store so any of
+    them can be promoted to primary. Without one it manages exactly the
+    one pinned document of ``store`` -- the shape a redundant metadata
+    store takes inside the replicated layer, where each pinned copy is an
+    independent store with its own failover.
     """
 
     METADATA_FILE_NAME = "metadata.json"
@@ -31,12 +36,18 @@ class PinnedMessageMetadataRepository(IMetaDataRepository):
         store: IStore,
         fc_repo: IFileContentRepository,
         mirror_group: Optional[MirrorGroup] = None,
+        create_if_missing: bool = True,
     ):
         super().__init__()
 
         self._message_api = store
         self._fc_repo = fc_repo
         self._mirror_group = mirror_group
+        # True for a primary metadata store: a fresh installation has no
+        # pinned document yet and bootstraps one. False for a redundant
+        # copy: an empty store must surface as "no data", not silently
+        # become a fresh empty tree that wins the failover.
+        self._create_if_missing = create_if_missing
 
         self._message_id: Optional[int] = None
         # Mirror store key -> message id of the pinned metadata copy there.
@@ -51,11 +62,10 @@ class PinnedMessageMetadataRepository(IMetaDataRepository):
         # the blob has to fit one message of the store. That is 2 GiB on
         # Telegram and a few tens of megabytes on Discord.
         if len(buffer) > self._message_api.caps.max_part_bytes:
-            raise TechnicalError(
-                f"The metadata blob ({len(buffer)} bytes) does not fit one message "
-                f"of store {self._message_api.key} "
-                f"({self._message_api.caps.max_part_bytes} bytes); use the "
-                f"github_repo metadata type for this file system"
+            raise MetadataBlobTooLarge(
+                len(buffer),
+                self._message_api.key,
+                self._message_api.caps.max_part_bytes,
             )
         if self._message_id is not None:
             await self._fc_repo.update(
@@ -107,6 +117,8 @@ class PinnedMessageMetadataRepository(IMetaDataRepository):
         try:
             pinned_message = await self._message_api.get_pinned_message()
         except NoPinnedMessage:
+            if not self._create_if_missing:
+                raise NoStoredMetadata(self._message_api.key) from None
             pinned_message = await self.new_metadata()
 
         temp_fv = TGFSFileVersion.from_sent_file_message(
