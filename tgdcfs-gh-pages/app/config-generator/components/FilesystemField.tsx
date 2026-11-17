@@ -16,6 +16,7 @@ import {
 import {
   FilesystemConfig,
   MetadataEntry,
+  MetadataLayout,
   MetadataType,
   MirrorMode,
   StoreConfig,
@@ -49,14 +50,17 @@ interface FilesystemFieldProps {
 const storeLabel = (store: StoreConfig) =>
   `${store.name || "(unnamed)"} · ${store.backend}`;
 
+const layoutLabel = (layout: MetadataLayout): string =>
+  layout === "document" ? "Single JSON document" : "Mirrored tree (default)";
+
 const metadataDescription = (type: MetadataType): string => {
   if (type === "pinned_message") {
     return "The directory tree is kept as a JSON document pinned in a store's channel and copied to every file mirror. Never delete the pinned file or pin anything else in that channel. On a Discord store the tree has to fit one attachment; use a repository store for anything but small trees. The Store field picks the channel: the file system's primary store by default, or any other store -- a pinned copy in a Telegram store and one in a Discord store are two separate metadata stores this way.";
   }
   if (type === "github_repo") {
-    return "The directory tree is kept in a GitHub repository, so it survives even the loss of every store. Recommended whenever mirrors are configured.";
+    return "The directory tree is kept in a GitHub repository, so it survives even the loss of every store. Recommended whenever mirrors are configured. Layout 'mirrored tree' stores one blob per directory and writes incrementally; layout 'single JSON document' rewrites one file on every push, the same shape the pinned-message store uses.";
   }
-  return "The directory tree is kept as one JSON document in a GitLab repository and rewritten on every push, the same shape the pinned-message store uses. Base URL points at a self-hosted GitLab; the default is gitlab.com.";
+  return "The metadata is kept in a GitLab repository. Layout 'mirrored tree' (the default) stores it exactly like the GitHub repository store: one blob per directory, written incrementally. Layout 'single JSON document' rewrites one file on every push, the same shape the pinned-message store uses. Base URL points at a self-hosted GitLab; the default is gitlab.com.";
 };
 
 interface MetadataStoreEditorProps {
@@ -169,6 +173,35 @@ function MetadataStoreEditor({
               Get Token
             </Button>
           </Box>
+          <Box
+            sx={{ display: "flex", alignItems: "flex-start", gap: 1, mb: 1 }}
+          >
+            <FormControl size="small" sx={{ minWidth: 240 }}>
+              <InputLabel>Layout</InputLabel>
+              <Select
+                value={entry.github_repo.layout}
+                label="Layout"
+                onChange={(e) =>
+                  updateGithub(
+                    "layout",
+                    e.target.value as MetadataLayout
+                  )
+                }
+              >
+                <MenuItem value="tree">{layoutLabel("tree")}</MenuItem>
+                <MenuItem value="document">{layoutLabel("document")}</MenuItem>
+              </Select>
+            </FormControl>
+            {entry.github_repo.layout === "document" && (
+              <ConfigTextField
+                label="File Path"
+                value={entry.github_repo.file_path}
+                onChange={(e) => updateGithub("file_path", e.target.value)}
+                helperText="Where the JSON document lives; default: metadata.json"
+                style={{ flex: 1 }}
+              />
+            )}
+          </Box>
         </>
       )}
       {entry.type === "gitlab_repo" && (
@@ -229,9 +262,25 @@ function MetadataStoreEditor({
               label="File Path"
               value={entry.gitlab_repo.file_path}
               onChange={(e) => updateGitlab("file_path", e.target.value)}
-              helperText="Default: metadata.json"
+              helperText="Document layout, or a document left by an older release; default: metadata.json"
               width={220}
             />
+            <FormControl size="small" sx={{ minWidth: 220 }}>
+              <InputLabel>Layout</InputLabel>
+              <Select
+                value={entry.gitlab_repo.layout}
+                label="Layout"
+                onChange={(e) =>
+                  updateGitlab(
+                    "layout",
+                    e.target.value as MetadataLayout
+                  )
+                }
+              >
+                <MenuItem value="tree">{layoutLabel("tree")}</MenuItem>
+                <MenuItem value="document">{layoutLabel("document")}</MenuItem>
+              </Select>
+            </FormControl>
           </Box>
         </>
       )}

@@ -49,7 +49,7 @@ def login(username: str, password: str) -> str:
 
 
 def authenticate(token: str) -> User:
-    payload: JWTPayload = jwt.decode(
+    payload = jwt.decode(
         token, key=jwt_config.secret, algorithms=[jwt_config.algorithm]
     )
 

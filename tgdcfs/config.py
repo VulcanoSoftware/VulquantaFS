@@ -161,6 +161,25 @@ class EncryptionConfig:
         )
 
 
+class MetadataLayout(Enum):
+    # How a repository metadata store keeps the directory tree: mirrored
+    # into the repo's own directory structure (one blob per directory,
+    # written incrementally -- the ``github_repo`` shape) or as one JSON
+    # document that is rewritten on every push (the pinned-message shape,
+    # a drop-in redundant copy next to any other metadata store).
+    TREE = "tree"
+    DOCUMENT = "document"
+
+
+def _parse_metadata_layout(field: str, value: object) -> MetadataLayout:
+    raw = str(value or MetadataLayout.TREE.value).strip().lower()
+    try:
+        return MetadataLayout(raw)
+    except ValueError:
+        allowed = ", ".join(layout.value for layout in MetadataLayout)
+        raise ValueError(f"{field} must be one of {allowed}, got {raw!r}") from None
+
+
 @dataclass
 class GithubRepoConfig:
     # How many directories the truncated-tree fallback reads in parallel.
@@ -173,6 +192,16 @@ class GithubRepoConfig:
     commit: str
     access_token: str
     tree_fetch_concurrency: int = DEFAULT_TREE_FETCH_CONCURRENCY
+    # How the metadata tree is stored in the repo: mirrored into the
+    # repo's own directory structure (one blob per directory, written
+    # incrementally) or as one JSON document that is rewritten on every
+    # push, the same shape the pinned-message store uses.
+    layout: MetadataLayout = MetadataLayout.TREE
+    # Where the document layout keeps the JSON document; unused by the
+    # tree layout.
+    file_path: str = "metadata.json"
+
+    DEFAULT_FILE_PATH = "metadata.json"
 
     @classmethod
     def from_dict(cls, data: dict) -> Self:
@@ -184,11 +213,20 @@ class GithubRepoConfig:
                 "metadata.github_repo.tree_fetch_concurrency must be "
                 f"positive, got {concurrency}"
             )
+        file_path = str(data.get("file_path") or cls.DEFAULT_FILE_PATH).strip("/")
+        if not file_path or file_path.endswith("/"):
+            raise ValueError(
+                f"metadata.github_repo.file_path must name a file, got {file_path!r}"
+            )
         return cls(
             repo=data["repo"],
             commit=data["commit"],
             access_token=data["access_token"],
             tree_fetch_concurrency=concurrency,
+            layout=_parse_metadata_layout(
+                "metadata.github_repo.layout", data.get("layout")
+            ),
+            file_path=file_path,
         )
 
 
@@ -279,13 +317,14 @@ class MetadataConfig:
 
 @dataclass
 class GitlabRepoConfig:
-    """A GitLab repository holding the metadata as one JSON document.
+    """A GitLab repository holding the metadata.
 
-    Unlike ``github_repo`` (which mirrors the tree into the repo's own
-    directory structure), ``gitlab_repo`` keeps the whole tree in a single
-    file -- ``metadata.json`` by default -- and rewrites it on every push,
-    the same shape the pinned-message store uses. That keeps it small and
-    makes it a drop-in redundant copy next to any other metadata store.
+    By default the tree is mirrored into the repo's own directory
+    structure, exactly like ``github_repo``. With ``layout: document`` it
+    keeps the whole tree in a single file -- ``metadata.json`` by default
+    -- and rewrites it on every push, the same shape the pinned-message
+    store uses. That keeps it small and makes it a drop-in redundant copy
+    next to any other metadata store.
 
     ``repo`` is ``group/project`` (URL-quoted for the API) or a numeric
     project id. ``base_url`` points at a self-hosted GitLab; it defaults
@@ -298,6 +337,13 @@ class GitlabRepoConfig:
     access_token: str
     base_url: str = "https://gitlab.com"
     file_path: str = "metadata.json"
+    # Like ``github_repo``: the tree mirrored into the repo's own
+    # directory structure (the default, the same shape ``github_repo``
+    # uses), or one JSON document at ``file_path``. A copy written by an
+    # older release (before the layout existed) is a document and is
+    # migrated automatically: the tree layout falls back to reading it
+    # until the first push has mirrored the tree.
+    layout: MetadataLayout = MetadataLayout.TREE
 
     DEFAULT_BASE_URL = "https://gitlab.com"
     DEFAULT_FILE_PATH = "metadata.json"
@@ -326,6 +372,9 @@ class GitlabRepoConfig:
             access_token=str(access_token),
             base_url=base_url,
             file_path=file_path,
+            layout=_parse_metadata_layout(
+                "metadata.gitlab_repo.layout", data.get("layout")
+            ),
         )
 
 

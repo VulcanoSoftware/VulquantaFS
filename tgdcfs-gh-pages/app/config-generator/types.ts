@@ -12,6 +12,10 @@ export interface StoreConfig {
 }
 
 export type MetadataType = "pinned_message" | "github_repo" | "gitlab_repo";
+// How a repository metadata store (GitHub or GitLab) keeps the tree:
+// mirrored into the repository's own directory structure, or as one JSON
+// document that is rewritten on every push (the pinned-message shape).
+export type MetadataLayout = "tree" | "document";
 export type MirrorMode = "auto" | "forward" | "reupload";
 export type SyncMode = "inline" | "background" | "tee";
 // When a write is answered: once the primary store has it, or once the
@@ -32,6 +36,11 @@ export interface MetadataEntry {
     repo: string;
     commit: string;
     access_token: string;
+    layout: MetadataLayout;
+    // document layout only: where the JSON document lives. The tree
+    // layout uses it to find (and remove) a document left by an older
+    // release or by the document layout.
+    file_path: string;
   };
   gitlab_repo: {
     repo: string;
@@ -39,6 +48,7 @@ export interface MetadataEntry {
     access_token: string;
     base_url: string;
     file_path: string;
+    layout: MetadataLayout;
   };
 }
 
@@ -52,13 +62,20 @@ export const GITLAB_DEFAULTS = {
 export const newMetadataEntry = (): MetadataEntry => ({
   type: "pinned_message",
   store: "",
-  github_repo: { repo: "", commit: "master", access_token: "" },
+  github_repo: {
+    repo: "",
+    commit: "master",
+    access_token: "",
+    layout: "tree",
+    file_path: GITLAB_DEFAULTS.file_path,
+  },
   gitlab_repo: {
     repo: "",
     branch: "master",
     access_token: "",
     base_url: GITLAB_DEFAULTS.base_url,
     file_path: GITLAB_DEFAULTS.file_path,
+    layout: "tree",
   },
 });
 

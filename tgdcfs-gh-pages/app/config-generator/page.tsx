@@ -93,13 +93,20 @@ type ConfigUpdatePaths = {
 type MetadataEntryYaml = {
   type: string;
   store?: string;
-  github_repo?: { repo: string; commit: string; access_token: string };
+  github_repo?: {
+    repo: string;
+    commit: string;
+    access_token: string;
+    layout?: string;
+    file_path?: string;
+  };
   gitlab_repo?: {
     repo: string;
     branch: string;
     access_token: string;
     base_url?: string;
     file_path?: string;
+    layout?: string;
   };
 };
 
@@ -109,7 +116,20 @@ const metadataEntryYaml = (entry: MetadataEntry): MetadataEntryYaml => {
     yaml.store = entry.store.trim();
   }
   if (entry.type === "github_repo") {
-    yaml.github_repo = entry.github_repo;
+    const filePath = entry.github_repo.file_path.trim();
+    yaml.github_repo = {
+      repo: entry.github_repo.repo,
+      commit: entry.github_repo.commit,
+      access_token: entry.github_repo.access_token,
+      // The tree layout is the loader's default; only the document
+      // layout has to be spelled out.
+      ...(entry.github_repo.layout === "document"
+        ? { layout: entry.github_repo.layout }
+        : {}),
+      ...(filePath !== "" && filePath !== GITLAB_DEFAULTS.file_path
+        ? { file_path: filePath }
+        : {}),
+    };
   }
   if (entry.type === "gitlab_repo") {
     const baseUrl = entry.gitlab_repo.base_url.trim();
@@ -123,6 +143,9 @@ const metadataEntryYaml = (entry: MetadataEntry): MetadataEntryYaml => {
         : {}),
       ...(filePath !== "" && filePath !== GITLAB_DEFAULTS.file_path
         ? { file_path: filePath }
+        : {}),
+      ...(entry.gitlab_repo.layout === "document"
+        ? { layout: entry.gitlab_repo.layout }
         : {}),
     };
   }
