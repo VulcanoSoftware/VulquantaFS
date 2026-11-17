@@ -67,6 +67,9 @@ export function DockerRunPanel({
   const [pathStyle, setPathStyle] = useState<PathStyle>("unix");
   const [hostPath, setHostPath] = useState(defaultHostPath("unix", hostDirName));
   const [detached, setDetached] = useState(false);
+  // The image runs as the unprivileged "tgdcfs" user; root is an opt-in
+  // override for host directories it cannot read or write.
+  const [asRoot, setAsRoot] = useState(false);
   const [copied, setCopied] = useState(false);
 
   const engineName = engine === "podman" ? "Podman" : "Docker";
@@ -93,6 +96,7 @@ export function DockerRunPanel({
     detached ? "-d --restart unless-stopped" : "-it",
     "--pull=always",
     `--name ${containerName}`,
+    ...(asRoot ? ["--user root"] : []),
     ...uniquePorts.map((p) => `-p ${p}:${p}`),
     ...envVars.map((name) => `-e ${name}`),
     `-v "${hostPath}:${dataDir}"`,
@@ -106,6 +110,7 @@ export function DockerRunPanel({
     `  ${containerName}:`,
     `    image: ${selectedImage}:latest`,
     `    container_name: ${containerName}`,
+    ...(asRoot ? ["    user: root"] : []),
     "    pull_policy: always",
     "    restart: unless-stopped",
     ...(uniquePorts.length > 0
@@ -215,6 +220,24 @@ export function DockerRunPanel({
           }
           sx={{ mb: 1 }}
         />
+      )}
+      <FormControlLabel
+        label="Run the container as root"
+        control={
+          <Checkbox
+            checked={asRoot}
+            onChange={(e) => setAsRoot(e.target.checked)}
+            size="small"
+          />
+        }
+        sx={{ mb: asRoot ? 0 : 1 }}
+      />
+      {asRoot && (
+        <Typography variant="body2" color="text.secondary" sx={{ mb: 1 }}>
+          The image runs as the unprivileged user &quot;tgdcfs&quot; by default; root
+          is only needed when it cannot read or write the directory mounted
+          below (a warning about permissions in the container logs).
+        </Typography>
       )}
       <Box
         sx={{
