@@ -54,16 +54,16 @@ class GithubDocumentMetadataRepository(IMetaDataRepository):
         # AES-256-GCM key for the blob when at-rest encryption is enabled;
         # ``None`` stores the document as plain JSON.
         self._blob_key = blob_key
-        # Lazy: the repository resolves on the first API call (which runs
+        # Lazy: the repository completes on the first API call (which runs
         # in ``asyncio.to_thread``), so construction stays off the network
         # and an unreachable GitHub surfaces as this store's read error --
         # the replicated layer fails over to the next store and the heal
         # worker catches this one up later. The bounded retry keeps that
         # first failure at about a minute instead of PyGithub's default
         # ten-attempt cycle.
-        self._repo = Github(
-            config.access_token, lazy=True, retry=GithubRetry(total=3)
-        ).get_repo(config.repo)
+        self._repo = Github(config.access_token, retry=GithubRetry(total=3)).get_repo(
+            config.repo, lazy=True
+        )
         # Whether the document exists in the repo; ``None`` until the first
         # successful read or write answered the question.
         self._exists: Optional[bool] = None

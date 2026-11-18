@@ -134,9 +134,10 @@ class TestGithubRepoMetadataRepository:
         mock_github_class.assert_called_once()
         call = mock_github_class.call_args
         assert call.args == ("test_token",)
-        assert call.kwargs["lazy"] is True
         assert call.kwargs["retry"].total == 3
-        mock_github_instance.get_repo.assert_called_once_with("owner/test-repo")
+        mock_github_instance.get_repo.assert_called_once_with(
+            "owner/test-repo", lazy=True
+        )
         assert repository._ghc.repo_name == "owner/test-repo"
         assert repository._ghc.commit == "main"
         assert repository._ghc.repo == mock_repo
