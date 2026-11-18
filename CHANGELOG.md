@@ -18,6 +18,20 @@ the fact on the commits that shipped them.
 
 ### Fixed
 
+- The primary metadata store is no longer the source of truth by
+  definition. It always was, so a mirror that kept receiving writes
+  while the primary was down (as reported in the logs: metadata was
+  still written to the mirror) lost those writes at the next boot to
+  the primary's older copy -- which was then also synced over the
+  mirror, erasing them there too. Every store is now read at start and
+  dated: git stores by the branch head commit's date, document and
+  pinned-message stores by a revision that every push writes into the
+  metadata document. The most recent tree is served and the older
+  stores are re-synced to it, primary included. Within a short window
+  (~1 minute) the primary keeps the lead, so the blink between two
+  stores' write clocks never flips the source of truth in calm
+  operation.
+
 - The metadata store constructors no longer touch the network. The
   GitHub stores resolved their repository with a blocking call in
   `__init__`, on the event loop, while the configuration loaded: with

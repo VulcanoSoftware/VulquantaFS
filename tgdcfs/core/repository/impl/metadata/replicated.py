@@ -26,15 +26,18 @@ Behaviour:
   serving its last consistent copy, which is what a read failover after
   a restart falls back to.
 
-Conflict handling is deliberately simple (last writer wins, primary
-preferred on load): the stores are written on every push, so they only
-diverge when one of them is down -- exactly the situation the heal
-closes.
+Conflict handling: every push stamps the tree with a revision (see
+``TGFSMetadata.revision``) and the load serves the store with the
+freshest one -- the primary only by preference when a mirror is not
+meaningfully newer, never by force. The stores only diverge while one
+of them is down, exactly the situation the heal closes; a store whose
+copy was beaten at load is handed the winner's tree like a stale one.
 """
 
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import dataclass
 from typing import Iterable, List, Optional, Sequence, Set
 
@@ -53,6 +56,14 @@ logger = logging.getLogger(__name__)
 # A store that answers "I hold no metadata document yet" is empty, not
 # broken. Both blob-store shapes raise one of these on a fresh store.
 EMPTY_METADATA_ERRORS = (NoPinnedMessage, NoStoredMetadata)
+
+# A mirror's copy is always written shortly after the primary's (the
+# writes run in order) and the clocks behind the revisions are not one
+# clock: git stores report their server's commit date, document stores
+# the time of the writing process. A mirror only wins the load when it
+# is newer by more than this much -- otherwise the primary keeps the
+# lead, and calm operation never flips the source of truth.
+PRIMARY_FRESHNESS_WINDOW_SECONDS = 60.0
 
 
 @dataclass
@@ -116,12 +127,19 @@ class ReplicatedMetadataRepository(IMetaDataRepository):
         await self.push()
 
     async def _load(self) -> TGFSMetadata:
-        """The tree to serve: the primary's, or a mirror's when the
-        primary cannot be read; a fresh tree when every store is empty.
+        """The tree to serve: the most recent one across the stores.
 
-        Stores that could not serve a tree (failed *or* empty) are marked
-        stale, so the push that follows and the periodic heal write the
-        winning tree to them."""
+        Every store that answers is read and dated by its revision, so
+        the copy a store received while the primary was down wins over
+        the primary's older one; git stores date themselves by their
+        branch head commit. The primary is preferred only while no other
+        store is meaningfully newer, so calm operation never flips the
+        source of truth on the split seconds between two stores' clocks.
+
+        Stores that could not serve a tree (failed *or* empty *or* older
+        than the winner) are marked stale, so the push that follows and
+        the periodic heal write the winning tree to them."""
+        candidates: List[tuple[MetadataStore, TGFSMetadata]] = []
         fresh: Optional[TGFSMetadata] = None
         fresh_store: Optional[MetadataStore] = None
         failures: List[str] = []
@@ -129,13 +147,7 @@ class ReplicatedMetadataRepository(IMetaDataRepository):
 
         for store in self._stores:
             try:
-                tree = await store.repo.get()
-                if not store.primary:
-                    logger.info(
-                        f"Metadata store {store.key} served the tree; the "
-                        f"primary will be re-synced"
-                    )
-                return tree
+                candidates.append((store, await store.repo.get()))
             except EMPTY_METADATA_ERRORS:
                 # The store is reachable and holds nothing. Remember the
                 # first one; if no store holds a tree, this is where a
@@ -153,22 +165,64 @@ class ReplicatedMetadataRepository(IMetaDataRepository):
                     f"Could not read the metadata from store {store.key}: {ex}"
                 )
 
-        if fresh is not None and fresh_store is not None:
-            if failures:
-                logger.warning(
-                    f"No metadata store could serve a tree ({'; '.join(failures)}); "
-                    f"starting from the empty tree of {fresh_store.key}"
+        if not candidates:
+            if fresh is not None and fresh_store is not None:
+                if failures:
+                    logger.warning(
+                        f"No metadata store could serve a tree "
+                        f"({'; '.join(failures)}); starting from the "
+                        f"empty tree of {fresh_store.key}"
+                    )
+                return fresh
+            raise TechnicalError(
+                "No metadata store could be read: " + "; ".join(failures)
+            ) from first_error
+
+        winner, tree = self._freshest(candidates)
+        for store, _ in candidates:
+            if store is not winner:
+                self._stale.add(store.key)
+                logger.info(
+                    f"Metadata store {winner.key} holds the most recent "
+                    f"metadata tree; store {store.key} will be re-synced"
                 )
-            return fresh
-        raise TechnicalError(
-            "No metadata store could be read: " + "; ".join(failures)
-        ) from first_error
+        return tree
+
+    def _freshest(
+        self,
+        candidates: Sequence[tuple[MetadataStore, TGFSMetadata]],
+    ) -> tuple[MetadataStore, TGFSMetadata]:
+        """The most recent tree among the loaded ones, the primary
+        preferred on a tie or when no store beats it beyond the window.
+        A tree without a revision (a legacy document, or a store that
+        could not date itself) ranks below every dated one."""
+        primary = self._stores[0]
+        primary_tree = next(
+            (tree for store, tree in candidates if store is primary), None
+        )
+
+        def revision(tree: TGFSMetadata) -> float:
+            return tree.revision if tree.revision is not None else 0.0
+
+        # A stable sort keeps the configuration order within equal dates.
+        ordered = sorted(candidates, key=lambda pair: revision(pair[1]), reverse=True)
+        winner, tree = ordered[0]
+        if (
+            winner is not primary
+            and primary_tree is not None
+            and primary_tree.revision is not None
+            and revision(primary_tree)
+            >= revision(tree) - PRIMARY_FRESHNESS_WINDOW_SECONDS
+        ):
+            return primary, primary_tree
+        return winner, tree
 
     # -- writing ---------------------------------------------------------------
 
     async def push(self) -> None:
         if not self.metadata:
             raise MetadataNotInitialized()
+        self._stamp_revision()
 
         any_store_ok = False
         errors: List[str] = []
@@ -190,6 +244,17 @@ class ReplicatedMetadataRepository(IMetaDataRepository):
             raise TechnicalError(
                 "Writing the metadata failed for every store: " + "; ".join(errors)
             )
+
+    def _stamp_revision(self) -> None:
+        """Date the tree being written, so the stores hold comparable
+        revisions at the next load. Document shaped stores serialize it
+        into the metadata document; git tree stores date themselves by
+        their branch head commit either way."""
+        tree = self.metadata
+        if tree is None:
+            return
+        now = time.time()
+        tree.revision = now if tree.revision is None else max(tree.revision, now)
 
     async def _write(
         self, store: MetadataStore, full: bool

@@ -81,11 +81,12 @@ class _GitTreeObject:
 
 
 class _Commit:
-    def __init__(self, sha: str):
+    def __init__(self, sha: str, committed_date: Optional[str] = None):
         self.sha = sha
         # GitLab exposes no tree ids; the tree API accepts the commit sha
         # as its ref, so the commit sha stands in for the tree sha.
         self.tree = _GitTreeObject(sha)
+        self.committer = type("_Committer", (), {"date": _parse_date(committed_date)})()
 
 
 class _CommitMeta:
@@ -305,8 +306,10 @@ class GitlabRepository:
     # -- reads -----------------------------------------------------------------
 
     def get_git_commit(self, sha: str) -> _Commit:
-        self._json(self._request("GET", f"/repository/commits/{quote(sha, safe='')}"))
-        return _Commit(sha)
+        data = self._json(
+            self._request("GET", f"/repository/commits/{quote(sha, safe='')}")
+        )
+        return _Commit(sha, data.get("committed_date"))
 
     def get_git_tree(self, sha: str, recursive: bool = False) -> _Tree:
         # A tree id the facade itself listed maps back to its path; a

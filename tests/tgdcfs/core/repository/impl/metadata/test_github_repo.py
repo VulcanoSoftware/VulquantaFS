@@ -169,6 +169,51 @@ class TestGithubRepoMetadataRepository:
         assert result.dir.parent is None
 
     @patch("tgdcfs.core.repository.impl.metadata.github_repo.Github")
+    @pytest.mark.asyncio
+    async def test_get_metadata_dates_the_tree_by_the_branch_head(
+        self, mock_github_class, mock_github_config
+    ):
+        """The replicated layer compares stores by this date."""
+        mock_github_instance = Mock(spec=Github)
+        mock_repo = Mock(spec=Repository)
+        mock_github_instance.get_repo.return_value = mock_repo
+        mock_github_class.return_value = mock_github_instance
+        mock_tree(mock_repo, [])
+
+        committed = datetime.datetime(2026, 6, 1, 12, 0, tzinfo=datetime.timezone.utc)
+        ref = Mock()
+        ref.object.sha = "commitsha"
+        mock_repo.get_git_ref.return_value = ref
+        commit = Mock()
+        commit.committer.date = committed
+        mock_repo.get_git_commit.return_value = commit
+
+        repository = GithubRepoMetadataRepository(mock_github_config)
+        result = await repository.get()
+
+        assert result.revision == committed.timestamp()
+
+    @patch("tgdcfs.core.repository.impl.metadata.github_repo.Github")
+    @pytest.mark.asyncio
+    async def test_get_metadata_survives_an_undatable_branch(
+        self, mock_github_class, mock_github_config
+    ):
+        """A branch without a head (a fresh repository) dates as unknown."""
+        mock_github_instance = Mock(spec=Github)
+        mock_repo = Mock(spec=Repository)
+        mock_github_instance.get_repo.return_value = mock_repo
+        mock_github_class.return_value = mock_github_instance
+        mock_tree(mock_repo, [])
+        mock_repo.get_git_ref.side_effect = GithubException(
+            404, {"message": "Not Found"}, None
+        )
+
+        repository = GithubRepoMetadataRepository(mock_github_config)
+        result = await repository.get()
+
+        assert result.revision is None
+
+    @patch("tgdcfs.core.repository.impl.metadata.github_repo.Github")
     def test_build_directory_structure_restores_root_timestamps(
         self, mock_github_class, mock_github_config
     ):
