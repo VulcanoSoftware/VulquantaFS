@@ -19,6 +19,16 @@ class NoSpaceInBufferDir(TechnicalError):
     """The disk behind ``upload_buffer_dir`` cannot take the staged bytes."""
 
 
+class HandleClosedError(TechnicalError, ValueError):
+    """A request reached a handle that was already closed or aborted.
+
+    Pipelined clients have dozens of writes in flight when an upload is
+    cut short; every one of them lands here. It is an expected outcome,
+    not a server fault, so the SFTP layer answers it without a traceback.
+    (``ValueError`` as well, which is what this used to raise.)
+    """
+
+
 SEEK_DATA = getattr(os, "SEEK_DATA", 3)
 SEEK_HOLE = getattr(os, "SEEK_HOLE", 4)
 
@@ -228,7 +238,7 @@ class WriteHandle(Handle):
         try:
             async with self._lock:
                 if self._closed:
-                    raise ValueError("write on a closed handle")
+                    raise HandleClosedError("write on a closed handle")
                 self._raise_if_failed()
                 if not data:
                     return

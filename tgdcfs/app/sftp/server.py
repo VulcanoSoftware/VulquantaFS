@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 import functools
 import logging
 import os.path
@@ -48,7 +49,7 @@ from tgdcfs.errors import (
 )
 
 from .attrs import dir_attrs, file_attrs, root_attrs
-from .handles import ReadHandle, WriteHandle
+from .handles import HandleClosedError, ReadHandle, WriteHandle
 from .paths import ResolvedPath, normalize, resolve
 
 logger = logging.getLogger(__name__)
@@ -60,6 +61,9 @@ USER_INFO_KEY = "tgdcfs_user"
 T = TypeVar("T")
 
 
+_LOGGED_ATTR = "_tgdcfs_sftp_logged"
+
+
 def _to_sftp_error(ex: Exception) -> asyncssh.SFTPError:
     if isinstance(ex, FileOrDirectoryDoesNotExist):
         return asyncssh.SFTPNoSuchFile(str(ex))
@@ -69,7 +73,17 @@ def _to_sftp_error(ex: Exception) -> asyncssh.SFTPError:
         return asyncssh.SFTPFailure(str(ex))
     if isinstance(ex, (InvalidName, InvalidPath)):
         return asyncssh.SFTPFailure(str(ex))
-    logger.exception("Unexpected error while serving an SFTP request")
+    if isinstance(ex, HandleClosedError):
+        logger.debug("SFTP request on a closed handle: %s", ex)
+    elif getattr(ex, _LOGGED_ATTR, False):
+        # A failed upload stores its error and hands the very same exception
+        # to every request that was in flight (a pipelining client has more
+        # than a hundred). One traceback says it all.
+        logger.debug("SFTP request failed with an already logged error: %s", ex)
+    else:
+        logger.exception("Unexpected error while serving an SFTP request")
+        with contextlib.suppress(Exception):  # an exception without a __dict__
+            setattr(ex, _LOGGED_ATTR, True)
     return asyncssh.SFTPFailure(str(ex) or ex.__class__.__name__)
 
 
@@ -197,6 +211,7 @@ class TGFSSFTPServer(asyncssh.SFTPServer):
         self, chan: asyncssh.SSHServerChannel, clients: Clients, config: Config
     ):
         super().__init__(chan)
+        self._channel = chan
         self._clients = clients
         self._config = config
         self._user: User = chan.get_extra_info(USER_INFO_KEY) or ReadonlyUser(
@@ -493,6 +508,17 @@ class TGFSSFTPServer(asyncssh.SFTPServer):
         if not isinstance(file_obj, (ReadHandle, WriteHandle)):
             return
         try:
+            if isinstance(file_obj, WriteHandle) and self._session_is_ending():
+                # asyncssh closes every handle that is still open when the
+                # session goes away -- through this very method, *before*
+                # it calls exit(). To the handle that looks like the
+                # client finishing its upload, so it would commit whatever
+                # arrived as a complete file (the log showed a 1 GB upload
+                # cut off at 105 MB stored as a finished version, after
+                # which FileZilla resumed from that size). A transfer the
+                # client dropped is aborted, never committed.
+                await file_obj.abort()
+                return
             await file_obj.close()
         finally:
             if file_obj in self._handles:
@@ -617,6 +643,15 @@ class TGFSSFTPServer(asyncssh.SFTPServer):
     # ------------------------------------------------------------------
     # session teardown
     # ------------------------------------------------------------------
+
+    def _session_is_ending(self) -> bool:
+        """True once the SSH channel is going away (client dropped, timed
+        out or disconnected), as opposed to the client asking to close one
+        handle on a live session."""
+        try:
+            return bool(self._channel.is_closing())
+        except Exception:  # pragma: no cover - a channel that cannot tell
+            return False
 
     async def exit(self) -> None:
         # Anything still open was not closed by the client, so the transfer
