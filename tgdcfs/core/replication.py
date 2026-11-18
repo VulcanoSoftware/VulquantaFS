@@ -7,6 +7,12 @@ per file system drains the queue by running the backfill's unit of work
 every version that lacks a copy in some mirror store and commits the
 result into the descriptor and the metadata.
 
+Workers also serve ``inline`` and ``tee`` file systems: there the write
+itself fills the mirrors, so the queue only receives the files a failed
+mirror write left without a copy. They are caught up the same way, so a
+store that was temporarily unreachable is brought current once it is
+back, without manual action.
+
 The queue is persisted as a small JSON file in the data directory, so a
 restart does not lose pending copies. Items are paths, which makes the
 queue idempotent: a file queued twice is processed once, and a file

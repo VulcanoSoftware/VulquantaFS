@@ -219,11 +219,10 @@ class Client:
         await metadata_api.init()
 
         on_written = None
-        # Every write goes to the queue when the mirrors are filled in the
-        # background or when the bytes still have to leave the cache.
-        if replication is not None and (
-            (not inline and mirror_group is not None) or write_back
-        ):
+        # Mirrors filled in the background put every write on the queue;
+        # inline and tee writes fill the mirrors themselves and only
+        # queue the files a copy is still missing from.
+        if replication is not None and (mirror_group is not None or write_back):
             queue = replication
             name = filesystem.name
 
@@ -239,7 +238,10 @@ class Client:
             mirror_group=mirror_group,
             inline_mirroring=inline,
             on_written=on_written,
-            written_gaps_only=tee,
+            # The write itself filled the mirrors (inline or tee), so the
+            # queue is only told about a file some store still lacks a
+            # copy of; in background mode every write is queued.
+            written_gaps_only=inline or tee,
             stat_api=FileStatApi(
                 fd_api,
                 validate=config.tgdcfs.listing.validate_on_list,

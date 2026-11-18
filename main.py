@@ -94,14 +94,20 @@ def start_cache_sweeper(
 def start_replication_workers(
     clients: Clients, config: Config, replication: ReplicationQueue
 ) -> List[ReplicationWorker]:
-    """One background worker per file system with ``sync: background``."""
+    """One background worker per replicated file system.
+
+    For ``sync: background`` it fills every mirror; for ``inline`` and
+    ``tee`` writes it closes the gaps a failed mirror write left behind,
+    so a store that was temporarily down is caught up without manual
+    action. It also drains the bytes a ``write_ack: cache`` write left
+    on the local disk.
+    """
     workers: List[ReplicationWorker] = []
     for filesystem in config.filesystems.values():
         client = clients.get(filesystem.name)
         if client is None:
             continue
-        background = filesystem.sync == "background" and filesystem.mirrors
-        if not background and filesystem.write_ack != "cache":
+        if not filesystem.mirrors and filesystem.write_ack != "cache":
             continue
         worker = ReplicationWorker(client, replication)
         worker.start()

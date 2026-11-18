@@ -15,7 +15,11 @@ from tgdcfs.core.api import DirectoryApi, FileApi, FileDescApi, MetaDataApi
 from tgdcfs.core.local_cache import LocalCache
 from tgdcfs.core.mirror import MirrorGroup, MirrorStore
 from tgdcfs.core.model import TGFSDirectory, TGFSFileVersion
-from tgdcfs.core.replication import ReplicationQueue, file_path
+from tgdcfs.core.replication import (
+    ReplicationQueue,
+    ReplicationWorker,
+    file_path,
+)
 from tgdcfs.core.repository.impl import (
     PinnedMessageMetadataRepository,
     StoreFDRepository,
@@ -486,6 +490,33 @@ class TestWritePath:
 
         assert not version.has_copy_in("dc:9")
         assert [item.path for item in queue.pending("fs")] == ["/a.bin"]
+        assert await stack.read("a.bin") == DATA
+
+    async def test_the_queued_gap_is_replicated_by_the_worker(self, tmp_path):
+        queue = ReplicationQueue(path=str(tmp_path / "queue.json"))
+        tg, dc = telegram_like(), discord_like()
+        dc.fail.add("upload")
+        stack = await Stack(tg, dc, queue=queue).init()
+        await stack.put("a.bin", DATA)
+        assert [i.path for i in queue.pending("fs")] == ["/a.bin"]
+        dc.fail.clear()
+        client = type(
+            "C",
+            (),
+            {
+                "name": "fs",
+                "mirror_group": stack.mirror_group,
+                "fd_repo": stack.fd_repo,
+                "metadata_api": stack.metadata_api,
+                "dir_api": stack.dir_api,
+            },
+        )()
+
+        assert await ReplicationWorker(client, queue).run_once() == 1  # type: ignore[arg-type]
+
+        assert queue.pending("fs") == []
+        version = await stack.version("a.bin")
+        assert version.has_copy_in("dc:9")
         assert await stack.read("a.bin") == DATA
 
     async def test_a_failing_primary_fails_the_write_and_stops_the_mirror(self):

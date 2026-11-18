@@ -62,10 +62,12 @@ class FileApi:
         # pushed; the replication queue hooks in here for
         # ``sync: background``.
         self._on_written = on_written
-        # ``sync: tee``: the write itself filled the mirrors that re-upload,
-        # so the queue is only told about a file some store still lacks a
-        # copy of (a mirror that failed mid-stream, a server-side copy
-        # that was refused, a copy of a file made without a stream).
+        # ``sync: inline`` or ``sync: tee``: the write itself filled the
+        # mirrors (re-uploading ones from the stream, the others copied
+        # server-side), so the queue is only told about a file some store
+        # still lacks a copy of (a mirror that failed mid-stream, a
+        # server-side copy that was refused, a copy of a file made without
+        # a stream). In background mode every write is queued.
         self._written_gaps_only = written_gaps_only
         # What listings show of a file; see ``FileStatApi``.
         self.stats = stat_api or FileStatApi(file_desc_api)

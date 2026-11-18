@@ -18,6 +18,17 @@ the fact on the commits that shipped them.
 
 ### Fixed
 
+- The file data of a replicated file system now heals itself the way the
+  metadata does. With ``sync: tee`` a mirror write that failed (a mirror
+  store being temporarily down, for instance) was detected and the file's
+  path was put on the persistent replication queue, but no worker ever
+  drained the queue for a ``tee`` file system: the copy only came back
+  through a manual backfill. A replication worker now runs for every file
+  system with mirrors, whatever its ``sync`` mode, and ``inline`` writes
+  report their gaps to the queue as well. A store that was unreachable
+  during an upload is caught up automatically once it is back, with the
+  queue's usual backoff, without manual action.
+
 - The primary metadata store is no longer the source of truth by
   definition. It always was, so a mirror that kept receiving writes
   while the primary was down (as reported in the logs: metadata was
