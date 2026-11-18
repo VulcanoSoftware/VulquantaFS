@@ -14,6 +14,7 @@ from tgdcfs.config import GithubRepoConfig
 from tgdcfs.core.model import FileStat, TGFSDirectory, TGFSFileRef, TGFSMetadata
 from tgdcfs.crypto.path_names import encrypt_path_name
 from tgdcfs.errors import MetadataNotInitialized, TechnicalError
+from tgdcfs.core.repository.impl.metadata.breaker import FailFastRepository
 from tgdcfs.core.repository.impl.metadata.github_repo import (
     GithubRepoMetadataRepository,
 )
@@ -134,13 +135,14 @@ class TestGithubRepoMetadataRepository:
         mock_github_class.assert_called_once()
         call = mock_github_class.call_args
         assert call.args == ("test_token",)
-        assert call.kwargs["retry"].total == 3
+        assert call.kwargs["retry"].total == 1
         mock_github_instance.get_repo.assert_called_once_with(
             "owner/test-repo", lazy=True
         )
         assert repository._ghc.repo_name == "owner/test-repo"
         assert repository._ghc.commit == "main"
-        assert repository._ghc.repo == mock_repo
+        assert isinstance(repository._ghc.repo, FailFastRepository)
+        assert repository._ghc.repo._inner == mock_repo
         assert repository._ghc.gh == mock_github_instance
 
     @patch("tgdcfs.core.repository.impl.metadata.github_repo.Github")
