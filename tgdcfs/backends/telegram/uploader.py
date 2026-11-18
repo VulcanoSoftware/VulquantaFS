@@ -305,6 +305,13 @@ class FileUploader:
         index = 0
         held: Optional[bytes] = None
         tail: Optional[bytes] = None
+        reader: Optional[asyncio.Task] = None
+        # A worker that dies while this loop waits in ``_read`` must end
+        # the upload, not sit unretrieved until the source produces
+        # something again: the SFTP client's writes stay unacknowledged,
+        # so nothing here proves the failure on its own. The next read
+        # races the worker-failure event, and the failing side decides.
+        failure_watcher = asyncio.create_task(worker_failed.wait())
         try:
             while True:
                 if await self._cancelled():
@@ -312,7 +319,24 @@ class FileUploader:
                     # even the part held back for the boundary check.
                     held = None
                     break
-                content = await self._read(self._chunk_size)
+                reader = asyncio.create_task(self._read(self._chunk_size))
+                done, _ = await asyncio.wait(
+                    {reader, failure_watcher},
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if failure_watcher in done:
+                    # The workers are dead, so whatever the read still
+                    # brings back cannot complete this upload: drop it
+                    # and let the cleanup below re-raise the worker's
+                    # error through the write's failover path.
+                    if reader not in done:
+                        reader.cancel()
+                        await asyncio.gather(reader, return_exceptions=True)
+                    else:
+                        # A finished read must never be left unretrieved.
+                        reader.exception()
+                    break
+                content = reader.result()
                 if not content:
                     break
                 total += len(content)
@@ -329,6 +353,11 @@ class FileUploader:
                     break
                 held = content
         finally:
+            failure_watcher.cancel()
+            await asyncio.gather(failure_watcher, return_exceptions=True)
+            if reader is not None and not reader.done():
+                reader.cancel()
+                await asyncio.gather(reader, return_exceptions=True)
             if all(w.done() for w in workers):
                 results = await asyncio.gather(*workers, return_exceptions=True)
             else:
