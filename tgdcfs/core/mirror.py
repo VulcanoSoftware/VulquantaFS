@@ -32,6 +32,23 @@ is logged and the affected store is simply omitted from the result --
 the primary write has already succeeded and the backfill task or the
 replication queue can close the gap later. With ``strict=True`` the
 error propagates.
+
+Write failover (the acting store): when the read-path breaker marks
+the primary dead, writes skip it and land in ``acting_candidates()``--
+the first mirror that accepts them. That store then owns the version
+and the descriptor (both record the acting store's key), and the
+copies it left behind everywhere else are handed to the replication
+queue like any other gap: ``copy_into_primary`` and ``relocate`` bring
+both back to the primary once a write into it succeeds again. A
+primary that only fails at the start of a write marks itself dead; the
+caller's retry -- an upload stream cannot be replayed within the same
+attempt -- then goes straight to the acting store.
+
+Names: every message a store keeps is named by the store's own part
+numbering with the file's own name, copies included. A mirror copy is
+therefore indistinguishable from the original messages, encryption
+included: only their message ids, which the metadata records, say
+which is which.
 """
 
 from __future__ import annotations
@@ -131,8 +148,27 @@ class MirrorGroup:
     def mark_primary_dead(self) -> None:
         self._primary_dead_until = time.monotonic() + PRIMARY_DEAD_SECONDS
 
+    def mark_primary_alive(self) -> None:
+        """A write into the primary just succeeded: drop the breaker.
+
+        The backfill proves the primary is back before the 60 seconds
+        are up, and saves the second-guessing of every later write."""
+        self._primary_dead_until = 0.0
+
     def primary_dead(self) -> bool:
         return time.monotonic() < self._primary_dead_until
+
+    # -- write failover (acting store) -----------------------------------
+
+    def acting_candidates(self) -> List[MirrorStore]:
+        """The stores a write falls back to while the primary is dead.
+
+        Mirrors in configuration order; the caller tries them one by one
+        and raises when none of them accepts the write either. A file
+        system without mirrors has no acting store: its writes fail as
+        they always did.
+        """
+        return list(self._stores)
 
     # -- content parts -----------------------------------------------------
 
@@ -147,6 +183,7 @@ class MirrorGroup:
         only_stores: Optional[List[str]] = None,
         source: Optional[IStore] = None,
         cache: Optional["VersionCache"] = None,
+        name: Optional[str] = None,
     ) -> MirrorResult:
         """Copy the given parts into the mirror stores.
 
@@ -155,8 +192,10 @@ class MirrorGroup:
         or a replica; when omitted they are looked up from the source.
         With ``cache`` the bytes come from the local copy of the version
         when there is one, and a download that has to happen anyway fills
-        the cache for the stores that follow. Returns the copies per
-        store that succeeded.
+        the cache for the stores that follow. ``name`` is the file's own
+        name, so a copy that has to be re-uploaded is named like the
+        primary's message instead of after a message id. Returns the
+        copies per store that succeeded.
         """
         res = MirrorResult()
         if not message_ids:
@@ -173,11 +212,11 @@ class MirrorGroup:
                     sizes = await self._part_sizes(source, message_ids)
                 if self._fits_aligned(ch.store, source, sizes):
                     res.mirrors[ch.key] = await self._copy_to(
-                        ch, source, message_ids, sizes, cache
+                        ch, source, message_ids, sizes, cache, name
                     )
                 else:
                     res.replicas[ch.key] = await self._replicate(
-                        ch, source, message_ids, sizes, cache
+                        ch, source, message_ids, sizes, cache, name
                     )
             except Exception as ex:
                 self._handle_write_error(ch.key, "content parts", ex)
@@ -221,6 +260,10 @@ class MirrorGroup:
         targets = self.tee_targets()
         if not targets or size == 0:
             return None
+        # The same name the primary uploader receives, so a copy in a
+        # mirror store is indistinguishable from the original message:
+        # the document name, its encryption included, is the stores'
+        # business only.
         name = file_msg.file_name()
         branches = [TeeBranch(ch.key, buffer_bytes) for ch in targets]
         message = TeeFileMessage.wrap(file_msg, branches)
@@ -230,9 +273,7 @@ class MirrorGroup:
                 stream = branch.stream()
                 try:
                     sent = await ch.store.upload(
-                        FileMessageFromStream.new(
-                            stream=stream, size=size, name=f"replica-{name}"
-                        )
+                        FileMessageFromStream.new(stream=stream, size=size, name=name)
                     )
                 finally:
                     await stream.aclose()
@@ -277,7 +318,9 @@ class MirrorGroup:
             part_sizes=[m.size for m in sent],
         )
 
-    async def copy_into_primary(self, version: "TGFSFileVersion") -> bool:
+    async def copy_into_primary(
+        self, version: "TGFSFileVersion", name: Optional[str] = None
+    ) -> bool:
         """Copy a version that lives in a former primary into the current one.
 
         Returns whether the version now has its primary layout in the
@@ -298,13 +341,14 @@ class MirrorGroup:
             sizes = await self._part_sizes(source, version.message_ids)
         target = MirrorStore(key=self._primary.key, store=self._primary)
         if self._fits_aligned(self._primary, source, sizes):
-            ids = await self._copy_to(target, source, version.message_ids)
+            ids = await self._copy_to(target, source, version.message_ids, name=name)
             version.mirrors[self._primary.key] = ids
         else:
             version.replicas[self._primary.key] = await self._replicate(
-                target, source, version.message_ids, sizes
+                target, source, version.message_ids, sizes, name=name
             )
         version.part_sizes = list(sizes)
+        self.mark_primary_alive()
         version.relocate(self._primary.key)
         return version.owned_by(self._primary.key)
 
@@ -335,6 +379,7 @@ class MirrorGroup:
         message_ids: List[int],
         part_sizes: Optional[List[int]] = None,
         cache: Optional["VersionCache"] = None,
+        name: Optional[str] = None,
     ) -> List[int]:
         """Aligned copy of ``source`` messages into ``target`` per ``mode``."""
         if not message_ids:
@@ -369,7 +414,7 @@ class MirrorGroup:
                 offsets[i] = (local, begin, begin + size - 1)
                 begin += size
         return [
-            await self._reupload_one(target, source, mid, local_range)
+            await self._reupload_one(target, source, mid, local_range, name)
             for mid, local_range in zip(message_ids, offsets)
         ]
 
@@ -379,13 +424,17 @@ class MirrorGroup:
         source: IStore,
         message_id: int,
         local_range: Optional[tuple["VersionBytes", int, int]] = None,
+        name: Optional[str] = None,
     ) -> int:
         """Bandwidth-bound aligned copy: stream one part down and up again.
 
         Bytes are copied verbatim -- this sits below the encryption
         decorator, so ciphertext stays ciphertext. The caller has checked
         that the part fits one message of the target. With ``local_range``
-        the part is read from the local cache instead of the source.
+        the part is read from the local cache instead of the source. The
+        target's own uploader parts and names the message, so the copy
+        ends up named like a primary part; without a known file name the
+        message id does.
         """
         if local_range is not None:
             local, begin, end = local_range
@@ -399,7 +448,7 @@ class MirrorGroup:
             chunks = (await source.download_file(message_id, 0, size - 1)).chunks
         sent = await target.store.upload(
             FileMessageFromStream.new(
-                stream=chunks, size=size, name=f"part-{message_id}"
+                stream=chunks, size=size, name=name or f"part-{message_id}"
             )
         )
         if len(sent) != 1:
@@ -416,6 +465,7 @@ class MirrorGroup:
         message_ids: List[int],
         part_sizes: List[int],
         cache: Optional["VersionCache"] = None,
+        name: Optional[str] = None,
     ) -> Replica:
         """Re-partitioned copy: stream the whole version through the target.
 
@@ -450,7 +500,12 @@ class MirrorGroup:
         try:
             sent = await target.store.upload(
                 FileMessageFromStream.new(
-                    stream=stream, size=total, name=f"replica-{message_ids[0]}"
+                    stream=stream,
+                    size=total,
+                    # The file's own name when it is known: the store
+                    # numbers its parts exactly like the primary's uploader
+                    # does, so the copy reads like the original messages.
+                    name=name or f"replica-{message_ids[0]}",
                 )
             )
         finally:
@@ -467,16 +522,23 @@ class MirrorGroup:
     # -- file descriptors --------------------------------------------------
 
     async def mirror_fd(
-        self, text: str, existing: Optional[Dict[str, int]] = None
+        self,
+        text: str,
+        existing: Optional[Dict[str, int]] = None,
+        skip: Optional[str] = None,
     ) -> Dict[str, int]:
         """Send or update the FD text message in every mirror store.
 
         Returns the map of current FD message ids per store: existing
         entries merged with this round's successful writes, so a store
         that fails transiently keeps its (stale but recoverable) copy.
+        With ``skip`` the write failover leaves out the store that holds
+        the descriptor itself: it would receive the same text twice.
         """
         res: Dict[str, int] = dict(existing or {})
         for ch in self._stores:
+            if ch.key == skip:
+                continue
             try:
                 if mid := res.get(ch.key):
                     try:

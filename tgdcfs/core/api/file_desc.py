@@ -50,8 +50,12 @@ class FileDescApi:
                     return TGFSFileVersion.pending_version(version_id, staged)
         if isinstance(file_msg, UploadableFileMessage | FileMessageImported):
             sent_file_msg = await self.get_sent_file_message(file_msg)
+            # A write that failed over to an acting store names it here, so
+            # the version is owned by the store that actually holds the
+            # parts; the descriptor save stamps only versions without one.
+            store = sent_file_msg[0].store if sent_file_msg else None
             return TGFSFileVersion.from_sent_file_message(
-                *sent_file_msg, version_id=version_id
+                *sent_file_msg, version_id=version_id, store=store
             )
         return None
 

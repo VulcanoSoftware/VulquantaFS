@@ -18,7 +18,7 @@ from tgdcfs.backends.base import IStore
 from tgdcfs.core.mirror import MirrorGroup
 from tgdcfs.core.model import TGFSDirectory, TGFSFileDesc, TGFSFileRef, TGFSFileVersion
 from tgdcfs.core.repository.interface import FDRepositoryResp
-from tgdcfs.errors import FileOrDirectoryDoesNotExist
+from tgdcfs.errors import FileOrDirectoryDoesNotExist, TechnicalError
 from tgdcfs.reqres import (
     FileContent,
     FileMessage,
@@ -76,8 +76,12 @@ class FileApi:
         if self._on_written is None:
             return
         if self._written_gaps_only and fd is not None and self._mirror_group:
+            # A write that filled the mirrors itself only hands its gaps to
+            # the queue: a store that lacks a copy, and a version that a
+            # failed-over acting store owns while the primary has none.
             if not any(
                 self._mirror_group.missing_stores(version)
+                or not version.owned_by(self._store_key)
                 for version in fd.get_versions()
                 if version.is_valid()
             ):
@@ -232,6 +236,20 @@ class FileApi:
                 mirror_ids.setdefault(channel_key, []).extend(channel_ids)
         return ids, mirror_ids
 
+    def _owning_store(self, version: TGFSFileVersion) -> Optional[IStore]:
+        """The store whose channel ``version.message_ids`` live in.
+
+        A version without a recorded store belongs to the primary, as
+        tgfs always assumed. Versions of a failed-over write live in the
+        acting store that took them. ``None`` when that store is not
+        configured any more; a copy would duplicate the wrong message.
+        """
+        if version.owned_by(self._store_key):
+            return self._message_api
+        if self._mirror_group is not None and version.store is not None:
+            return self._mirror_group.store_for(version.store)
+        return None
+
     async def _duplicate_versions(self, fd: TGFSFileDesc) -> TGFSFileDesc:
         """Build a descriptor whose versions own fresh content messages.
 
@@ -243,31 +261,45 @@ class FileApi:
         an identifier with each other.
         """
         versions = fd.get_versions(sort=True)
-        parts = [mid for version in versions for mid in version.message_ids]
-        new_parts = await self._message_api.copy_within(parts)
+        # A copy is a channel-internal duplicate of content that lives in
+        # the store that owns it: the primary, or -- after a write
+        # failover, possibly with the primary never seen again -- an
+        # acting store. Duplicating in the wrong channel would either
+        # fail or duplicate unrelated messages.
+        copied_parts: Dict[str, List[int]] = {}
+        for version in versions:
+            if not version.message_ids:
+                continue
+            target = self._owning_store(version)
+            if target is None:
+                raise TechnicalError(
+                    f"Cannot copy {fd.name}@{version.id}: its store "
+                    f"{version.store} is not configured"
+                )
+            copied_parts[version.id] = await target.copy_within(version.message_ids)
 
         copied = TGFSFileDesc(name=fd.name)
         version_ids: Dict[str, str] = {}
-        offset = 0
         for version in versions:
-            n = len(version.message_ids)
             version_ids[version.id] = str(uuid())
             new_version = TGFSFileVersion(
                 id=version_ids[version.id],
                 updated_at=version.updated_at,
-                message_ids=new_parts[offset : offset + n],
+                message_ids=copied_parts.get(version.id, []),
                 part_sizes=list(version.part_sizes),
-                store=self._store_key,
+                store=version.store or self._store_key,
             )
             # Copies are mirrored version by version: a replica covers one
             # version's bytes, not the whole file's.
-            if self._mirror_group and self._inline_mirroring and n:
+            if self._mirror_group and self._inline_mirroring and new_version.is_valid():
                 copies = await self._mirror_group.mirror_parts(
-                    new_version.message_ids, new_version.part_sizes or None
+                    new_version.message_ids,
+                    new_version.part_sizes or None,
+                    source=self._owning_store(new_version),
+                    name=fd.name,
                 )
                 copies.apply_to(new_version)
             copied.add_version(new_version)
-            offset += n
         # add_version derives created_at from the versions it is given; the
         # copy should carry the original's creation date instead.
         copied.created_at = fd.created_at

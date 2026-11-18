@@ -432,6 +432,22 @@ class TestWritePath:
         assert not any(mid in version.message_ids for mid in tg.downloaded)
         assert await stack.read("a.bin") == DATA
 
+    async def test_a_tee_replica_is_named_like_a_primary_upload(self):
+        """The copy carries the file's own name, numbered by the target's
+        own uploader -- no ``replica-`` marker, no message id."""
+        tg, dc = telegram_like(), discord_like()
+        stack = await Stack(tg, dc).init()
+        await stack.put("a.bin", DATA)
+        version = await stack.version("a.bin")
+
+        assert {tg.messages[mid].name for mid in version.message_ids} == {
+            f"[part{i}]a.bin" for i in range(1, 4)
+        }
+        replica_ids = version.replicas["dc:9"].message_ids
+        assert {dc.messages[mid].name for mid in replica_ids} == {
+            f"[part{i}]a.bin" for i in range(1, 81)
+        }
+
     async def test_nothing_is_staged_in_the_cache(self, tmp_path):
         """The mirrors take the bytes from the stream, so an upload goes to
         the stores only, even with ``stage_uploads`` on."""

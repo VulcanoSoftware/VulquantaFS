@@ -1,9 +1,10 @@
-import pytest
 import datetime
 
+import pytest
+
+from tgdcfs.backends.telegram.store import TelegramStore
 from tgdcfs.core.api.file import FileApi
 from tgdcfs.core.api.file_desc import FileDescApi
-from tgdcfs.backends.telegram.store import TelegramStore
 from tgdcfs.core.api.metadata import MetaDataApi
 from tgdcfs.core.model import TGFSDirectory, TGFSFileDesc, TGFSFileRef, TGFSFileVersion
 from tgdcfs.errors import FileOrDirectoryAlreadyExists, FileOrDirectoryDoesNotExist
@@ -130,7 +131,10 @@ class TestFileApi:
             ("v2", [201, 202], [20, 30]),
         )
         mock_file_desc_api.get_file_desc.return_value = source
-        mock_message_api.copy_within.return_value = [301, 302, 300]
+        # Every version is duplicated on its own in the store that owns
+        # its parts, in the order of its own parts. Versions are copied
+        # newest first.
+        mock_message_api.copy_within.side_effect = [[301, 302], [300]]
         resp = mocker.Mock()
         resp.message_id = 999
         resp.mirrors = {}
@@ -141,6 +145,9 @@ class TestFileApi:
         mock_file_desc_api.get_file_desc.assert_called_once_with(
             sample_file_ref, include_all_versions=True
         )
+        assert [
+            call.args[0] for call in mock_message_api.copy_within.await_args_list
+        ] == [[201, 202], [200]]
         copied_fd = mock_file_desc_api.save_new_file_desc.call_args[0][0]
         # Both versions survive, with their timestamps and part sizes, but
         # under ids of their own -- the copy shares nothing with the source.

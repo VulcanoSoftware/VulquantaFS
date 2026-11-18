@@ -11,7 +11,8 @@ from tgdcfs.core.repository.interface import (
     FDRepositoryResp,
     IFDRepository,
 )
-from tgdcfs.errors import MessageNotFound
+from tgdcfs.errors import MessageNotFound, TechnicalError
+from tgdcfs.reqres import MessageResp
 
 logger = logging.getLogger(__name__)
 
@@ -63,56 +64,106 @@ class StoreFDRepository(IFDRepository):
     ) -> FDRepositoryResp:
         self._stamp(fd)
 
+        # A primary the circuit breaker marks dead is skipped outright:
+        # the old behaviour (a failing edit_message_text retried against a
+        # store that is down) only burns time before the write fails. The
+        # acting store writes the descriptor and owns it in its place; the
+        # backfill returns both to the primary once it is back.
+        group = self._mirror_group
+        candidates = group.acting_candidates() if group is not None else []
+        if not (group and candidates and group.primary_dead()):
+            try:
+                return await self._save_into(self._message_api, fd, fr, self.key)
+            except Exception as ex:
+                if not candidates:
+                    raise
+                logger.warning(
+                    f"Could not write the file descriptor of {fd.name} to the "
+                    f"primary store ({ex}); an acting store takes the write"
+                )
+        last: Optional[Exception] = None
+        for ch in candidates:
+            try:
+                return await self._save_into(ch.store, fd, fr, ch.key, skip=ch.key)
+            except Exception as ex:
+                last = ex
+                logger.warning(
+                    f"Could not write the file descriptor of {fd.name} to the "
+                    f"acting store {ch.key}: {ex}"
+                )
+        raise last or TechnicalError(f"No store accepted the descriptor of {fd.name}")
+
+    async def _save_into(
+        self,
+        store: IStore,
+        fd: TGFSFileDesc,
+        fr: Optional[TGFSFileRef],
+        key: str,
+        skip: Optional[str] = None,
+    ) -> FDRepositoryResp:
         # If file_content referer is None, create a new file_content descriptor message.
         if fr is None:
             return FDRepositoryResp(
-                message_id=await self._message_api.send_text(fd.to_json()),
+                message_id=await store.send_text(fd.to_json()),
                 fd=fd,
-                mirrors=await self._mirror_fd(fd, existing=None),
-                store=self.key,
+                mirrors=await self._mirror_fd(fd, existing=None, skip=skip),
+                store=key,
             )
 
         # A descriptor that lives in a former primary (the mirror was
         # promoted) must not be edited by id here -- the id names some
         # other message in this store. Send a fresh copy and keep the old
-        # one as that store's mirror entry.
-        if not fr.owned_by(self.key):
+        # one as that store's mirror entry. Not the primary's own entry,
+        # though: a failed-over save edits the acting store while the
+        # primary is down, and its ``mirrors`` entry there is the stale
+        # descriptor it already holds. Recording it would let a later
+        # read relocate the whole ref to that stale copy.
+        if not fr.owned_by(key):
             existing = dict(fr.mirrors)
-            if fr.store:
-                existing.setdefault(fr.store, fr.message_id)
+            if fr.store and fr.store != self.key:
+                existing[fr.store] = fr.message_id
+            if skip is not None:
+                # The acting store's own entry is superseded: its fresh
+                # copy becomes the owned descriptor message.
+                existing.pop(skip, None)
             return FDRepositoryResp(
-                message_id=await self._message_api.send_text(fd.to_json()),
+                message_id=await store.send_text(fd.to_json()),
                 fd=fd,
-                mirrors=await self._mirror_fd(fd, existing=existing),
-                store=self.key,
+                mirrors=await self._mirror_fd(fd, existing=existing, skip=skip),
+                store=key,
             )
 
         # If file_content referer is provided, try to update the existing file_content descriptor.
         # But if the message is not found (probably got deleted manually), a new file_content descriptor will be created.
         try:
             return FDRepositoryResp(
-                message_id=await self._message_api.edit_message_text(
+                message_id=await store.edit_message_text(
                     message_id=fr.message_id, message=fd.to_json()
                 ),
                 fd=fd,
-                mirrors=await self._mirror_fd(fd, existing=fr.mirrors),
-                store=self.key,
+                mirrors=await self._mirror_fd(fd, existing=fr.mirrors, skip=skip),
+                store=key,
             )
         except MessageNotFound:
-            return await self.save(fd)
+            return await self._save_into(store, fd, None, key, skip=skip)
 
     async def _mirror_fd(
-        self, fd: TGFSFileDesc, existing: Optional[Dict[str, int]]
+        self,
+        fd: TGFSFileDesc,
+        existing: Optional[Dict[str, int]],
+        skip: Optional[str] = None,
     ) -> Dict[str, int]:
         """Keep a copy of the FD text message in every mirror store.
 
         Descriptors are sent as fresh text messages (not forwarded)
         because they are edited on every new version and a forwarded
-        message cannot be edited in the target channel.
+        message cannot be edited in the target channel. With ``skip`` the
+        store that holds the descriptor itself is left out: the write
+        failover made it the descriptor's own home.
         """
         if not self._mirror_group:
             return dict(existing or {})
-        return await self._mirror_group.mirror_fd(fd.to_json(), existing)
+        return await self._mirror_group.mirror_fd(fd.to_json(), existing, skip=skip)
 
     async def _lookup_mirror_parts(
         self, missing: List[Tuple[str, int]]
@@ -168,6 +219,46 @@ class StoreFDRepository(IFDRepository):
             complete = True
         return complete
 
+    async def _acting_map(
+        self, versions: List[TGFSFileVersion]
+    ) -> Dict[int, MessageResp]:
+        """Look up the parts of acting-owned versions in their stores.
+
+        A version a failed-over write owns lives in a live mirror; its
+        ids are checked there instead of against a primary that never
+        saw the parts (and is likely down). A store that cannot answer
+        simply contributes nothing, like a mirror below.
+        """
+        if self._mirror_group is None:
+            return {}
+        by_store: Dict[str, List[int]] = {}
+        for version in versions:
+            if version.owned_by(self.key):
+                continue
+            if (
+                version.store is None
+                or version.store not in self._mirror_group.store_keys
+            ):
+                continue
+            by_store.setdefault(version.store, []).extend(
+                mid for mid in version.message_ids if mid > 0
+            )
+        res: Dict[int, MessageResp] = {}
+        for store_key, ids in by_store.items():
+            api = self._mirror_group.store_for(store_key)
+            if api is None:
+                continue
+            try:
+                found = await api.get_messages(ids)
+            except Exception as ex:
+                logger.warning(
+                    f"Could not check the acting store {store_key} for the "
+                    f"parts it owns: {ex}"
+                )
+                continue
+            res.update({m.message_id: m for m in found if m})
+        return res
+
     async def _validate_fv(
         self, fd: TGFSFileDesc, include_all_versions: bool
     ) -> TGFSFileDesc:
@@ -204,17 +295,28 @@ class StoreFDRepository(IFDRepository):
             fd.complete = False
 
         message_map = {msg.message_id: msg for msg in file_messages if msg}
+        acting_map = await self._acting_map(versions)
 
         has_valid_version = False
 
         for i, version in enumerate(versions):
             owned = version.owned_by(self.key)
+            acting = (
+                not owned
+                and self._mirror_group is not None
+                and version.store is not None
+                and version.store in self._mirror_group.store_keys
+            )
+            # Each version's ids are checked against the store that owns
+            # them: the primary, or the acting store a failed-over write
+            # went to. Anything else reads the mirrors.
+            own_map = message_map if owned else acting_map if acting else None
             version.part_sizes = []
             primary_layout_ok = True
             for j, message_id in enumerate(version.message_ids):
                 if (
-                    owned
-                    and (file_message := message_map.get(message_id, None))
+                    own_map is not None
+                    and (file_message := own_map.get(message_id, None))
                     and file_message.document
                 ):
                     version.part_sizes.append(file_message.document.size)
@@ -298,8 +400,29 @@ class StoreFDRepository(IFDRepository):
     async def _get_fd_text(self, fr: TGFSFileRef) -> Optional[str]:
         """Read the FD JSON, falling back to mirror copies if needed."""
         message = None
+        acting = (
+            self._mirror_group.store_for(fr.store)
+            if self._mirror_group is not None
+            and fr.store is not None
+            and fr.store in self._mirror_group.store_keys
+            else None
+        )
+        if acting is not None:
+            # The acting store of a failed-over write owns the current
+            # descriptor copy under ``message_id``; ``mirrors`` there may
+            # hold a stale leftover from before the outage.
+            try:
+                message = (await acting.get_messages([fr.message_id]))[0]
+            except Exception as ex:
+                logger.warning(
+                    f"Could not read file descriptor {fr.message_id} for "
+                    f"{fr.name} from the acting store {fr.store}: {ex}"
+                )
+            if message and message.text:
+                return message.text
+            message = None
         try:
-            if fr.owned_by(self.key):
+            if acting is None and fr.owned_by(self.key):
                 message = (await self._message_api.get_messages([fr.message_id]))[0]
         except Exception as ex:
             logger.warning(

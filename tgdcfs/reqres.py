@@ -34,6 +34,10 @@ class SentFileMessage(Message):
     # Copies of the whole version in stores that re-partitioned it, keyed
     # by store key. Carried by the first part's message only.
     replicas: Dict[str, "Replica"] = field(default_factory=dict)
+    # The store the parts of this upload belong to. ``None`` for a
+    # write that went to the configured primary; the write failover of a
+    # primary that was marked dead names the acting store here.
+    store: Optional[str] = None
 
 
 @dataclass

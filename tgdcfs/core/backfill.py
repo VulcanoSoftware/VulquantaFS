@@ -240,7 +240,7 @@ async def backfill_file(
         # the current primary first; that copy becomes its primary layout.
         if not version.owned_by(mirror_group.primary.key):
             try:
-                if await mirror_group.copy_into_primary(version):
+                if await mirror_group.copy_into_primary(version, name=fr.name):
                     report.versions_promoted += 1
                     changed = True
                 else:
@@ -268,6 +268,7 @@ async def backfill_file(
             version.part_sizes or None,
             only_stores=missing,
             cache=cache,
+            name=fr.name,
         )
         if copies.store_keys:
             copies.apply_to(version)

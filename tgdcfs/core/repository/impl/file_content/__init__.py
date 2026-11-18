@@ -4,7 +4,7 @@ from typing import AsyncIterator, Dict, Generator, Iterable, List, Optional, Seq
 
 from tgdcfs.backends.base import IStore
 from tgdcfs.core.local_cache import LocalCache, StagedFileMessage, version_cache_for
-from tgdcfs.core.mirror import MirrorGroup
+from tgdcfs.core.mirror import MirrorGroup, MirrorStore
 from tgdcfs.core.model import TGFSFileVersion
 from tgdcfs.core.multisource import MultiSourceRead, StoreView, read_slots
 from tgdcfs.core.repository.interface import IFileContentRepository
@@ -101,6 +101,22 @@ class StoreFileContentRepository(IFileContentRepository):
         return self._cache
 
     async def save(self, file_msg: UploadableFileMessage) -> List[SentFileMessage]:
+        # Write failover: a primary the circuit breaker marks dead is
+        # skipped before the first byte is read -- a consumed upload stream
+        # cannot be replayed after a failed attempt, so the acting store
+        # must be decided up front. The write lands there as the version's
+        # own content; everything else it misses (the primary's copy, the
+        # other mirrors) the replication queue brings back later.
+        candidates = (
+            self._mirror_group.acting_candidates()
+            if self._mirror_group is not None
+            and self._mirror_group.primary_dead()
+            and self._mirror_group.acting_candidates()
+            else []
+        )
+        if candidates:
+            return await self._save_acting(candidates, file_msg)
+
         # Stage the bytes on disk while they stream to the primary, so the
         # mirrors read the version from here instead of from the primary.
         # Not with ``sync: tee``: the mirrors that re-upload take the bytes
@@ -138,6 +154,11 @@ class StoreFileContentRepository(IFileContentRepository):
                 await tee.abort()
             if writer is not None:
                 await writer.abort()
+            # An exhausted stream rules out failing over inside this call:
+            # mark the primary dead so the caller's retry -- or the next
+            # write -- goes straight to an acting store.
+            if self._mirror_group is not None:
+                self._mirror_group.mark_primary_dead()
             raise
         if writer is not None:
             await writer.close()
@@ -165,6 +186,7 @@ class StoreFileContentRepository(IFileContentRepository):
                 cache=version_cache_for(
                     self._cache, self._cache_scope, version_id, sum(m.size for m in res)
                 ),
+                name=file_msg.file_name(),
             )
             for store_key, mirror_ids in copies.mirrors.items():
                 for sent, mirror_id in zip(res, mirror_ids):
@@ -175,6 +197,36 @@ class StoreFileContentRepository(IFileContentRepository):
             if self._cache is not None and version_id:
                 self._cache.release(version_id)
         return res
+
+    async def _save_acting(
+        self,
+        candidates: List[MirrorStore],
+        file_msg: UploadableFileMessage,
+    ) -> List[SentFileMessage]:
+        """Upload through an acting store because the primary is dead.
+
+        No staging and no tee: the staged copy had a reader only when the
+        primary and its inline mirrors consumed the upload, and the tee
+        splits the stream for mirrors of the primary, not of the acting
+        store. An acting write therefore fills just one store -- the one
+        that owns the version -- and leaves the rest to the replication
+        queue, which copies the version into every store it is missing
+        from, the primary included, once those can be written again.
+        """
+        last: Optional[Exception] = None
+        for ch in candidates:
+            try:
+                res = await ch.store.upload(file_msg)
+                for sent in res:
+                    sent.store = ch.key
+                return res
+            except Exception as ex:
+                last = ex
+                logger.warning(
+                    f"Acting store {ch.key} also refused the upload of "
+                    f"{file_msg.file_name()}: {ex}"
+                )
+        raise last or TechnicalError("No store accepted the upload")
 
     async def stage(
         self, file_msg: UploadableFileMessage, version_id: str
@@ -314,11 +366,24 @@ class StoreFileContentRepository(IFileContentRepository):
         primary_key = self._store.key
 
         if fv.message_ids and len(fv.part_sizes) == len(fv.message_ids):
+            # The store that owns ``message_ids``: the primary, or -- when
+            # a failed-over write named a mirror as its owner -- that
+            # mirror. A recorded store that is not configured any more is
+            # not an owner; the mirrored layouts below serve the read.
+            owner = (
+                self._store
+                if fv.owned_by(primary_key) or fv.store is None
+                else (
+                    self._mirror_group.store_for(fv.store)
+                    if self._mirror_group is not None
+                    else None
+                )
+            )
             candidates: List[List[tuple[IStore, int]]] = []
             for i, mid in enumerate(fv.message_ids):
                 sources: List[tuple[IStore, int]] = []
-                if fv.owned_by(primary_key) and mid > 0:
-                    sources.append((self._store, mid))
+                if owner is not None and mid > 0:
+                    sources.append((owner, mid))
                 if group:
                     for key, ids in fv.mirrors.items():
                         store = group.store_for(key)
