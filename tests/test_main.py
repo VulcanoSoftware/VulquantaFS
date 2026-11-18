@@ -2,8 +2,15 @@ from typing import Any, Dict
 
 import pytest
 
-from main import create_clients, create_store_factory, main, run_server
+from main import (
+    create_clients,
+    create_store_factory,
+    main,
+    run_server,
+    start_replication_workers,
+)
 from tgdcfs.config import Config
+from tgdcfs.core.replication import ReplicationQueue
 
 CONFIG: Dict[str, Any] = {
     "backends": {
@@ -65,6 +72,27 @@ class TestMain:
         assert set(result) == {"media", "notes"}
         assert created["media"].key == "tg:-1001"
         assert created["notes"].key == "tg:-1002"
+
+    @pytest.mark.asyncio
+    async def test_a_replication_worker_serves_every_replicated_filesystem(
+        self, mocker
+    ):
+        for sync in ("inline", "tee", "background"):
+            config = Config.from_dict(CONFIG)
+            config.filesystems["media"].sync = sync
+            queue = ReplicationQueue(None)
+            clients = {
+                name: type("C", (), {"name": name})() for name in ("media", "notes")
+            }
+
+            workers = start_replication_workers(clients, config, queue)
+            try:
+                # "media" has mirrors and gets a worker for every sync
+                # mode; "notes" has none and gets nothing.
+                assert [w._client for w in workers] == [clients["media"]]
+            finally:
+                for worker in workers:
+                    await worker.stop()
 
     @pytest.mark.asyncio
     async def test_store_factory_logs_in_to_discord_when_used(self, mocker):
