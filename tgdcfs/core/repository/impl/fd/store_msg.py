@@ -1,9 +1,11 @@
+import asyncio
 import json
 import logging
 from itertools import chain
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Awaitable, Callable, Dict, List, Optional, Tuple
 
 from tgdcfs.backends.base import IStore
+from tgdcfs.config import get_config
 from tgdcfs.core.mirror import MirrorGroup
 from tgdcfs.core.model import TGFSFileDesc, TGFSFileRef, TGFSFileVersion
 from tgdcfs.core.model.file import INVALID_FILE_SIZE
@@ -11,10 +13,35 @@ from tgdcfs.core.repository.interface import (
     FDRepositoryResp,
     IFDRepository,
 )
-from tgdcfs.errors import MessageNotFound, TechnicalError
+from tgdcfs.errors import MessageNotFound, RpcTimeoutError, TechnicalError
 from tgdcfs.reqres import MessageResp
 
 logger = logging.getLogger(__name__)
+
+
+def _bounded_read(what: str, action: Awaitable) -> Awaitable:
+    """Bound one store read by ``transfer.upload_part_timeout_s``
+
+    The same bound that keeps a silent part upload from freezing an
+    SFTP client's write acknowledgements keeps a silent store read
+    from freezing the write's own preparation: ``rpc_timeout_s`` is
+    minutes, and a client whose read never comes back abandons the
+    transfer long before the timeout converts the hang into an error
+    the failover can act on. ``0`` keeps reads unbounded.
+    """
+    timeout = get_config().tgdcfs.transfer.upload_part_timeout_s
+    if not timeout:
+        return action
+
+    async def run():
+        try:
+            return await asyncio.wait_for(action, float(timeout))
+        except asyncio.TimeoutError as ex:
+            raise RpcTimeoutError(
+                f"A store did not answer {what} within {timeout}s"
+            ) from ex
+
+    return run()
 
 
 class StoreFDRepository(IFDRepository):
@@ -183,7 +210,10 @@ class StoreFDRepository(IFDRepository):
             if (api := self._mirror_group.store_for(store_key)) is None:
                 continue
             try:
-                messages = await api.get_messages(mids)
+                messages = await _bounded_read(
+                    f"the mirror part lookup for messages {mids} in {store_key}",
+                    api.get_messages(mids),
+                )
             except Exception as ex:
                 logger.warning(
                     f"Could not check mirror store {store_key} for "
@@ -206,7 +236,10 @@ class StoreFDRepository(IFDRepository):
             if store is None or not replica.message_ids:
                 continue
             try:
-                messages = await store.get_messages(replica.message_ids)
+                messages = await _bounded_read(
+                    f"the replica lookup for version {version.id} in {store_key}",
+                    store.get_messages(replica.message_ids),
+                )
             except Exception as ex:
                 logger.warning(
                     f"Could not check replica in store {store_key} for "
@@ -249,7 +282,10 @@ class StoreFDRepository(IFDRepository):
             if api is None:
                 continue
             try:
-                found = await api.get_messages(ids)
+                found = await _bounded_read(
+                    f"the part lookup in the acting store {store_key}",
+                    api.get_messages(ids),
+                )
             except Exception as ex:
                 logger.warning(
                     f"Could not check the acting store {store_key} for the "
@@ -412,7 +448,12 @@ class StoreFDRepository(IFDRepository):
             # descriptor copy under ``message_id``; ``mirrors`` there may
             # hold a stale leftover from before the outage.
             try:
-                message = (await acting.get_messages([fr.message_id]))[0]
+                message = (
+                    await _bounded_read(
+                        f"the read of file descriptor {fr.message_id} for {fr.name}",
+                        acting.get_messages([fr.message_id]),
+                    )
+                )[0]
             except Exception as ex:
                 logger.warning(
                     f"Could not read file descriptor {fr.message_id} for "
@@ -421,9 +462,17 @@ class StoreFDRepository(IFDRepository):
             if message and message.text:
                 return message.text
             message = None
+        skip_primary = (
+            self._mirror_group is not None and self._mirror_group.primary_dead()
+        )
         try:
-            if acting is None and fr.owned_by(self.key):
-                message = (await self._message_api.get_messages([fr.message_id]))[0]
+            if acting is None and fr.owned_by(self.key) and not skip_primary:
+                message = (
+                    await _bounded_read(
+                        f"the read of file descriptor {fr.message_id} for {fr.name}",
+                        self._message_api.get_messages([fr.message_id]),
+                    )
+                )[0]
         except Exception as ex:
             logger.warning(
                 f"Could not read file descriptor {fr.message_id} for "
@@ -443,7 +492,13 @@ class StoreFDRepository(IFDRepository):
             if (api := self._mirror_group.store_for(store_key)) is None:
                 continue
             try:
-                mirror_message = (await api.get_messages([mirror_mid]))[0]
+                mirror_message = (
+                    await _bounded_read(
+                        f"the read of file descriptor mirror {mirror_mid} in "
+                        f"{store_key} for {fr.name}",
+                        api.get_messages([mirror_mid]),
+                    )
+                )[0]
             except Exception as ex:
                 logger.warning(
                     f"Could not read FD mirror {mirror_mid} in store "

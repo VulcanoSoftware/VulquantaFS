@@ -1,5 +1,8 @@
+import asyncio
 import datetime
 import json
+import time
+
 import pytest
 from unittest.mock import Mock, AsyncMock
 
@@ -7,7 +10,7 @@ from tgdcfs.backends.telegram.store import TelegramStore
 from tgdcfs.core.model import TGFSFileDesc, TGFSFileRef, TGFSFileVersion
 from tgdcfs.core.repository.impl.fd.store_msg import StoreFDRepository
 from tgdcfs.core.repository.interface import FDRepositoryResp
-from tgdcfs.errors import MessageNotFound
+from tgdcfs.errors import MessageNotFound, RpcTimeoutError
 
 
 # Global fixtures for all test classes
@@ -788,3 +791,125 @@ class TestGetWithoutValidation:
         fd = await repository.get(sample_file_ref, validate=False)
 
         assert fd.versions == {}
+
+
+class TestDeadPrimaryDescriptorReads:
+    """A write retry after a mid-upload failure re-reads the descriptor
+    of the file on the way in. Against a primary that went silent (a
+    Telegram network outage leaves every call hanging) that read used
+    to wait out the whole ``rpc_timeout_s`` -- the SFTP client abandons
+    a transfer after twenty seconds, so every retry died of old age
+    before it ever reached a store. The reads must respect the shorter
+    part bound, and a primary the breaker already marked dead must not
+    be contacted at all."""
+
+    @staticmethod
+    def _descriptor(vid, day, message_ids, size):
+        message = Mock()
+        message.text = json.dumps(
+            {
+                "type": "F",
+                "versions": [
+                    {
+                        "type": "FV",
+                        "id": vid,
+                        "updatedAt": int(
+                            datetime.datetime(2024, 1, day).timestamp() * 1000
+                        ),
+                        "messageIds": message_ids,
+                        "size": size,
+                    }
+                ],
+            }
+        )
+        return message
+
+    @staticmethod
+    def _mirror_group(api):
+        group = Mock()
+        group.primary_dead.return_value = True
+        group.store_for = Mock(return_value=api)
+        return group
+
+    @pytest.mark.asyncio
+    async def test_a_dead_primary_is_not_read_for_the_descriptor(self, mocker):
+        mirror_api = Mock(spec=TelegramStore)
+        mirror_api.key = "dc:222"
+        mirror_api.get_messages = AsyncMock(
+            return_value=[self._descriptor("v1", 1, [12345], 1000)]
+        )
+        primary = Mock(spec=TelegramStore)
+        primary.key = "tg:111"
+        primary.get_messages = AsyncMock(return_value=[])
+        repository = StoreFDRepository(
+            primary, mirror_group=self._mirror_group(mirror_api)
+        )
+        fr = TGFSFileRef(message_id=999, name="f.bin", location=Mock())
+        fr.mirrors["dc:222"] = 5000
+
+        fd = await repository.get(fr, validate=False)
+
+        primary.get_messages.assert_not_awaited()
+        assert fd.get_latest_version().id == "v1"
+
+    @pytest.mark.asyncio
+    async def test_a_silent_primary_read_gives_up_within_the_part_bound(self, mocker):
+        """A hanging store read returns inside the bound instead of
+        freezing the caller for ``rpc_timeout_s``."""
+        cfg = Mock()
+        cfg.tgdcfs.transfer.upload_part_timeout_s = 0.2
+        mocker.patch(
+            "tgdcfs.core.repository.impl.fd.store_msg.get_config", return_value=cfg
+        )
+        primary = Mock(spec=TelegramStore)
+        primary.key = "tg:111"
+
+        async def hang(mids):
+            await asyncio.sleep(30)
+            return [None]
+
+        primary.get_messages = AsyncMock(side_effect=hang)
+        repository = StoreFDRepository(primary)
+        fr = TGFSFileRef(message_id=999, name="f.bin", location=Mock())
+
+        start = time.monotonic()
+        fd = await repository.get(fr, validate=False)
+
+        assert time.monotonic() - start < 3
+        assert fd.versions == {}
+
+    @pytest.mark.asyncio
+    async def test_a_silent_primary_read_marks_the_breaker(self, mocker):
+        """The timed-out read feeds the circuit breaker, so the write
+        that follows is served by the mirrors right away."""
+        cfg = Mock()
+        cfg.tgdcfs.transfer.upload_part_timeout_s = 0.2
+        mocker.patch(
+            "tgdcfs.core.repository.impl.fd.store_msg.get_config", return_value=cfg
+        )
+        primary = Mock(spec=TelegramStore)
+        primary.key = "tg:111"
+
+        async def hang(mids):
+            await asyncio.sleep(30)
+            return [None]
+
+        primary.get_messages = AsyncMock(side_effect=hang)
+        mirror_api = Mock(spec=TelegramStore)
+        mirror_api.key = "dc:222"
+        mirror_api.get_messages = AsyncMock(
+            return_value=[self._descriptor("v1", 1, [12345], 1000)]
+        )
+        mirror_group = self._mirror_group(mirror_api)
+        mirror_group.primary_dead.return_value = False
+        repository = StoreFDRepository(primary, mirror_group=mirror_group)
+        fr = TGFSFileRef(message_id=999, name="f.bin", location=Mock())
+        fr.mirrors["dc:222"] = 5000
+
+        start = time.monotonic()
+        fd = await repository.get(fr, validate=False)
+
+        assert time.monotonic() - start < 3
+        mirror_group.mark_primary_dead.assert_called_once()
+        mirror_api.get_messages.assert_awaited_once_with([5000])
+        assert fd.get_latest_version().id == "v1"

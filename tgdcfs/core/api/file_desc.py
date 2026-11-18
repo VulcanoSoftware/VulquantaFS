@@ -103,7 +103,15 @@ class FileDescApi:
     async def append_file_version(
         self, file_msg: FileMessage, fr: Optional[TGFSFileRef] = None
     ) -> FDRepositoryResp:
-        fd = await self.get_file_desc(fr) if fr else TGFSFileDesc(name=file_msg.name)
+        # Unvalidated: appending a version needs the descriptor's shape,
+        # not a proof that the recorded parts still exist -- checking
+        # them here would point every store RPC of a dead primary at a
+        # write that is about to produce a working replacement version.
+        fd = (
+            await self.get_file_desc(fr, validate=False)
+            if fr
+            else TGFSFileDesc(name=file_msg.name)
+        )
 
         # The version id is chosen before the bytes move so the content
         # repository can stage them in the local cache under it.
@@ -118,7 +126,7 @@ class FileDescApi:
     async def update_file_version(
         self, fr: TGFSFileRef, file_msg: FileMessage, version_id: str
     ) -> FDRepositoryResp:
-        fd = await self.get_file_desc(fr)
+        fd = await self.get_file_desc(fr, validate=False)
         if (fv := await self._new_version(file_msg, version_id)) is not None:
             fd.update_version(version_id, fv)
         else:
