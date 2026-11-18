@@ -2,6 +2,7 @@
 stale bookkeeping and healing."""
 
 import logging
+import time
 
 import pytest
 
@@ -199,6 +200,78 @@ class TestLoad:
 
         assert result is layer.metadata
         assert primary.get_error is None or True  # get() was not called again
+
+
+class TestFreshestLoad:
+    """The load serves the most recent tree, not the primary's by force:
+    a store that was written while the primary was down keeps its data."""
+
+    async def test_a_fresher_mirror_wins_over_the_primary(self):
+        primary_tree, mirror_tree = tree("primary"), tree("mirror")
+        primary_tree.revision = 1_000_000_000.0
+        mirror_tree.revision = primary_tree.revision + 3600.0
+        primary = FakeMetadataRepo("primary", primary_tree)
+        mirror = FakeMetadataRepo("mirror", mirror_tree)
+        layer = replicated(primary, mirror)
+
+        await layer.init()
+
+        assert layer.metadata is mirror_tree
+        assert layer.stale_stores() == []
+        assert primary.push_full_calls == 1
+        assert primary.stored is mirror_tree
+
+    async def test_the_primary_keeps_the_lead_within_the_freshness_window(self):
+        """The mirror is always committed a blink after the primary and its
+        clock is another clock; within the window the primary serves."""
+        primary_tree, mirror_tree = tree("primary"), tree("mirror")
+        primary_tree.revision = 1_000_000_000.0
+        mirror_tree.revision = primary_tree.revision + 10.0
+        primary = FakeMetadataRepo("primary", primary_tree)
+        mirror = FakeMetadataRepo("mirror", mirror_tree)
+        layer = replicated(primary, mirror)
+
+        await layer.init()
+
+        assert layer.metadata is primary_tree
+        assert primary.push_calls == 1
+        assert primary.push_full_calls == 0
+        assert mirror.stored is primary_tree
+
+    async def test_an_older_mirror_does_not_shadow_the_primary(self):
+        primary_tree, mirror_tree = tree("primary"), tree("mirror")
+        primary_tree.revision = 1_000_000_000.0
+        mirror_tree.revision = primary_tree.revision - 3600.0
+        primary = FakeMetadataRepo("primary", primary_tree)
+        mirror = FakeMetadataRepo("mirror", mirror_tree)
+        layer = replicated(primary, mirror)
+
+        await layer.init()
+
+        assert layer.metadata is primary_tree
+        assert mirror.stored is primary_tree
+
+    async def test_trees_without_a_revision_rank_in_configuration_order(self):
+        """Legacy documents predate revisions; without a date anywhere the
+        primary serves, like it always did."""
+        layer = replicated(
+            FakeMetadataRepo("primary", tree("primary")),
+            FakeMetadataRepo("mirror", tree("mirror")),
+        )
+
+        await layer.init()
+
+        assert layer.metadata.dir.find_dirs()[0].name == "primary"
+
+    async def test_every_push_stamps_the_tree_revision(self):
+        layer = replicated(FakeMetadataRepo("primary"), FakeMetadataRepo("mirror"))
+        layer.metadata = tree("a")
+
+        await layer.push()
+
+        assert layer.metadata.revision is not None
+        assert layer.metadata.revision <= time.time()
+        assert layer.metadata.revision > time.time() - 5.0
 
 
 class TestPush:

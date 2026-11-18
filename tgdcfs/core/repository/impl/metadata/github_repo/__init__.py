@@ -506,7 +506,25 @@ class GithubRepoMetadataRepository(IMetaDataRepository):
         # Off the loop too: with a large repo the walk is a request per
         # directory. The structure is built fresh, so nothing is shared.
         root_dir = await asyncio.to_thread(self._build_directory_structure)
-        return TGFSMetadata(dir=root_dir)
+        metadata = TGFSMetadata(dir=root_dir)
+        # The replicated layer compares stores by this date: the branch head
+        # is when this copy was written last. A store that proves dead later
+        # during the read fails the load anyway; an empty repository has no
+        # head and simply dates as unknown.
+        metadata.revision = await asyncio.to_thread(self._head_commit_epoch)
+        return metadata
+
+    def _head_commit_epoch(self) -> Optional[float]:
+        """When the branch was written last, as a Unix epoch, or None."""
+        try:
+            ref = self._ghc.repo.get_git_ref(f"heads/{self._ghc.commit}")
+            commit = self._ghc.repo.get_git_commit(ref.object.sha)
+            date = commit.committer.date
+        except Exception:
+            return None
+        if not isinstance(date, datetime.datetime):
+            return None
+        return date.timestamp()
 
     def _build_directory_structure(self) -> GithubDirectory:
         root = GithubDirectory(

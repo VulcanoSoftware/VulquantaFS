@@ -505,6 +505,16 @@ class TestFacade:
 
         assert sha == gitlab.branch_heads["main"]
 
+    async def test_the_head_commit_carries_its_date(self, gitlab):
+        """The replicated layer dates a GitLab mirror by this date."""
+        sha = gitlab.commit("main", "first", [])
+        facade = GitlabRepository(gitlab_config())
+
+        commit = facade.get_git_commit(sha)
+
+        assert commit.committer.date is not None
+        assert commit.committer.date.year == 2024
+
     async def test_a_commit_creates_a_missing_branch_from_the_default(self, gitlab):
         gitlab.commit(
             "master",
