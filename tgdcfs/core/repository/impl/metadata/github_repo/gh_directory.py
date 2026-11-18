@@ -14,6 +14,7 @@ from tgdcfs.core.model import TGFSDirectory, TGFSFileRef
 from tgdcfs.crypto.path_names import encrypt_path_name
 from tgdcfs.utils.time import FIRST_DAY_OF_EPOCH
 
+from ..breaker import StoreUnreachable
 from .dir_timestamps import DirTimestampStore
 from .stats_file import STATS_FILE_NAME
 
@@ -37,7 +38,12 @@ def _is_transient(ex: Exception) -> bool:
     status = getattr(ex, "status", None)
     if status is not None:
         return status >= 500
-    return isinstance(ex, (requests.exceptions.RequestException, OSError))
+    # A refusal of the fail-fast wrapper is the outage it shortcuts
+    # happening; the deferred writes keep retrying until the probe finds
+    # the service again.
+    return isinstance(
+        ex, (requests.exceptions.RequestException, OSError, StoreUnreachable)
+    )
 
 
 def _is_sha_missing(ex: Exception) -> bool:

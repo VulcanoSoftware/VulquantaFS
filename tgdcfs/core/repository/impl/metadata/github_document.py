@@ -20,13 +20,18 @@ import base64
 import json
 import logging
 from functools import partial
-from typing import Optional, cast
+from typing import Any, Optional, cast
 
 from github import Github, GithubException, GithubRetry
 from github.ContentFile import ContentFile
 
 from tgdcfs.config import GithubRepoConfig
 from tgdcfs.core.model import TGFSMetadata
+from tgdcfs.core.repository.impl.metadata.breaker import (
+    FailFastRepository,
+    StoreCircuitBreaker,
+    probe_github_branch,
+)
 from tgdcfs.core.repository.interface import IMetaDataRepository
 from tgdcfs.crypto.metadata_blob import (
     decrypt_metadata_blob,
@@ -59,11 +64,15 @@ class GithubDocumentMetadataRepository(IMetaDataRepository):
         # and an unreachable GitHub surfaces as this store's read error --
         # the replicated layer fails over to the next store and the heal
         # worker catches this one up later. The bounded retry keeps that
-        # first failure at about a minute instead of PyGithub's default
-        # ten-attempt cycle.
-        self._repo = Github(config.access_token, retry=GithubRetry(total=3)).get_repo(
+        # first failure at one attempt plus its timeout, and the fail-fast
+        # wrapper refuses this store's calls while the service stays
+        # unreachable instead of paying the connection timeout per call,
+        # mirroring the tree store.
+        raw = Github(config.access_token, retry=GithubRetry(total=1)).get_repo(
             config.repo, lazy=True
         )
+        self._breaker = StoreCircuitBreaker(probe_github_branch(raw, config.commit))
+        self._repo: Any = FailFastRepository(raw, self._breaker)
         # Whether the document exists in the repo; ``None`` until the first
         # successful read or write answered the question.
         self._exists: Optional[bool] = None

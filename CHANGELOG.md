@@ -28,9 +28,14 @@ the fact on the commits that shipped them.
   worker thread; a failure there surfaces as that store's read error, so
   the layer fails over to the next store and the heal worker catches the
   unavailable store up once it answers again. The GitHub metadata
-  clients also cap PyGithub's retry cycle at three attempts, which turns
-  a dead GitHub from roughly three minutes of silence at boot into
-  about one.
+  clients also cap PyGithub's retry cycle at two attempts, and a circuit
+  breaker refuses the store's calls once one of them ran into a dead
+  connection, while a background probe alone waits for the service: one
+  outage costs its connection timeouts once -- at boot, instead of
+  several minutes -- and then no listing, write, stats commit or heal
+  queues behind it again. When the probe finds the service answering
+  again, the breaker closes and the heal worker brings the store back in
+  line within a probe interval.
 - The Docker image names in the config generator's command panel and in
   the getting-started guide follow the repository the site is built from.
   They were hard-coded (and kept pointing at a foreign namespace, because

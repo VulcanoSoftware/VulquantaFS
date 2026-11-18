@@ -7,7 +7,7 @@ import json
 import logging
 import time
 from concurrent.futures import ThreadPoolExecutor
-from typing import Iterable, NamedTuple, Optional, Sequence, Set
+from typing import Iterable, NamedTuple, Optional, Sequence, Set, cast
 
 from github import Github, GithubException, GithubRetry, InputGitTreeElement
 from github.ContentFile import ContentFile
@@ -15,6 +15,11 @@ from github.Repository import Repository
 
 from tgdcfs.config import GithubRepoConfig, expand_path
 from tgdcfs.core.model import FileStat, TGFSDirectory, TGFSFileRef, TGFSMetadata
+from tgdcfs.core.repository.impl.metadata.breaker import (
+    FailFastRepository,
+    StoreCircuitBreaker,
+    probe_github_branch,
+)
 from tgdcfs.core.repository.interface import IMetaDataRepository
 from tgdcfs.crypto.path_names import (
     PathNameEncryptionError,
@@ -65,7 +70,7 @@ class GithubRepoMetadataRepository(IMetaDataRepository):
         super().__init__()
         self._stats_loads: dict[int, asyncio.Future[bool]] = {}
 
-        gh = Github(config.access_token, retry=GithubRetry(total=3))
+        gh = Github(config.access_token, retry=GithubRetry(total=1))
         # Injectable for a store that speaks the PyGithub surface without
         # being GitHub (the GitLab tree mirror); the default client talks
         # to GitHub itself. The lazy flag keeps the resolution request out
@@ -75,9 +80,16 @@ class GithubRepoMetadataRepository(IMetaDataRepository):
         # replicated layer fails over to a healthy mirror and the heal
         # worker catches this store up once it answers again -- never as a
         # minutes-long blocking call on the event loop before the layer
-        # even exists.
+        # even exists. The fail-fast wrapper keeps it that way afterwards:
+        # once a call ran into a dead connection, every further call of
+        # this store is refused until a background probe finds the
+        # service again, so one outage costs its connect timeouts once --
+        # not once per listing, write, stats commit and heal.
+        self._breaker: Optional[StoreCircuitBreaker] = None
         if repo is None:
-            repo = gh.get_repo(config.repo, lazy=True)
+            raw = gh.get_repo(config.repo, lazy=True)
+            self._breaker = StoreCircuitBreaker(probe_github_branch(raw, config.commit))
+            repo = cast(Repository, FailFastRepository(raw, self._breaker))
 
         self._timestamps = DirTimestampStore(
             repo=repo,
