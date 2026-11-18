@@ -225,51 +225,69 @@ class WriteHandle(Handle):
         return self._size
 
     async def write(self, offset: int, data: bytes) -> None:
-        async with self._lock:
-            if self._closed:
-                raise ValueError("write on a closed handle")
-            self._raise_if_failed()
-            if not data:
-                return
-            if offset < self._pos:
-                raise TechnicalError(
-                    f"Write at offset {offset} of {self._path} lands behind bytes "
-                    f"that were already streamed"
-                )
-            if offset > self._pos or self._overlaps_staged(offset, len(data)):
-                try:
-                    await self._stage(offset, data)
-                except NoSpaceInBufferDir:
-                    # The staging disk is full: leaving the upload running
-                    # would let a later close() commit a truncated file.
-                    await self._abort_locked()
-                    raise
-            else:
-                self._dirty = True
-                await self._enqueue(data)
-                self._advance(offset + len(data))
-            # A staged write may have filled the gap at the position.
-            await self._drain()
+        try:
+            async with self._lock:
+                if self._closed:
+                    raise ValueError("write on a closed handle")
+                self._raise_if_failed()
+                if not data:
+                    return
+                if offset < self._pos:
+                    raise TechnicalError(
+                        f"Write at offset {offset} of {self._path} lands behind bytes "
+                        f"that were already streamed"
+                    )
+                if offset > self._pos or self._overlaps_staged(offset, len(data)):
+                    try:
+                        await self._stage(offset, data)
+                    except NoSpaceInBufferDir:
+                        # The staging disk is full: leaving the upload running
+                        # would let a later close() commit a truncated file.
+                        await self._abort_locked()
+                        raise
+                else:
+                    self._dirty = True
+                    await self._enqueue(data)
+                    self._advance(offset + len(data))
+                # A staged write may have filled the gap at the position.
+                await self._drain()
+        except asyncio.CancelledError:
+            # The request was torn down by the transport (session teardown,
+            # loop shutdown): the upload task keeps running on its own and
+            # holds the stores' write slots until it ends, so drop it with
+            # the handle. ``_cancel_task`` instead of ``_abort_locked``:
+            # the lock is already released here and a concurrent close may
+            # rely on this task still being awaitable.
+            await self._cancel_task()
+            raise
 
     async def close(self) -> None:
         """Finish the upload as a new version of the file."""
-        async with self._lock:
-            if self._closed:
-                return
-            self._closed = True
-            try:
-                if not self._dirty:
-                    if self._task is not None:
-                        await asyncio.gather(self._task, return_exceptions=True)
+        try:
+            async with self._lock:
+                if self._closed:
                     return
-                await self._flush_staged()
-                self._raise_if_failed()
-                _, task = self._ensure_task()
-                await self._enqueue(None)
-                await task
-                self._raise_if_failed()
-            finally:
-                await self._close_staging()
+                self._closed = True
+                try:
+                    if not self._dirty:
+                        if self._task is not None:
+                            await asyncio.gather(self._task, return_exceptions=True)
+                        return
+                    await self._flush_staged()
+                    self._raise_if_failed()
+                    _, task = self._ensure_task()
+                    await self._enqueue(None)
+                    await task
+                    self._raise_if_failed()
+                finally:
+                    await self._close_staging()
+        except asyncio.CancelledError:
+            # The close itself was torn down (session teardown, loop
+            # shutdown): the task cannot commit a version nobody waits
+            # for, but ``_abort_locked`` would return early because the
+            # close already set ``_closed``. Cancel it directly.
+            await self._cancel_task()
+            raise
 
     async def abort(self) -> None:
         """Drop the upload without touching the stored file."""
@@ -281,6 +299,10 @@ class WriteHandle(Handle):
         if self._closed:
             return
         self._closed = True
+        await self._cancel_task()
+
+    async def _cancel_task(self) -> None:
+        """Stop the upload task, waiting for it to unwind."""
         if self._task is not None:
             self._task.cancel()
             await asyncio.gather(self._task, return_exceptions=True)
