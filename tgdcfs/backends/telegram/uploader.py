@@ -358,7 +358,18 @@ class FileUploader:
             if reader is not None and not reader.done():
                 reader.cancel()
                 await asyncio.gather(reader, return_exceptions=True)
-            if all(w.done() for w in workers):
+            if worker_failed.is_set():
+                # A worker died mid upload, so the queued chunks can
+                # never be uploaded again: delivering the end-of-stream
+                # sentinels would block on a full queue nobody drains
+                # and keep the failure unretrieved forever. Stop the
+                # survivors instead and let the gather collect the
+                # error.
+                for w in workers:
+                    if not w.done():
+                        w.cancel()
+                results = await asyncio.gather(*workers, return_exceptions=True)
+            elif all(w.done() for w in workers):
                 results = await asyncio.gather(*workers, return_exceptions=True)
             else:
                 for _ in workers:

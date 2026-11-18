@@ -823,6 +823,54 @@ class TestStreamedUploadFailurePropagation:
         assert time.monotonic() - start < 5
 
     @pytest.mark.asyncio
+    async def test_a_dead_worker_ends_the_upload_while_one_lives_behind(self, mocker):
+        """The cleanup must not wait for the queue when a worker died.
+
+        The workers hold one queued chunk each; the main loop only exits
+        when the first failure lands, and the queue behind it is full of
+        chunks the dead workers will never take. The old cleanup fed
+        end-of-stream sentinels into that full queue and hung there for
+        as long as it took every worker to exhaust its retries -- with a
+        silent store, forever: nobody drains the queue anymore. The
+        exception stayed unretrieved and ``save()``'s failover path was
+        never reached, so a retry against a mirror could never start.
+        """
+        self._config(mocker, upload_part_timeout_s=10, upload_workers_big=2)
+        client = mocker.AsyncMock(spec=ITDLibClient)
+
+        calls = 0
+
+        async def save_big_file_part(req):
+            nonlocal calls
+            calls += 1
+            # One part gives up within a second; the other is still inside
+            # its own attempt when that failure lands.
+            await asyncio.sleep(1 if calls == 1 else 2)
+            raise RpcTimeoutError("Telegram did not answer the part")
+
+        client.save_big_file_part = save_big_file_part
+
+        async def silent_after_six_chunks():
+            for _ in range(6):
+                yield b"x" * self.PART
+            await asyncio.sleep(60)
+
+        uploader = FileUploader(
+            client=client,
+            file_msg=FileMessageFromStream.new(
+                stream=silent_after_six_chunks(), size=-1
+            ),
+        )
+
+        start = time.monotonic()
+        # The error surfaces either as the worker's ``RpcTimeoutError``
+        # (gathered by the cleanup) or as the feed's own bail-out on the
+        # full queue; both reach the failover path.
+        with pytest.raises((RpcTimeoutError, TechnicalError)):
+            await asyncio.wait_for(uploader.upload(), timeout=10)
+        assert time.monotonic() - start < 5
+
+    @pytest.mark.asyncio
     async def test_a_healthy_upload_survives_the_failure_watcher(self, mocker):
         self._config(mocker, upload_part_timeout_s=1)
         client = mocker.AsyncMock(spec=ITDLibClient)
