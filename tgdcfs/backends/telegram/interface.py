@@ -2,10 +2,10 @@ import asyncio
 from abc import ABCMeta, abstractmethod
 from dataclasses import dataclass
 from itertools import cycle
-from typing import Awaitable, Optional, Sequence
+from typing import Any, Awaitable, Optional, Sequence
 
 from tgdcfs.config import get_config
-from tgdcfs.errors import TechnicalError
+from tgdcfs.errors import RpcTimeoutError
 from tgdcfs.reqres import (
     DeleteMessagesReq,
     DownloadFileReq,
@@ -30,6 +30,32 @@ from tgdcfs.reqres import (
 )
 
 
+def bounded_part(what: str, action: Awaitable):
+    """Bound one part upload by ``transfer.upload_part_timeout_s``.
+
+    The part uploads pace the SFTP write acknowledgements: a frozen part
+    freezes them, and an SFTP client that waits out its inactivity
+    timeout (FileZilla: 20 s) drops the session and looks at a stalled
+    transfer. This bound sits below that timeout, so a silent store's
+    failure reaches the failover while the client is still willing to
+    retry. ``0`` leaves the part to the wide ``rpc_timeout_s`` bound of
+    ``_bounded``.
+    """
+    timeout = get_config().tgdcfs.transfer.upload_part_timeout_s
+    if timeout <= 0:
+        return action
+
+    async def run() -> Any:
+        try:
+            return await asyncio.wait_for(action, float(timeout))
+        except asyncio.TimeoutError as ex:
+            raise RpcTimeoutError(
+                f"Telegram did not answer {what} within {timeout}s"
+            ) from ex
+
+    return run()
+
+
 class ITDLibClient(metaclass=ABCMeta):
     def __init__(self):
         self._me: Optional[GetMeResp] = None
@@ -43,8 +69,10 @@ class ITDLibClient(metaclass=ABCMeta):
         trips its breaker only on exceptions -- would then wait out the
         whole outage without ever failing over. A call that stays silent
         for the configured ``rpc_timeout_s`` becomes a
-        :class:`TechnicalError`, which reads and saves treat like any
-        other store failure. ``0`` switches the bound off.
+        :class:`RpcTimeoutError`, which reads and saves treat like any
+        other store failure, and which the retry loops give up on
+        immediately: a silent store has nothing to negotiate.
+        ``0`` switches the bound off.
         """
         timeout = get_config().tgdcfs.transfer.rpc_timeout_s
         if timeout <= 0:
@@ -52,7 +80,7 @@ class ITDLibClient(metaclass=ABCMeta):
         try:
             return await asyncio.wait_for(action, float(timeout))
         except asyncio.TimeoutError as ex:
-            raise TechnicalError(
+            raise RpcTimeoutError(
                 f"Telegram did not answer {what} within {timeout}s"
             ) from ex
 

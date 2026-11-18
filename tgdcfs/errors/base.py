@@ -16,6 +16,15 @@ class TechnicalError(Exception):
         self.http_error = http_error
 
 
+class RpcTimeoutError(TechnicalError):
+    """A call into a store stayed silent past its deadline.
+
+    Unlike any other technical failure the store never answered at all,
+    so there is nothing worth negotiating: retry loops must stop and let
+    the failure travel straight to the failover logic.
+    """
+
+
 class BusinessError(TechnicalError):
     def __init__(
         self,

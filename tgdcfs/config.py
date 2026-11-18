@@ -547,9 +547,20 @@ class TransferConfig:
     # and without this bound every call into it hangs forever -- the
     # circuit breaker of a mirror group only trips on exceptions, so
     # nothing would ever fail over. ``0`` turns the bound off. Generous
-    # by default: an upload part on a slow line and a server-demanded
-    # flood wait are both legitimate silences.
+    # by default: a server-demanded flood wait is a legitimate silence,
+    # and so is every part upload, which has a much shorter bound of its
+    # own (see ``upload_part_timeout_s``).
     rpc_timeout_s: int = 120
+    # How long one part upload may stay unanswered before the uploader
+    # gives the part up without a retry. The part uploads pace the SFTP
+    # write acknowledgements -- a frozen part freezes them, and an SFTP
+    # client that waits out its inactivity timeout (FileZilla: 20 s)
+    # drops the session and looks at a stalled transfer. This bound has
+    # to sit below that timeout, so the write fails, the breaker trips
+    # and the client's retry reaches a mirror store while it is still
+    # willing to retry. ``0`` turns the bound off and leaves the part to
+    # ``rpc_timeout_s``.
+    upload_part_timeout_s: int = 15
 
     DEFAULT_UPLOAD_PARTS_IN_FLIGHT = 1
     DEFAULT_READ_PARALLEL_WINDOW = 8
@@ -568,6 +579,7 @@ class TransferConfig:
     DEFAULT_CHUNK_CACHE_READAHEAD = 2
     DEFAULT_CHUNK_CACHE_BLOCK_KB = 1024
     DEFAULT_RPC_TIMEOUT_S = 120
+    DEFAULT_UPLOAD_PART_TIMEOUT_S = 15
 
     @property
     def download_piece_size_bytes(self) -> int:
@@ -654,6 +666,9 @@ class TransferConfig:
             ),
             tee_buffer_mb=positive("tee_buffer_mb", cls.DEFAULT_TEE_BUFFER_MB),
             rpc_timeout_s=non_negative("rpc_timeout_s", cls.DEFAULT_RPC_TIMEOUT_S),
+            upload_part_timeout_s=non_negative(
+                "upload_part_timeout_s", cls.DEFAULT_UPLOAD_PART_TIMEOUT_S
+            ),
         )
 
 

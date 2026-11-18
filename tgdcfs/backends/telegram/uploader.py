@@ -6,7 +6,7 @@ from typing import Optional
 from telethon.helpers import generate_random_long
 
 from tgdcfs.config import get_config
-from tgdcfs.errors import TechnicalError
+from tgdcfs.errors import RpcTimeoutError, TechnicalError
 from tgdcfs.reqres import (
     SaveBigFilePartReq,
     SaveFilePartReq,
@@ -17,7 +17,7 @@ from tgdcfs.reqres import (
 )
 from tgdcfs.utils.others import flood_wait_seconds, is_big_file
 
-from .interface import ITDLibClient
+from .interface import ITDLibClient, bounded_part
 
 logger = logging.getLogger(__name__)
 
@@ -101,9 +101,10 @@ class FileUploader:
         self, chunk: FileChunk, file_total_parts: Optional[int] = None
     ) -> None:
         for attempt in range(1, MAX_PART_ATTEMPTS + 1):
-            try:
-                if self._is_big:
-                    rsp = await self.client.save_big_file_part(
+            if self._is_big:
+                call = bounded_part(
+                    f"part {chunk.file_part} of {self._file_name}",
+                    self.client.save_big_file_part(
                         SaveBigFilePartReq(
                             file_id=self._file_id,
                             bytes=chunk.content,
@@ -114,15 +115,21 @@ class FileUploader:
                                 else file_total_parts
                             ),
                         )
-                    )
-                else:
-                    rsp = await self.client.save_file_part(
+                    ),
+                )
+            else:
+                call = bounded_part(
+                    f"part {chunk.file_part} of {self._file_name}",
+                    self.client.save_file_part(
                         SaveFilePartReq(
                             file_id=self._file_id,
                             bytes=chunk.content,
                             file_part=chunk.file_part,
                         )
-                    )
+                    ),
+                )
+            try:
+                rsp = await call
 
                 if not rsp.success:
                     raise TechnicalError(f"Unexpected response: {rsp}")
@@ -130,6 +137,13 @@ class FileUploader:
                 self._uploaded_size += len(chunk.content)
                 return
 
+            except RpcTimeoutError:
+                # The store stayed silent for the whole part bound: it is
+                # unresponsive, not flaky. Retrying against the same dead
+                # connection burns the SFTP client's patience -- its write
+                # acknowledgements are frozen -- before the write can fail
+                # over to a mirror store, so let the failure travel now.
+                raise
             except Exception as e:
                 if attempt == MAX_PART_ATTEMPTS:
                     logger.error(

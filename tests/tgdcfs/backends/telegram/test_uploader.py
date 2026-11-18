@@ -1,6 +1,9 @@
+import asyncio
 import os
 import tempfile
+import time
 from typing import AsyncIterator
+from unittest.mock import Mock
 
 import pytest
 
@@ -11,7 +14,8 @@ from tgdcfs.backends.telegram.uploader import (
     FileUploader,
     WorkersConfig,
 )
-from tgdcfs.errors import TechnicalError
+from tgdcfs.config import TransferConfig
+from tgdcfs.errors import RpcTimeoutError, TechnicalError
 from tgdcfs.reqres import (
     FileMessageFromBuffer,
     FileMessageFromPath,
@@ -631,3 +635,107 @@ class TestStreamedUpload:
 
         with pytest.raises(TechnicalError):
             await uploader.upload()
+
+
+class TestPartTimeout:
+    """A silent part upload must not burn the SFTP client's patience.
+
+    The part uploads pace the SFTP write acknowledgements: while one
+    hangs, nothing is answered, and a client that sees no activity for
+    its inactivity timeout (FileZilla: 20 s) drops the session and the
+    transfer looks stalled. The part bound turns the silence into an
+    error long before that, and without the retry budget of a flaky
+    network: a store that never answered at all is not going to start
+    answering mid-retry, so a timeout travels straight to the write's
+    failover instead.
+    """
+
+    PART = 512 * 1024
+
+    @staticmethod
+    def _config(mocker, **transfer):
+        cfg = Mock()
+        cfg.tgdcfs.transfer = TransferConfig.from_dict(transfer)
+        mocker.patch("tgdcfs.backends.telegram.uploader.get_config", return_value=cfg)
+        mocker.patch("tgdcfs.backends.telegram.interface.get_config", return_value=cfg)
+
+    @staticmethod
+    def _stream(size: int):
+        async def stream():
+            left = size
+            while left > 0:
+                chunk = b"x" * min(left, TestPartTimeout.PART)
+                left -= len(chunk)
+                yield chunk
+
+        return stream()
+
+    @staticmethod
+    def _hanging(mocker):
+        async def hang(req):
+            await asyncio.sleep(60)
+
+        return mocker.AsyncMock(side_effect=hang)
+
+    @pytest.mark.asyncio
+    async def test_a_silent_part_upload_raises_within_the_part_bound(self, mocker):
+        self._config(mocker, upload_part_timeout_s=1)
+        client = mocker.AsyncMock(spec=ITDLibClient)
+        client.save_big_file_part = self._hanging(mocker)
+
+        uploader = FileUploader(
+            client=client,
+            file_msg=FileMessageFromStream.new(
+                stream=self._stream(2 * self.PART), size=-1
+            ),
+        )
+
+        start = time.monotonic()
+        with pytest.raises(RpcTimeoutError):
+            await uploader.upload()
+        assert time.monotonic() - start < 5
+        # Eight workers, four parts: every part was tried exactly once,
+        # none of them was re-fed to the dead connection five times over.
+        assert client.save_big_file_part.await_count <= 4
+
+    @pytest.mark.asyncio
+    async def test_the_retry_budget_survives_for_errors_that_can_recover(
+        self, no_backoff, mocker
+    ):
+        self._config(mocker, upload_part_timeout_s=1)
+
+        class TelegramFloodWaitError(Exception):
+            seconds = 30
+
+        client = mocker.AsyncMock(spec=ITDLibClient)
+        client.save_big_file_part = mocker.AsyncMock(
+            side_effect=TelegramFloodWaitError("flood")
+        )
+
+        uploader = FileUploader(
+            client=client,
+            file_msg=FileMessageFromStream.new(stream=self._stream(self.PART), size=-1),
+        )
+
+        with pytest.raises(TelegramFloodWaitError):
+            await uploader.upload()
+        assert client.save_big_file_part.await_count == MAX_PART_ATTEMPTS
+
+    @pytest.mark.asyncio
+    async def test_a_zero_part_bound_leaves_the_call_unbounded(self, mocker):
+        self._config(mocker, upload_part_timeout_s=0)
+        client = mocker.AsyncMock(spec=ITDLibClient)
+        client.save_big_file_part = self._hanging(mocker)
+
+        uploader = FileUploader(
+            client=client,
+            file_msg=FileMessageFromStream.new(stream=self._stream(self.PART), size=-1),
+        )
+
+        task = asyncio.create_task(uploader.upload())
+        await asyncio.sleep(0.3)
+        assert not task.done()
+        assert client.save_big_file_part.await_count >= 1
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task

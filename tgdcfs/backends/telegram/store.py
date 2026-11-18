@@ -28,6 +28,7 @@ from tgdcfs.errors import (
     MessageNotFound,
     NoPinnedMessage,
     PinnedMessageNotSupported,
+    RpcTimeoutError,
     TechnicalError,
 )
 from tgdcfs.reqres import (
@@ -59,7 +60,7 @@ from tgdcfs.utils.others import exclude_none
 from tgdcfs.utils.prefetching_chain import prefetching_chain
 
 from .broker import MessageBroker
-from .interface import TDLibApi
+from .interface import TDLibApi, bounded_part
 from .uploader import FileUploader
 
 logger = logging.getLogger(__name__)
@@ -412,8 +413,13 @@ class TelegramStore(MessageBroker, IStore):
         last: Optional[Exception] = None
         for attempt in range(1, MAX_SEND_ATTEMPTS + 1):
             try:
-                message = await uploader.send(self.private_file_channel)
+                message = await bounded_part(
+                    f"the send of {name}",
+                    uploader.send(self.private_file_channel),
+                )
                 return SentFileMessage(message_id=message.message_id, size=size)
+            except RpcTimeoutError:
+                raise
             except Exception as ex:
                 last = ex
                 logger.error(
@@ -591,14 +597,19 @@ class TelegramStore(MessageBroker, IStore):
         last: Optional[Exception] = None
         for attempt in range(1, MAX_SEND_ATTEMPTS + 1):
             try:
-                message = await uploader.client.edit_message_media(
-                    EditMessageMediaReq(
-                        chat=self.private_file_channel,
-                        message_id=message_id,
-                        file=uploader.get_uploaded_file(),
-                    )
+                message = await bounded_part(
+                    f"the edit of the document of message {message_id}",
+                    uploader.client.edit_message_media(
+                        EditMessageMediaReq(
+                            chat=self.private_file_channel,
+                            message_id=message_id,
+                            file=uploader.get_uploaded_file(),
+                        )
+                    ),
                 )
                 return message.message_id
+            except RpcTimeoutError:
+                raise
             except Exception as ex:
                 last = ex
                 logger.error(
