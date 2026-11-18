@@ -8,11 +8,16 @@ knobs that make backend differences testable without a network:
 * ``server_copy`` -- whether ``copy_from`` copies server-side (only
   between two stores of the same ``backend`` name) or reports ``None``;
 * ``fail`` -- a set of method names that raise, to simulate outages;
+* ``stuck`` -- a set of method names that block forever, sharing the
+  store's ``stuck_event``, to simulate a service that went away
+  mid-call: a network that drops the packets makes every call hang
+  instead of raising;
 * ``deleted_on_remove`` -- the ``delete_messages_on_remove`` gate.
 """
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass, field
 from typing import Dict, Iterable, List, Optional, Set
 
@@ -57,6 +62,8 @@ class FakeStore(IStore):
     server_copy: bool = True
     deleted_on_remove: bool = True
     fail: Set[str] = field(default_factory=set)
+    stuck: Set[str] = field(default_factory=set)
+    stuck_event: asyncio.Event = field(default_factory=asyncio.Event)
     messages: Dict[int, FakeMessage] = field(default_factory=dict)
     pinned: Optional[int] = None
     next_id: int = 1
@@ -71,6 +78,11 @@ class FakeStore(IStore):
         self.calls.append(method)
         if method in self.fail:
             raise TechnicalError(f"{self.key}: {method} failed (simulated)")
+
+    async def _hold(self, method: str) -> None:
+        if method in self.stuck:
+            await self.stuck_event.wait()
+            raise TechnicalError(f"{self.key}: {method} stuck (simulated)")
 
     def _add(
         self, text: str = "", document: Optional[bytes] = None, name: str = ""
@@ -101,10 +113,12 @@ class FakeStore(IStore):
 
     async def send_text(self, message: str) -> int:
         self._check("send_text")
+        await self._hold("send_text")
         return self._add(text=message)
 
     async def edit_message_text(self, message_id: int, message: str) -> int:
         self._check("edit_message_text")
+        await self._hold("edit_message_text")
         if message_id not in self.messages:
             raise MessageNotFound(message_id=message_id)
         self.messages[message_id].text = message
@@ -112,6 +126,7 @@ class FakeStore(IStore):
 
     async def get_messages(self, ids: list[int]) -> list[Optional[MessageResp]]:
         self._check("get_messages")
+        await self._hold("get_messages")
         return [m.to_resp() if (m := self.messages.get(i)) else None for i in ids]
 
     async def search_messages(self, search: str) -> list[MessageResp]:
@@ -121,6 +136,7 @@ class FakeStore(IStore):
     async def upload(self, file_msg: UploadableFileMessage) -> List[SentFileMessage]:
         self._check("upload")
         await file_msg.open()
+        await self._hold("upload")
         size = file_msg.get_size()
         res: List[SentFileMessage] = []
         remaining = size
@@ -154,6 +170,7 @@ class FakeStore(IStore):
         self, message_id: int, begin: int, end: int
     ) -> DownloadFileResp:
         self._check("download_file")
+        await self._hold("download_file")
         if (
             message := self.messages.get(message_id)
         ) is None or message.document is None:
@@ -175,6 +192,7 @@ class FakeStore(IStore):
 
     async def replace_document(self, message_id: int, buffer: bytes, name: str) -> int:
         self._check("replace_document")
+        await self._hold("replace_document")
         if message_id not in self.messages:
             raise MessageNotFound(message_id=message_id)
         self.messages[message_id].document = buffer
@@ -214,6 +232,7 @@ class FakeStore(IStore):
 
     async def pin_message(self, message_id: int) -> None:
         self._check("pin_message")
+        await self._hold("pin_message")
         if message_id not in self.messages:
             raise MessageNotFound(message_id=message_id)
         self.pinned = message_id

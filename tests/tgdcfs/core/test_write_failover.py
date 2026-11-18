@@ -10,6 +10,7 @@ descriptor of the file. The replication queue brings both back to
 Telegram once it accepts writes again.
 """
 
+import asyncio
 from typing import List, Tuple, cast
 
 import pytest
@@ -114,6 +115,61 @@ def read(client: Client, fr, name: str) -> bytes:
 
 
 class TestWriteFailover:
+    async def test_an_aborted_hanging_primary_marks_the_breaker(self):
+        """The form a real outage takes: not an error, but silence.
+
+        The primary's upload never raises -- a network that only drops
+        packets leaves every call hanging -- so the write has to be
+        aborted from the outside (FileZilla gives up, the SFTP session
+        ends). The cancelled save must still trip the breaker, or the
+        client's next attempt waits out the whole outage again even
+        though a mirror store is standing by.
+        """
+        client, tg, dc, _ = await make_client()
+        root = tree(client)
+        dc_docs = documents(dc)
+
+        tg.stuck = {"upload"}
+        # The bootstrap metadata write of Client.create also shows up as an
+        # "upload"; the flight in view is only marked by a second one.
+        task = asyncio.create_task(
+            client.file_api.upload(
+                root, FileMessageFromBuffer.new(buffer=b"data", name="a.txt")
+            )
+        )
+        for _ in range(1000):
+            if tg.calls.count("upload") >= 2:
+                break
+            await asyncio.sleep(0)
+        assert tg.calls.count("upload") >= 2
+        assert not task.done()
+
+        # Let the store actually be inside its hanging call.
+        await asyncio.sleep(0.01)
+        assert not task.done()
+
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert client.mirror_group is not None
+        assert client.mirror_group.primary_dead()
+
+        # The next write skips the silent primary altogether: it lands in
+        # the acting store, which owns the version and its descriptor, and
+        # leaves nothing behind in the stores until replication.
+        assert "upload" in tg.calls
+        tg.fail = {"upload"}
+        await client.file_api.upload(
+            root, FileMessageFromBuffer.new(buffer=b"data", name="a.txt")
+        )
+        fr = root.find_file("a.txt")
+        assert fr is not None
+        assert client.fd_repo is not None
+        version = (await client.fd_repo.get(fr)).get_latest_version()
+        assert version.store == dc.key
+        assert fr.store == dc.key
+        assert documents(dc) != dc_docs
+
     async def test_a_failing_primary_fails_the_write(self):
         client, tg, dc, _ = await make_client()
         root = tree(client)

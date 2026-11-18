@@ -540,6 +540,16 @@ class TransferConfig:
     # of the upload stream and the mirror's upload; a full buffer makes
     # the primary wait.
     tee_buffer_mb: int = 64
+    # How long one call to a Telegram backend may stay unanswered before
+    # the store counts the service as unreachable and raises. Telegram
+    # normally answers within seconds; a network that just drops packets
+    # (a down service, a VPN that stopped routing) never answers at all,
+    # and without this bound every call into it hangs forever -- the
+    # circuit breaker of a mirror group only trips on exceptions, so
+    # nothing would ever fail over. ``0`` turns the bound off. Generous
+    # by default: an upload part on a slow line and a server-demanded
+    # flood wait are both legitimate silences.
+    rpc_timeout_s: int = 120
 
     DEFAULT_UPLOAD_PARTS_IN_FLIGHT = 1
     DEFAULT_READ_PARALLEL_WINDOW = 8
@@ -557,6 +567,7 @@ class TransferConfig:
     DEFAULT_CHUNK_CACHE_MB = 0
     DEFAULT_CHUNK_CACHE_READAHEAD = 2
     DEFAULT_CHUNK_CACHE_BLOCK_KB = 1024
+    DEFAULT_RPC_TIMEOUT_S = 120
 
     @property
     def download_piece_size_bytes(self) -> int:
@@ -642,6 +653,7 @@ class TransferConfig:
                 "read_parallel_window", cls.DEFAULT_READ_PARALLEL_WINDOW
             ),
             tee_buffer_mb=positive("tee_buffer_mb", cls.DEFAULT_TEE_BUFFER_MB),
+            rpc_timeout_s=non_negative("rpc_timeout_s", cls.DEFAULT_RPC_TIMEOUT_S),
         )
 
 

@@ -1,3 +1,6 @@
+import asyncio
+import time
+
 import pytest
 from unittest.mock import AsyncMock, Mock
 
@@ -1380,3 +1383,71 @@ class TestChunkCacheInvalidation:
         assert not cache.contains((5, 1, 0))
         assert not cache.contains((5, 2, 0))
         assert cache.contains((5, 3, 0))
+
+
+class TestRpcTimeout:
+    """A down Telegram network never answers and never raises.
+
+    The library re-connects forever, so every call into a network that
+    only drops the packets just hangs -- an outage has to become a
+    ``TechnicalError`` within the configured bound, or the write
+    failover of a mirror group never gets a chance to break in.
+    """
+
+    @staticmethod
+    def _timeout(mocker, seconds: int):
+        cfg = Mock()
+        cfg.tgdcfs.transfer = TransferConfig.from_dict({"rpc_timeout_s": seconds})
+        mocker.patch("tgdcfs.backends.telegram.interface.get_config", return_value=cfg)
+
+    @staticmethod
+    def _hanging(mocker) -> AsyncMock:
+        async def hang(*args, **kwargs):
+            await asyncio.sleep(60)
+
+        return mocker.AsyncMock(side_effect=hang)
+
+    @pytest.mark.asyncio
+    async def test_a_silent_client_becomes_a_technical_error(self, mocker):
+        self._timeout(mocker, 1)
+        client = mocker.AsyncMock(spec=TelegramClient)
+        client.send_message = self._hanging(mocker)
+        api = TelethonAPI(client)
+
+        start = time.monotonic()
+        with pytest.raises(TechnicalError):
+            await api.send_text(SendTextReq(chat=5, text="hello"))
+        assert time.monotonic() - start < 30
+
+    @pytest.mark.asyncio
+    async def test_a_hanging_file_part_upload_is_bounded_too(self, mocker):
+        self._timeout(mocker, 1)
+        # ``save_big_file_part`` calls the client itself: the transfer
+        # connection is the call.
+        client = mocker.AsyncMock(spec=TelegramClient)
+
+        async def hang(req):
+            await asyncio.sleep(60)
+
+        client.side_effect = hang
+        api = TelethonAPI(client)
+
+        req = SaveBigFilePartReq(file_id=1, file_part=0, bytes=b"x", file_total_parts=1)
+        with pytest.raises(TechnicalError):
+            await api.save_big_file_part(req)
+
+    @pytest.mark.asyncio
+    async def test_a_zero_timeout_disables_the_bound(self, mocker):
+        self._timeout(mocker, 0)
+        client = mocker.AsyncMock(spec=TelegramClient)
+
+        async def slow_but_alive(*args, **kwargs):
+            await asyncio.sleep(0.2)
+            sent = Mock()
+            sent.id = 7
+            return sent
+
+        client.send_message = mocker.AsyncMock(side_effect=slow_but_alive)
+        api = TelethonAPI(client)
+
+        assert (await api.send_text(SendTextReq(chat=5, text="hello"))).message_id == 7

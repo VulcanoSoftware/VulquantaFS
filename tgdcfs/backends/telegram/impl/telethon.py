@@ -75,7 +75,10 @@ class TelethonAPI(ITDLibClient):
         return next(self.__transfer_cycle)
 
     async def __get_messages(self, *args, **kwargs) -> Sequence[tlt.Message]:
-        messages = await self._client.get_messages(*args, **kwargs)
+        messages = await self._bounded(
+            "get_messages",
+            self._client.get_messages(*args, **kwargs),
+        )
         if not isinstance(messages, TotalList):
             raise TechnicalError("Unexpected response type from get_messages")
         return messages
@@ -129,32 +132,41 @@ class TelethonAPI(ITDLibClient):
         return GetMessagesResp(cache.gets(req.message_ids))
 
     async def send_text(self, req: SendTextReq) -> SendMessageResp:
-        message = await self._client.send_message(
-            entity=PeerChannel(channel_id=req.chat), message=req.text
+        message = await self._bounded(
+            "send_text",
+            self._client.send_message(
+                entity=PeerChannel(channel_id=req.chat), message=req.text
+            ),
         )
         return SendMessageResp(message_id=message.id)
 
     async def edit_message_text(self, req: EditMessageTextReq) -> SendMessageResp:
         channel_cache(req.chat).id[req.message_id] = None
         chunk_cache().invalidate(req.chat, req.message_id)
-        message = await self._client.edit_message(
-            entity=PeerChannel(channel_id=req.chat),
-            message=req.message_id,
-            text=req.text,
+        message = await self._bounded(
+            "edit_message_text",
+            self._client.edit_message(
+                entity=PeerChannel(channel_id=req.chat),
+                message=req.message_id,
+                text=req.text,
+            ),
         )
         return SendMessageResp(message_id=message.id)
 
     async def edit_message_media(self, req: EditMessageMediaReq) -> Message:
         channel_cache(req.chat).id[req.message_id] = None
         chunk_cache().invalidate(req.chat, req.message_id)
-        message = await self._client.edit_message(
-            entity=PeerChannel(channel_id=req.chat),
-            message=req.message_id,
-            file=tlt.InputFile(
-                id=req.file.id,
-                parts=req.file.parts,
-                name=req.file.name,
-                md5_checksum="",
+        message = await self._bounded(
+            "edit_message_media",
+            self._client.edit_message(
+                entity=PeerChannel(channel_id=req.chat),
+                message=req.message_id,
+                file=tlt.InputFile(
+                    id=req.file.id,
+                    parts=req.file.parts,
+                    name=req.file.name,
+                    md5_checksum="",
+                ),
             ),
         )
         return Message(message_id=message.id)
@@ -185,30 +197,39 @@ class TelethonAPI(ITDLibClient):
         )
 
     async def pin_message(self, req: PinMessageReq) -> None:
-        await self._client.pin_message(
-            entity=PeerChannel(channel_id=req.chat),
-            message=req.message_id,
-            notify=False,
+        await self._bounded(
+            "pin_message",
+            self._client.pin_message(
+                entity=PeerChannel(channel_id=req.chat),
+                message=req.message_id,
+                notify=False,
+            ),
         )
 
     async def save_big_file_part(self, req: SaveBigFilePartReq) -> SaveFilePartResp:
-        success = await self._transfer_client(
-            tlf.upload.SaveBigFilePartRequest(
-                file_id=req.file_id,
-                file_part=req.file_part,
-                bytes=req.bytes,
-                file_total_parts=req.file_total_parts,
-            )
+        success = await self._bounded(
+            "save_big_file_part",
+            self._transfer_client(
+                tlf.upload.SaveBigFilePartRequest(
+                    file_id=req.file_id,
+                    file_part=req.file_part,
+                    bytes=req.bytes,
+                    file_total_parts=req.file_total_parts,
+                )
+            ),
         )
         return SaveFilePartResp(success=success)
 
     async def save_file_part(self, req: SaveFilePartReq) -> SaveFilePartResp:
-        success = await self._transfer_client(
-            tlf.upload.SaveFilePartRequest(
-                file_id=req.file_id,
-                file_part=req.file_part,
-                bytes=req.bytes,
-            )
+        success = await self._bounded(
+            "save_file_part",
+            self._transfer_client(
+                tlf.upload.SaveFilePartRequest(
+                    file_id=req.file_id,
+                    file_part=req.file_part,
+                    bytes=req.bytes,
+                )
+            ),
         )
         return SaveFilePartResp(success=success)
 
@@ -218,11 +239,14 @@ class TelethonAPI(ITDLibClient):
             parts=req.file.parts,
             name=req.file.name,
         )
-        message = await self._client.send_file(
-            entity=PeerChannel(channel_id=req.chat),
-            file=file,
-            caption=req.caption,
-            force_document=True,
+        message = await self._bounded(
+            "send_big_file",
+            self._client.send_file(
+                entity=PeerChannel(channel_id=req.chat),
+                file=file,
+                caption=req.caption,
+                force_document=True,
+            ),
         )
         if not isinstance(message, tlt.Message):
             raise TechnicalError("Unexpected response type from send_file")
@@ -235,11 +259,14 @@ class TelethonAPI(ITDLibClient):
             name=req.file.name,
             md5_checksum="",
         )
-        message = await self._client.send_file(
-            entity=PeerChannel(channel_id=req.chat),
-            file=file,
-            caption=req.caption,
-            force_document=True,
+        message = await self._bounded(
+            "send_small_file",
+            self._client.send_file(
+                entity=PeerChannel(channel_id=req.chat),
+                file=file,
+                caption=req.caption,
+                force_document=True,
+            ),
         )
         if not isinstance(message, tlt.Message):
             raise TechnicalError("Unexpected response type from send_file")
@@ -304,7 +331,7 @@ class TelethonAPI(ITDLibClient):
                 aligned = offset - offset % DOWNLOAD_REQUEST_SIZE
                 skip = offset - aligned
                 try:
-                    async for chunk in self._transfer_client.iter_download(
+                    downloader = self._transfer_client.iter_download(
                         file=InputDocumentFileLocation(
                             id=doc.id,
                             access_hash=doc.access_hash,
@@ -313,7 +340,15 @@ class TelethonAPI(ITDLibClient):
                         ),
                         offset=aligned,
                         request_size=DOWNLOAD_REQUEST_SIZE,
-                    ):
+                    )
+                    while True:
+                        try:
+                            chunk = await self._bounded(
+                                f"download of message {req.message_id}",
+                                downloader.__anext__(),
+                            )
+                        except StopAsyncIteration:
+                            break
                         if skip:
                             if len(chunk) <= skip:
                                 skip -= len(chunk)

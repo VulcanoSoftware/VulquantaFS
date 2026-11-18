@@ -87,9 +87,13 @@ MAX_TEXT_CHARS = 4096
 OVERFLOW_PREFIX = "TGDCFS_OVERFLOW:"
 OVERFLOW_FILENAME = "overflow.json"
 
-# A failed send is retried forever, this far apart: the bytes are
-# already on Telegram's servers, only the message is missing.
+# A failed send is retried a bounded number of times, this far apart:
+# the bytes are already on Telegram's servers, only the message is
+# missing. Bounded, because an unbounded loop of a send that never
+# succeeds (a Telegram that went away mid-upload) would keep the write
+# hanging instead of letting its failover break in.
 SEND_RETRY_INTERVAL = 5  # seconds
+MAX_SEND_ATTEMPTS = 5
 
 # Telegram's messages.deleteMessages caps each request at 100 message ids.
 DELETE_BATCH_SIZE = 100
@@ -405,16 +409,23 @@ class TelegramStore(MessageBroker, IStore):
         self, uploader: FileUploader, size: int, name: Optional[str]
     ) -> SentFileMessage:
         """Turn an uploaded part into a channel message, retrying until it is."""
-        while True:
+        last: Optional[Exception] = None
+        for attempt in range(1, MAX_SEND_ATTEMPTS + 1):
             try:
                 message = await uploader.send(self.private_file_channel)
                 return SentFileMessage(message_id=message.message_id, size=size)
             except Exception as ex:
+                last = ex
                 logger.error(
                     f"Exception occurred when sending file {name}: {ex}. "
-                    f"Waiting {SEND_RETRY_INTERVAL} seconds before retrying."
+                    f"Waiting {SEND_RETRY_INTERVAL} seconds before retrying "
+                    f"(attempt {attempt}/{MAX_SEND_ATTEMPTS})."
                 )
                 await asyncio.sleep(SEND_RETRY_INTERVAL)
+        raise TechnicalError(
+            f"Could not send the message of file {name} after "
+            f"{MAX_SEND_ATTEMPTS} attempts: {last}"
+        ) from last
 
     @property
     def read_slots(self) -> int:
@@ -577,7 +588,8 @@ class TelegramStore(MessageBroker, IStore):
         uploader = FileUploader(self.tdlib.next_bot, file_msg)
         await uploader.upload()
 
-        while True:
+        last: Optional[Exception] = None
+        for attempt in range(1, MAX_SEND_ATTEMPTS + 1):
             try:
                 message = await uploader.client.edit_message_media(
                     EditMessageMediaReq(
@@ -588,12 +600,17 @@ class TelegramStore(MessageBroker, IStore):
                 )
                 return message.message_id
             except Exception as ex:
+                last = ex
                 logger.error(
                     f"Exception occurred when editing document of message "
                     f"{message_id}: {ex}. Waiting {SEND_RETRY_INTERVAL} seconds "
-                    f"before retrying."
+                    f"before retrying (attempt {attempt}/{MAX_SEND_ATTEMPTS})."
                 )
                 await asyncio.sleep(SEND_RETRY_INTERVAL)
+        raise TechnicalError(
+            f"Could not edit the document of message {message_id} after "
+            f"{MAX_SEND_ATTEMPTS} attempts: {last}"
+        ) from last
 
     async def delete_messages(
         self, message_ids: Iterable[int], force: bool = False
