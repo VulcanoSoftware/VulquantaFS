@@ -1,0 +1,25 @@
+#!/bin/bash
+# gebruik: gh-block block|unblock   (MODE=REJECT voor directe fouten i.p.v. timeouts)
+MODE=${MODE:-DROP}
+DOMAINS="github.com api.github.com raw.githubusercontent.com codeload.github.com objects.githubusercontent.com ghcr.io"
+case "$1" in
+block)
+  ranges=$(curl -fsS https://api.github.com/meta | jq -r '[.[]|arrays|.[]|strings]|.[]' | grep -E '^[0-9a-fA-F:.]+/[0-9]+$')
+  ips=$(for d in $DOMAINS; do getent ahosts "$d" | awk '{print $1}'; done | sort -u)
+  for t in iptables ip6tables; do $t -N GHBLOCK 2>/dev/null; $t -F GHBLOCK; done
+  for r in $ranges $ips; do
+    if [[ $r == *:* ]]; then ip6tables -A GHBLOCK -d "$r" -j "$MODE" || true
+    else iptables -A GHBLOCK -d "$r" -j "$MODE" || true; fi
+  done
+  for t in iptables ip6tables; do for c in OUTPUT FORWARD; do
+    $t -C $c -j GHBLOCK 2>/dev/null || $t -I $c 1 -j GHBLOCK
+  done; done
+  echo "GitHub geblokkeerd ($MODE)";;
+unblock)
+  for t in iptables ip6tables; do
+    for c in OUTPUT FORWARD; do $t -D $c -j GHBLOCK 2>/dev/null; done
+    $t -F GHBLOCK 2>/dev/null; $t -X GHBLOCK 2>/dev/null
+  done
+  echo "GitHub weer bereikbaar";;
+*) echo "gebruik: $0 block|unblock"; exit 1;;
+esac
