@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from itertools import cycle
 from typing import (
     Any,
@@ -64,6 +65,11 @@ OVERFLOW_CAPTION = "TGDCFS_OVERFLOW"
 
 # Reads a part in this many bytes at a time while buffering it.
 READ_CHUNK = 1024 * 1024
+
+# A live upload can have all its WRITEs acknowledged before the final
+# Discord attachments have been accepted. Bound that tail per file,
+# without shrinking the bot pool available to other files.
+LIVE_PARTS_IN_FLIGHT = 2
 
 # Discord's error code for an edit of a message another user sent.
 CANNOT_EDIT_FOREIGN_MESSAGE = 50005
@@ -348,9 +354,9 @@ class DiscordStore(IStore):
         Parts are read sequentially (the message is a stream) and sent
         with bounded concurrency; the result is in file order. A part is
         read only once a slot is free for it, so at most
-        ``max_concurrent_uploads`` parts are in memory and a source that
-        produces faster than Discord takes (a cache file, a tee'd upload
-        stream) is held back instead of buffered whole.
+        ``max_concurrent_uploads`` parts are in memory. A live stream also
+        limits its per-file backlog so a late client CLOSE doesn't wait
+        for an entire bot pool's worth of bytes.
         """
         await file_msg.open()
         file_name = file_msg.file_name()
@@ -361,6 +367,8 @@ class DiscordStore(IStore):
             index = 0
             remaining = size
             while True:
+                if size < 0 and index >= LIVE_PARTS_IN_FLIGHT:
+                    await tasks[index - LIVE_PARTS_IN_FLIGHT]
                 limit = self._max_part_bytes
                 if size >= 0:
                     limit = min(limit, remaining)
@@ -385,7 +393,26 @@ class DiscordStore(IStore):
                 remaining -= len(data)
                 if (size >= 0 and remaining <= 0) or len(data) < self._max_part_bytes:
                     break
-            return list(await asyncio.gather(*tasks))
+            if size < 0:
+                logger.info(
+                    "Discord store %s reached EOF for %s: %d attachments, "
+                    "%d awaiting confirmation",
+                    self.key,
+                    file_name,
+                    index,
+                    sum(not task.done() for task in tasks),
+                )
+            started = time.monotonic()
+            sent = list(await asyncio.gather(*tasks))
+            if size < 0:
+                logger.info(
+                    "Discord store %s confirmed all attachments for %s in %.1fs "
+                    "after EOF",
+                    self.key,
+                    file_name,
+                    time.monotonic() - started,
+                )
+            return sent
         except BaseException:
             for task in tasks:
                 task.cancel()

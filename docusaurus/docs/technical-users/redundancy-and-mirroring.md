@@ -44,7 +44,7 @@ Configured per file system under `filesystems.<fs>.sync`:
 - Reupload tasks are added to the persistent background queue (`replication_queue.json`) and processed asynchronously by one background worker per file system, with a retry backoff after failures.
 
 ### 3. `tee`
-- Bytes read from the incoming client stream are duplicated in memory to bounded branch buffers (`tee_buffer_mb`, default 64 MB).
+- Bytes read from the incoming client stream are duplicated in memory to bounded branch buffers (`tee_buffer_mb`, default 64 MiB). Uploads with no declared size, such as SFTP, cap each branch buffer at 1 MiB. The SFTP close still requires a complete stored copy.
 - Uploads to primary and reuploading mirrors run concurrently in parallel during the client PUT request. No local disk cache required.
 
 ### Automatic write failover

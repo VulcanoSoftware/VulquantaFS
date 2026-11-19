@@ -21,6 +21,11 @@ from tgdcfs.utils.prefetching_chain import prefetching_chain
 
 logger = logging.getLogger(__name__)
 
+# Live streams report EOF only at CLOSE. Keep the bytes between the client
+# and the store uploaders small, so CLOSE does not inherit a full batch of
+# re-uploads after the last WRITE has already been acknowledged.
+LIVE_TEE_BUFFER_BYTES = 1024 * 1024
+
 # How many parts of one file are fetched at a time. Each part may itself
 # be split across bots, so this multiplies with the per-message
 # concurrency -- keep it small.
@@ -105,9 +110,12 @@ class StoreFileContentRepository(IFileContentRepository):
     async def save(self, file_msg: UploadableFileMessage) -> List[SentFileMessage]:
         group = self._mirror_group
         if self._tee_mirroring and group is not None:
-            tee = group.tee(file_msg, self._tee_buffer)
+            capacity = self._tee_buffer
+            if file_msg.get_size() < 0:
+                capacity = min(capacity, LIVE_TEE_BUFFER_BYTES)
+            tee = group.tee(file_msg, capacity)
             if tee is not None:
-                return await self._save_tee(group, tee, file_msg.file_name())
+                return await self._save_tee(group, tee, file_msg.file_name(), capacity)
 
         # Write failover: a primary the circuit breaker marks dead is
         # skipped before the first byte is read -- a consumed upload stream
@@ -183,7 +191,7 @@ class StoreFileContentRepository(IFileContentRepository):
         return res
 
     async def _save_tee(
-        self, group: MirrorGroup, tee: TeeUpload, name: str
+        self, group: MirrorGroup, tee: TeeUpload, name: str, capacity: int
     ) -> List[SentFileMessage]:
         async def primary(msg: UploadableFileMessage) -> List[SentFileMessage]:
             try:
@@ -201,7 +209,7 @@ class StoreFileContentRepository(IFileContentRepository):
         result = await tee.run(
             self._store.key,
             None if group.primary_dead() else primary,
-            self._tee_buffer,
+            capacity,
         )
         total = result.size
         mirrors = {

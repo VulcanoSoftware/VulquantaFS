@@ -45,6 +45,11 @@ from tgdcfs.reqres import (
 
 logger = logging.getLogger(__name__)
 
+# A source read occupies space before it joins any branch, and a consumer
+# can take a whole chunk out of its branch to satisfy a smaller read. Keep
+# those extra buffers small on live streams as well as bounding the branch.
+LIVE_FEED_CHUNK_BYTES = 64 * 1024
+
 
 class TeeBranch:
     """A bounded byte queue between the source and one store."""
@@ -253,7 +258,10 @@ class TeeUpload:
                 # a failed store's reader cannot drop an in-progress chunk
                 # or close the client's one-shot iterator.
                 while size < 0 or self.message.fed < size:
-                    limit = min(capacity, 1024 * 1024)
+                    limit = min(
+                        capacity,
+                        LIVE_FEED_CHUNK_BYTES if size < 0 else 1024 * 1024,
+                    )
                     if size >= 0:
                         limit = min(limit, size - self.message.fed)
                     if not await self.message.read(max(1, limit)):

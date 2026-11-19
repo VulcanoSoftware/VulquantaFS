@@ -285,6 +285,14 @@ class WriteHandle(Handle):
                         if self._task is not None:
                             await asyncio.gather(self._task, return_exceptions=True)
                         return
+                    logger.info(
+                        "SFTP CLOSE received for %s: %d bytes, %d queued, "
+                        "%d staged ranges",
+                        self._path,
+                        self._size,
+                        self._queued_bytes,
+                        len(self._staged),
+                    )
                     await self._flush_staged()
                     self._raise_if_failed()
                     _, task = self._ensure_task()
@@ -476,13 +484,21 @@ class WriteHandle(Handle):
             )
 
         sent = 0
+        saw_eof = False
         started = time.monotonic()
 
         async def stream() -> AsyncIterator[bytes]:
-            nonlocal sent
+            nonlocal sent, saw_eof
             while True:
                 chunk = await queue.get()
                 if chunk is None:
+                    saw_eof = True
+                    logger.info(
+                        "SFTP upload of %s reached EOF after %d bytes; "
+                        "waiting for store and metadata confirmation",
+                        self._path,
+                        sent,
+                    )
                     return
                 sent += len(chunk)
                 self._queued_bytes -= len(chunk)
@@ -495,7 +511,13 @@ class WriteHandle(Handle):
             await self._upload_until_disconnect(stream())
         except HandleClosedError as ex:
             self._error = ex
-            logger.debug("Aborting upload of %s: %s", self._path, ex)
+            logger.info(
+                "Aborting SFTP upload of %s after %d bytes (EOF=%s): %s",
+                self._path,
+                sent,
+                saw_eof,
+                ex,
+            )
         except Exception as ex:
             self._error = ex
             logger.error(

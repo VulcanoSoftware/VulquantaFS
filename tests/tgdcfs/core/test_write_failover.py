@@ -270,6 +270,112 @@ class TestWriteFailover:
             else:
                 assert name.endswith("]outage.bin")
 
+    async def test_sftp_paces_writes_and_waits_for_discord_to_confirm_close(self):
+        raw = config_dict()
+        raw["filesystems"]["media"]["sync"] = "tee"
+        config = Config.from_dict(raw)
+        tg = await store_factory(config.stores["tg-main"])
+        channel = FakeChannel()
+        part_size = 128 * 1024
+        full_parts = 16
+        data = bytes(range(256)) * (full_parts * part_size // 256) + b"tail"
+        started: list[int] = []
+        first_batch = asyncio.Event()
+        last_attachment = asyncio.Event()
+        allow_data = asyncio.Event()
+        allow_last = asyncio.Event()
+
+        class Bot(FakeBot):
+            async def send_file(self, channel_id, data, name, caption=""):
+                if name.endswith("bounded.bin"):
+                    part = int(name.split("]", 1)[0][5:])
+                    started.append(part)
+                    if part == 2:
+                        first_batch.set()
+                    if part == full_parts + 1:
+                        last_attachment.set()
+                        await allow_last.wait()
+                    else:
+                        await allow_data.wait()
+                return await super().send_file(channel_id, data, name, caption)
+
+        dc = DiscordStore(
+            [Bot(1, channel)],
+            channel_id=98_770,
+            key=config.stores["dc-spare"].key,
+            max_part_bytes=part_size,
+            max_concurrent_uploads=11,
+        )
+
+        async def stores(cfg):
+            return tg if cfg.backend == "telegram" else dc
+
+        client = await Client.create(config.filesystems["media"], config, stores)
+        tg.fail = set(PRIMARY_DOWN)
+
+        class NoAuth(asyncssh.SSHServer):
+            def begin_auth(self, username: str) -> bool:
+                return False
+
+        def factory(chan):
+            server = TGFSSFTPServer(chan, {"media": client}, config)
+            server._user = AdminUser("admin")
+            return server
+
+        async with AsyncExitStack() as stack:
+            listener = await stack.enter_async_context(
+                asyncssh.listen(
+                    "127.0.0.1",
+                    0,
+                    server_factory=NoAuth,
+                    server_host_keys=[asyncssh.generate_private_key("ssh-ed25519")],
+                    sftp_factory=factory,
+                )
+            )
+            conn = await stack.enter_async_context(
+                asyncssh.connect(
+                    "127.0.0.1", listener.get_port(), username="test", known_hosts=None
+                )
+            )
+            sftp = await stack.enter_async_context(conn.start_sftp_client())
+            handle = await sftp.open("/media/bounded.bin", "wb")
+
+            async def write():
+                block = 32 * 1024
+                for offset in range(0, len(data), block):
+                    await handle.write(data[offset : offset + block], offset)
+
+            write_task = asyncio.create_task(write())
+            close_task = None
+            try:
+                await asyncio.wait_for(first_batch.wait(), 3)
+                done, _ = await asyncio.wait({write_task}, timeout=0.2)
+                # A large tee queue used to ACK the entire upload while
+                # this bot was still sending its first batch.
+                assert not done
+                assert started == [1, 2]
+                allow_data.set()
+                await asyncio.wait_for(write_task, 3)
+                close_task = asyncio.create_task(handle.close())
+                await asyncio.wait_for(last_attachment.wait(), 3)
+                assert not close_task.done()
+                allow_last.set()
+                await asyncio.wait_for(close_task, 3)
+                async with await sftp.open("/media/bounded.bin", "rb") as downloaded:
+                    assert await downloaded.read() == data
+            finally:
+                allow_data.set()
+                allow_last.set()
+                tasks = [write_task] if close_task is None else [write_task, close_task]
+                for task in tasks:
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
+
+        fr = tree(client).find_file("bounded.bin")
+        version = (await client.file_api.desc(fr)).get_latest_version()
+        assert version.store == dc.key
+
     async def test_an_aborted_hanging_primary_marks_the_breaker(self):
         """The form a real outage takes: not an error, but silence.
 

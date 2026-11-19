@@ -2,7 +2,7 @@ import asyncio
 import logging
 import time
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import Awaitable, List, Optional
 
 from telethon.helpers import generate_random_long
 
@@ -11,6 +11,7 @@ from tgdcfs.errors import RpcTimeoutError, TechnicalError
 from tgdcfs.reqres import (
     SaveBigFilePartReq,
     SaveFilePartReq,
+    SaveFilePartResp,
     SendFileReq,
     SendMessageResp,
     UploadableFileMessage,
@@ -114,20 +115,47 @@ class FileUploader:
         play, and a store that answered nothing at all -- or nothing for a
         whole bound -- still ends the upload immediately.
         """
-        if self._last_part_answered is None:
-            return False
+        return self._silence_remaining() > 0
+
+    def _silence_remaining(self) -> float:
         bound = get_config().tgdcfs.transfer.upload_part_timeout_s
-        if bound <= 0:
-            return False
-        return time.monotonic() - self._last_part_answered < float(bound)
+        if bound <= 0 or self._last_part_answered is None:
+            return 0.0
+        return self._last_part_answered + bound - time.monotonic()
+
+    async def _retry_while_answering(
+        self, what: str, call: Awaitable[SaveFilePartResp]
+    ) -> SaveFilePartResp:
+        """A timed-out part may retry only while other parts make progress.
+
+        Its next RPC can start before the store-wide silence bound expires.
+        Don't let that restart the clock: the first gap with no answers
+        for a whole bound ends the upload, even during a retry.
+        """
+        bound = get_config().tgdcfs.transfer.upload_part_timeout_s
+        rpc = asyncio.ensure_future(call)
+        try:
+            while (remaining := self._silence_remaining()) > 0:
+                done, _ = await asyncio.wait({rpc}, timeout=remaining)
+                if done:
+                    return rpc.result()
+                # Another worker may have extended the deadline.
+            raise RpcTimeoutError(
+                f"Telegram did not answer {what} within {bound}s of its last response"
+            )
+        finally:
+            rpc.cancel()
+            await asyncio.gather(rpc, return_exceptions=True)
 
     async def _upload_chunk(
         self, chunk: FileChunk, file_total_parts: Optional[int] = None
     ) -> None:
+        what = f"part {chunk.file_part} of {self._file_name}"
+        retrying_timeout = False
         for attempt in range(1, MAX_PART_ATTEMPTS + 1):
             if self._is_big:
                 call = bounded_part(
-                    f"part {chunk.file_part} of {self._file_name}",
+                    what,
                     self.client.save_big_file_part(
                         SaveBigFilePartReq(
                             file_id=self._file_id,
@@ -143,7 +171,7 @@ class FileUploader:
                 )
             else:
                 call = bounded_part(
-                    f"part {chunk.file_part} of {self._file_name}",
+                    what,
                     self.client.save_file_part(
                         SaveFilePartReq(
                             file_id=self._file_id,
@@ -153,7 +181,11 @@ class FileUploader:
                     ),
                 )
             try:
-                rsp = await call
+                rsp = (
+                    await self._retry_while_answering(what, call)
+                    if retrying_timeout
+                    else await call
+                )
 
                 if not rsp.success:
                     raise TechnicalError(f"Unexpected response: {rsp}")
@@ -163,7 +195,8 @@ class FileUploader:
                 return
 
             except Exception as e:
-                if isinstance(e, RpcTimeoutError) and not self._store_alive():
+                retrying_timeout |= isinstance(e, RpcTimeoutError)
+                if retrying_timeout and not self._store_alive():
                     # The store stayed silent for the whole part bound and
                     # nothing came back to say otherwise: it is
                     # unresponsive, not flaky. Retrying against the same
@@ -192,7 +225,14 @@ class FileUploader:
                     f"{e}, attempt={attempt}/{MAX_PART_ATTEMPTS}, "
                     f"retrying in {delay:.1f}s"
                 )
-                await asyncio.sleep(delay)
+                while delay > 0:
+                    pause = delay
+                    if retrying_timeout:
+                        pause = min(delay, self._silence_remaining())
+                        if pause <= 0:
+                            raise
+                    await asyncio.sleep(pause)
+                    delay -= pause
 
     def _done_reading(self) -> bool:
         return self._read_size >= self._file_size
@@ -322,27 +362,24 @@ class FileUploader:
             for _ in range(self._num_workers)
         ]
 
-        async def feed(chunk: FileChunk) -> None:
+        async def feed(chunk: Optional[FileChunk]) -> None:
             # A full queue waits for a worker to take from it; workers that
             # all stopped (cancelled or failed) never will, so bail out
             # instead of blocking on the queue forever.
             while True:
+                if worker_failure:
+                    raise worker_failure[0]
+                if all(w.done() for w in workers):
+                    if chunk is None:
+                        return
+                    raise TechnicalError(
+                        f"Upload of {self._file_name} stopped before the "
+                        f"stream was consumed"
+                    )
                 try:
                     queue.put_nowait(chunk)
                     return
                 except asyncio.QueueFull:
-                    if worker_failed.is_set():
-                        if worker_failure:
-                            raise worker_failure[0]
-                        raise TechnicalError(
-                            f"Upload of {self._file_name} stopped before the "
-                            f"stream was consumed"
-                        )
-                    if all(w.done() for w in workers):
-                        raise TechnicalError(
-                            f"Upload of {self._file_name} stopped before the "
-                            f"stream was consumed"
-                        )
                     await asyncio.sleep(0.05)
 
         total = 0
@@ -369,17 +406,7 @@ class FileUploader:
                     return_when=asyncio.FIRST_COMPLETED,
                 )
                 if failure_watcher in done:
-                    # The workers are dead, so whatever the read still
-                    # brings back cannot complete this upload: drop it
-                    # and let the cleanup below re-raise the worker's
-                    # error through the write's failover path.
-                    if reader not in done:
-                        reader.cancel()
-                        await asyncio.gather(reader, return_exceptions=True)
-                    else:
-                        # A finished read must never be left unretrieved.
-                        reader.exception()
-                    break
+                    raise worker_failure[0]
                 content = reader.result()
                 if not content:
                     break
@@ -396,33 +423,22 @@ class FileUploader:
                     tail = content
                     break
                 held = content
-        finally:
-            failure_watcher.cancel()
-            await asyncio.gather(failure_watcher, return_exceptions=True)
-            if reader is not None and not reader.done():
-                reader.cancel()
-                await asyncio.gather(reader, return_exceptions=True)
-            if worker_failed.is_set():
-                # A worker died mid upload, so the queued chunks can
-                # never be uploaded again: delivering the end-of-stream
-                # sentinels would block on a full queue nobody drains
-                # and keep the failure unretrieved forever. Stop the
-                # survivors instead and let the gather collect the
-                # error.
-                for w in workers:
-                    if not w.done():
-                        w.cancel()
-                results = await asyncio.gather(*workers, return_exceptions=True)
-            elif all(w.done() for w in workers):
-                results = await asyncio.gather(*workers, return_exceptions=True)
-            else:
+            if not await self._cancelled():
                 for _ in workers:
-                    await queue.put(None)
-                results = await asyncio.gather(*workers, return_exceptions=True)
-
-        failed = next((r for r in results if isinstance(r, Exception)), None)
-        if failed is not None:
-            raise failed
+                    await feed(None)
+                await asyncio.gather(*workers)
+            if await self._cancelled():
+                held = tail = None
+        finally:
+            # An aborted uploader must never wait for space in a dead
+            # worker's queue, and must reap every worker exception.
+            children = [failure_watcher, *workers]
+            if reader is not None:
+                children.append(reader)
+            for child in children:
+                if not child.done() and not child.cancelling():
+                    child.cancel()
+            await asyncio.gather(*children, return_exceptions=True)
 
         last = tail if tail is not None else held
         if last is not None:
