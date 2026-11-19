@@ -4,7 +4,7 @@ import time
 import pytest
 from unittest.mock import AsyncMock, Mock
 
-from telethon import TelegramClient
+from telethon import TelegramClient, functions as tlf
 from telethon.sessions import StringSession
 from telethon.helpers import TotalList
 from telethon import types as tlt
@@ -64,6 +64,81 @@ class TestTelethonAPI:
     @pytest.fixture
     def telethon_api(self, mock_client) -> TelethonAPI:
         return TelethonAPI(mock_client)
+
+    async def test_later_upload_part_reconnects_after_telethon_gave_up(
+        self, mock_client
+    ):
+        connected = False
+
+        async def connect():
+            nonlocal connected
+            connected = True
+
+        mock_client.is_connected.side_effect = lambda: connected
+        mock_client.connect.side_effect = connect
+        mock_client.return_value = True
+        api = TelethonAPI(mock_client)
+
+        results = await asyncio.gather(
+            *(
+                api.save_file_part(
+                    SaveFilePartReq(file_id=1, bytes=b"data", file_part=i)
+                )
+                for i in range(2)
+            )
+        )
+
+        assert all(result.success for result in results)
+        mock_client.connect.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("rpc_timeout", [0, 120])
+    async def test_sender_cancels_request_not_the_caller(
+        self, telethon_api, mock_client, mocker, rpc_timeout
+    ):
+        cfg = Mock()
+        cfg.tgdcfs.transfer = TransferConfig.from_dict({"rpc_timeout_s": rpc_timeout})
+        mocker.patch("tgdcfs.backends.telegram.interface.get_config", return_value=cfg)
+
+        async def disconnected(_req):
+            pending = asyncio.get_running_loop().create_future()
+            pending.cancel()
+            await pending
+
+        mock_client.side_effect = disconnected
+        req = SaveFilePartReq(file_id=1, bytes=b"data", file_part=0)
+        with pytest.raises(ConnectionError, match="cancelled the request"):
+            await telethon_api.save_file_part(req)
+
+        mock_client.side_effect = None
+        mock_client.return_value = True
+        assert (await telethon_api.save_file_part(req)).success
+
+    @pytest.mark.asyncio
+    async def test_cancelling_the_caller_still_stops_the_request(
+        self, telethon_api, mock_client
+    ):
+        started = asyncio.Event()
+        closed = asyncio.Event()
+
+        async def wait_for_reply(_req):
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                closed.set()
+
+        mock_client.side_effect = wait_for_reply
+        call = asyncio.create_task(
+            telethon_api.save_file_part(
+                SaveFilePartReq(file_id=1, bytes=b"data", file_part=0)
+            )
+        )
+        await started.wait()
+        call.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await call
+        assert closed.is_set()
 
     @pytest.fixture
     def mock_chat(self, mocker):
@@ -544,6 +619,108 @@ class TestTelethonAPI:
 
         assert telethon_api._client.get_messages.call_count == 1
 
+    async def test_download_file_reconnects_a_stale_transfer_client(
+        self, mock_client, mock_chat, mock_document_message, mocker
+    ):
+        reader = mocker.Mock(spec=TelegramClient)
+        connected = False
+
+        async def connect():
+            nonlocal connected
+            connected = True
+
+        async def download(**_kwargs):
+            if not connected:
+                raise ConnectionError("Cannot send requests while disconnected")
+            yield b"payload"
+
+        reader.is_connected.side_effect = lambda: connected
+        reader.connect.side_effect = connect
+        reader.iter_download = download
+        mock_client.get_messages.return_value = TotalList([mock_document_message])
+        api = TelethonAPI(mock_client, [reader])
+        # The metadata client was already used by the preceding transfer.
+        assert api._transfer_client is mock_client
+        req = DownloadFileReq(chat=mock_chat, message_id=54321, begin=1, end=4)
+        resp = await api.download_file(req)
+
+        assert b"".join([chunk async for chunk in resp.chunks]) == b"aylo"
+        reader.connect.assert_awaited_once()
+        mock_client.connect.assert_not_awaited()
+
+    @pytest.mark.parametrize("cancel_rpc", [False, True])
+    async def test_download_file_resumes_at_exact_byte_after_disconnect(
+        self, telethon_api, mock_client, mock_chat, mock_document_message, cancel_rpc
+    ):
+        mock_client.get_messages.return_value = TotalList([mock_document_message])
+        connected = True
+        offsets = []
+        closed = []
+
+        async def connect():
+            nonlocal connected
+            connected = True
+
+        async def download(*, offset, **_kwargs):
+            nonlocal connected
+            offsets.append(offset)
+            attempt = len(offsets)
+            try:
+                if attempt == 1:
+                    yield b"0123456"
+                    connected = False
+                    if cancel_rpc:
+                        rpc = asyncio.get_running_loop().create_future()
+                        rpc.cancel()
+                        await rpc
+                    raise ConnectionError("Cannot send requests while disconnected")
+                assert connected
+                yield b"0123456789abcdef"
+            finally:
+                closed.append(attempt)
+
+        mock_client.is_connected.side_effect = lambda: connected
+        mock_client.connect.side_effect = connect
+        mock_client.iter_download = download
+        begin = DOWNLOAD_REQUEST_SIZE + 3
+        resp = await telethon_api.download_file(
+            DownloadFileReq(
+                chat=mock_chat, message_id=54321, begin=begin, end=begin + 9
+            )
+        )
+
+        assert [chunk async for chunk in resp.chunks] == [b"3456", b"789abc"]
+        assert offsets == [DOWNLOAD_REQUEST_SIZE, DOWNLOAD_REQUEST_SIZE]
+        assert closed == [1, 2]
+        mock_client.connect.assert_awaited_once()
+
+    async def test_download_file_does_not_retry_when_the_reader_is_cancelled(
+        self, telethon_api, mock_client, mock_chat, mock_document_message
+    ):
+        mock_client.get_messages.return_value = TotalList([mock_document_message])
+        started = asyncio.Event()
+        never = asyncio.Event()
+        attempts = 0
+
+        async def download(**_kwargs):
+            nonlocal attempts
+            attempts += 1
+            started.set()
+            await never.wait()
+            yield b"unreachable"
+
+        mock_client.iter_download = download
+        resp = await telethon_api.download_file(
+            DownloadFileReq(chat=mock_chat, message_id=54321, begin=0, end=1)
+        )
+        call = asyncio.create_task(resp.chunks.__anext__())
+        await asyncio.wait_for(started.wait(), 1)
+        call.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await call
+        assert attempts == 1
+        mock_client.connect.assert_not_awaited()
+
     @pytest.mark.asyncio
     async def test_download_file_refreshes_an_expired_file_reference(
         self, telethon_api, mock_chat, mock_document_message
@@ -840,7 +1017,7 @@ class TestLoginAsAccount:
 
         MockSession = mocker.patch("tgdcfs.backends.telegram.impl.telethon.Session")
         MockTelegramClient = mocker.patch(
-            "tgdcfs.backends.telegram.impl.telethon.TelegramClient"
+            "tgdcfs.backends.telegram.impl.telethon._RPCOnlyTelegramClient"
         )
 
         mock_session_instance = MockSession.return_value
@@ -853,7 +1030,7 @@ class TestLoginAsAccount:
         result = await login_as_account(mock_config)
 
         MockTelegramClient.assert_called_once_with(
-            mock_session_string, 12345, "test_api_hash"
+            mock_session_string, 12345, "test_api_hash", receive_updates=False
         )
         mock_client.connect.assert_called_once()
         assert result == mock_client
@@ -868,7 +1045,7 @@ class TestLoginAsAccount:
 
         MockSession = mocker.patch("tgdcfs.backends.telegram.impl.telethon.Session")
         MockTelegramClient = mocker.patch(
-            "tgdcfs.backends.telegram.impl.telethon.TelegramClient"
+            "tgdcfs.backends.telegram.impl.telethon._RPCOnlyTelegramClient"
         )
         mock_input = mocker.patch("builtins.input")
 
@@ -907,7 +1084,7 @@ class TestLoginAsAccount:
 
         MockSession = mocker.patch("tgdcfs.backends.telegram.impl.telethon.Session")
         MockTelegramClient = mocker.patch(
-            "tgdcfs.backends.telegram.impl.telethon.TelegramClient"
+            "tgdcfs.backends.telegram.impl.telethon._RPCOnlyTelegramClient"
         )
         mock_input = mocker.patch("builtins.input")
 
@@ -949,7 +1126,7 @@ class TestLoginAsAccount:
 
         MockSession = mocker.patch("tgdcfs.backends.telegram.impl.telethon.Session")
         MockTelegramClient = mocker.patch(
-            "tgdcfs.backends.telegram.impl.telethon.TelegramClient"
+            "tgdcfs.backends.telegram.impl.telethon._RPCOnlyTelegramClient"
         )
         mock_input = mocker.patch("builtins.input")
 
@@ -974,7 +1151,7 @@ class TestLoginAsAccount:
 
         MockSession = mocker.patch("tgdcfs.backends.telegram.impl.telethon.Session")
         MockTelegramClient = mocker.patch(
-            "tgdcfs.backends.telegram.impl.telethon.TelegramClient"
+            "tgdcfs.backends.telegram.impl.telethon._RPCOnlyTelegramClient"
         )
         mock_logger = mocker.patch("tgdcfs.backends.telegram.impl.telethon.logger")
 
@@ -1030,7 +1207,7 @@ class TestLoginAsBots:
 
         MockSession = mocker.patch("tgdcfs.backends.telegram.impl.telethon.Session")
         MockTelegramClient = mocker.patch(
-            "tgdcfs.backends.telegram.impl.telethon.TelegramClient"
+            "tgdcfs.backends.telegram.impl.telethon._RPCOnlyTelegramClient"
         )
         mock_gather = mocker.patch("asyncio.gather")
 
@@ -1065,6 +1242,10 @@ class TestLoginAsBots:
 
         assert len(result) == 2
         assert result == mock_clients
+        assert all(
+            call.kwargs["receive_updates"] is False
+            for call in MockTelegramClient.call_args_list
+        )
 
         # Verify both clients were started with their tokens
         mock_clients[0].start.assert_called_once_with(bot_token="123:token1")
@@ -1078,7 +1259,7 @@ class TestLoginAsBots:
 
         MockSession = mocker.patch("tgdcfs.backends.telegram.impl.telethon.Session")
         MockTelegramClient = mocker.patch(
-            "tgdcfs.backends.telegram.impl.telethon.TelegramClient"
+            "tgdcfs.backends.telegram.impl.telethon._RPCOnlyTelegramClient"
         )
         mock_gather = mocker.patch("asyncio.gather")
 
@@ -1121,7 +1302,7 @@ class TestLoginAsBots:
 
         MockSession = mocker.patch("tgdcfs.backends.telegram.impl.telethon.Session")
         MockTelegramClient = mocker.patch(
-            "tgdcfs.backends.telegram.impl.telethon.TelegramClient"
+            "tgdcfs.backends.telegram.impl.telethon._RPCOnlyTelegramClient"
         )
         mock_gather = mocker.patch("asyncio.gather")
 
@@ -1147,7 +1328,7 @@ class TestLoginAsBots:
         result = await login_as_bots(mock_config_single_token)
 
         MockTelegramClient.assert_called_once_with(
-            existing_session, 12345, "test_api_hash"
+            existing_session, 12345, "test_api_hash", receive_updates=False
         )
         mock_client.connect.assert_called_once()
         mock_client.start.assert_not_called()  # Should not start if session exists
@@ -1161,7 +1342,7 @@ class TestLoginAsBots:
 
         MockSession = mocker.patch("tgdcfs.backends.telegram.impl.telethon.Session")
         MockTelegramClient = mocker.patch(
-            "tgdcfs.backends.telegram.impl.telethon.TelegramClient"
+            "tgdcfs.backends.telegram.impl.telethon._RPCOnlyTelegramClient"
         )
         mock_gather = mocker.patch("asyncio.gather")
         mock_logger = mocker.patch("tgdcfs.backends.telegram.impl.telethon.logger")
@@ -1293,7 +1474,7 @@ class TestOpenExtraConnections:
         client.session.save.return_value = "session-string"
         mocker.patch("tgdcfs.backends.telegram.impl.telethon.StringSession")
         built = mocker.patch(
-            "tgdcfs.backends.telegram.impl.telethon.TelegramClient",
+            "tgdcfs.backends.telegram.impl.telethon._RPCOnlyTelegramClient",
             side_effect=lambda *_a, **_kw: mocker.AsyncMock(spec=TelegramClient),
         )
 
@@ -1302,6 +1483,9 @@ class TestOpenExtraConnections:
         # Three more on top of the one the caller already holds
         assert len(extra) == 3
         assert built.call_count == 3
+        assert all(
+            call.kwargs["receive_updates"] is False for call in built.call_args_list
+        )
         for connection in extra:
             connection.connect.assert_awaited_once()  # type: ignore[attr-defined]
 
@@ -1323,12 +1507,36 @@ class TestOpenExtraConnections:
             return connection
 
         mocker.patch(
-            "tgdcfs.backends.telegram.impl.telethon.TelegramClient", side_effect=build
+            "tgdcfs.backends.telegram.impl.telethon._RPCOnlyTelegramClient",
+            side_effect=build,
         )
 
         extra = await open_extra_connections(config, client)
 
         assert len(extra) == 1
+
+
+@pytest.mark.asyncio
+async def test_rpc_only_connection_skips_updates_but_receives_rpc_replies(mocker):
+    from tgdcfs.backends.telegram.impl.telethon import _RPCOnlyTelegramClient
+
+    # Telethon 1.40 starts its own difference loop even with receive_updates
+    # disabled. The storage transport must not enter it on any connection.
+    pump = mocker.patch.object(TelegramClient, "_update_loop", new_callable=AsyncMock)
+    client = _RPCOnlyTelegramClient(
+        StringSession(), 12345, "test", receive_updates=False
+    )
+    await client._update_loop()
+    pump.assert_not_awaited()
+
+    reply = asyncio.get_running_loop().create_future()
+    reply.set_result(True)
+    send = mocker.patch.object(client._sender, "send", return_value=reply)
+    req = tlf.upload.SaveFilePartRequest(file_id=1, file_part=0, bytes=b"test")
+    assert await client(req) is True
+    wrapped = send.call_args.args[0]
+    assert isinstance(wrapped, tlf.InvokeWithoutUpdatesRequest)
+    assert wrapped.query is req
 
 
 class TestChunkCacheInvalidation:

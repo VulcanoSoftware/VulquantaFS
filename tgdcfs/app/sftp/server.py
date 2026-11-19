@@ -470,6 +470,7 @@ class TGFSSFTPServer(asyncssh.SFTPServer):
             buffer_max_bytes=sftp_cfg.upload_buffer_size_bytes,
             buffer_dir=sftp_cfg.upload_buffer_dir,
             max_gap_bytes=sftp_cfg.max_ahead_gap_bytes,
+            wait_disconnected=self._channel.wait_closed,
         )
         self._handles.append(handle)
         return handle

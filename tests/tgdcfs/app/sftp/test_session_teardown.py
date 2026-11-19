@@ -18,6 +18,7 @@ import pytest
 
 from tests.tgdcfs.app.sftp.test_sftp_server import build_client
 from tgdcfs.app.sftp import server as sftp_server
+from tgdcfs.app.sftp.handles import WriteHandle
 from tgdcfs.app.sftp.server import TGFSSFTPServer
 from tgdcfs.auth.user import AdminUser
 from tgdcfs.core import Ops
@@ -31,6 +32,8 @@ class Recorder:
         self.committed: List[int] = []  # byte counts of finished uploads
         self.cancelled = 0
         self.started = asyncio.Event()
+        self.stopped = asyncio.Event()
+        self.hold_upload = False
 
 
 def make_ops_class(recorder: Recorder):
@@ -47,10 +50,13 @@ def make_ops_class(recorder: Recorder):
             received = 0
             recorder.started.set()
             try:
+                if recorder.hold_upload:
+                    await asyncio.Event().wait()
                 async for chunk in stream:
                     received += len(chunk)
             except asyncio.CancelledError:
                 recorder.cancelled += 1
+                recorder.stopped.set()
                 raise
             recorder.committed.append(received)
 
@@ -151,3 +157,36 @@ async def test_a_dropped_upload_does_not_flood_the_log(session, caplog):
         await settle(1.0)
 
     assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
+
+
+@pytest.mark.parametrize("request_kind", ["write", "close"])
+async def test_disconnect_unblocks_a_request_waiting_on_a_full_queue(
+    session, monkeypatch, request_kind
+):
+    recorder, conn = session
+    recorder.hold_upload = True
+    blocked = asyncio.Event()
+    original = WriteHandle._enqueue
+
+    async def observe_enqueue(self, data):
+        if data in (None, b"second"):
+            blocked.set()
+        await original(self, data)
+
+    monkeypatch.setattr(WriteHandle, "_enqueue", observe_enqueue)
+    sftp = await conn.start_sftp_client()
+    handle = await sftp.open("/notes/stalled.bin", "wb")
+    await handle.write(b"first", 0)  # fills the queue; the backend reads nothing
+    await asyncio.wait_for(recorder.started.wait(), 2)
+    pending = asyncio.create_task(
+        handle.write(b"second", 5) if request_kind == "write" else handle.close()
+    )
+    try:
+        await asyncio.wait_for(blocked.wait(), 2)
+        assert not pending.done()
+        conn.abort()
+        await asyncio.wait_for(recorder.stopped.wait(), 2)
+        assert recorder.committed == []
+    finally:
+        pending.cancel()
+        await asyncio.gather(pending, return_exceptions=True)

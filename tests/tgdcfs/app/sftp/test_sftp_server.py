@@ -1,3 +1,4 @@
+import asyncio
 import datetime
 
 import asyncssh
@@ -63,7 +64,11 @@ def build_client(mocker, name: str) -> Client:
 
 
 def build_server(mocker, user=None, clients=None) -> TGFSSFTPServer:
+    async def wait_closed():
+        await asyncio.Event().wait()
+
     chan = mocker.Mock()
+    chan.wait_closed = mocker.AsyncMock(side_effect=wait_closed)
     chan.is_closing = mocker.Mock(return_value=False)
     chan.get_extra_info = mocker.Mock(
         side_effect=lambda key, default=None: (
