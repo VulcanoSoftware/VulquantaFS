@@ -1,7 +1,8 @@
 import asyncio
 import logging
+import time
 from dataclasses import dataclass
-from typing import Optional
+from typing import List, Optional
 
 from telethon.helpers import generate_random_long
 
@@ -87,6 +88,9 @@ class FileUploader:
         self._is_big = self._streamed or is_big_file(self._file_size)
         self._read_size = 0
         self._uploaded_size = 0
+        # When the last part came back, ``None`` while none has; see
+        # :meth:`_store_alive`.
+        self._last_part_answered: Optional[float] = None
 
         self._num_workers = self._workers.big if self._is_big else self._workers.small
         self._lock = asyncio.Lock()
@@ -96,6 +100,26 @@ class FileUploader:
 
     async def _read(self, length: int) -> bytes:
         return await self._file_msg.read(length)
+
+    def _store_alive(self) -> bool:
+        """Whether the store answered a part, and recently enough to matter.
+
+        A part bound that expires is evidence of a dead store only when no
+        other part came back either. The workers share one connection, and
+        at this level a single dropped response is indistinguishable from a
+        service that went away; failing the whole upload for it throws away
+        a transfer the client cannot resume, while the parts that did come
+        back prove the store is still there. The part bound is the window:
+        anything answered within the last one keeps the retry budget in
+        play, and a store that answered nothing at all -- or nothing for a
+        whole bound -- still ends the upload immediately.
+        """
+        if self._last_part_answered is None:
+            return False
+        bound = get_config().tgdcfs.transfer.upload_part_timeout_s
+        if bound <= 0:
+            return False
+        return time.monotonic() - self._last_part_answered < float(bound)
 
     async def _upload_chunk(
         self, chunk: FileChunk, file_total_parts: Optional[int] = None
@@ -134,17 +158,23 @@ class FileUploader:
                 if not rsp.success:
                     raise TechnicalError(f"Unexpected response: {rsp}")
 
+                self._last_part_answered = time.monotonic()
                 self._uploaded_size += len(chunk.content)
                 return
 
-            except RpcTimeoutError:
-                # The store stayed silent for the whole part bound: it is
-                # unresponsive, not flaky. Retrying against the same dead
-                # connection burns the SFTP client's patience -- its write
-                # acknowledgements are frozen -- before the write can fail
-                # over to a mirror store, so let the failure travel now.
-                raise
             except Exception as e:
+                if isinstance(e, RpcTimeoutError) and not self._store_alive():
+                    # The store stayed silent for the whole part bound and
+                    # nothing came back to say otherwise: it is
+                    # unresponsive, not flaky. Retrying against the same
+                    # dead connection burns the SFTP client's patience --
+                    # its write acknowledgements are frozen while every
+                    # worker is stuck -- before the write can fail over to a
+                    # mirror store, so let the failure travel now. A store
+                    # that is still answering other parts is covered by the
+                    # retry budget below instead.
+                    raise
+
                 if attempt == MAX_PART_ATTEMPTS:
                     logger.error(
                         f"Giving up on part {chunk.file_part} for {self._file_name} "
@@ -260,6 +290,11 @@ class FileUploader:
             maxsize=self._num_workers
         )
         worker_failed = asyncio.Event()
+        # What took the first worker down. It is the upload's real failure,
+        # so it is what the caller has to see -- a bail-out message of our
+        # own would hide the part bound or the store's error from the log
+        # and from the write's failover path.
+        worker_failure: List[BaseException] = []
 
         async def worker() -> None:
             try:
@@ -276,7 +311,9 @@ class FileUploader:
                     await self._upload_chunk(chunk, file_total_parts=-1)
                     if tt := self._file_msg.task_tracker:
                         await tt.update_progress(size_delta=len(chunk.content))
-            except Exception:
+            except Exception as ex:
+                if not worker_failure:
+                    worker_failure.append(ex)
                 worker_failed.set()
                 raise
 
@@ -294,7 +331,14 @@ class FileUploader:
                     queue.put_nowait(chunk)
                     return
                 except asyncio.QueueFull:
-                    if worker_failed.is_set() or all(w.done() for w in workers):
+                    if worker_failed.is_set():
+                        if worker_failure:
+                            raise worker_failure[0]
+                        raise TechnicalError(
+                            f"Upload of {self._file_name} stopped before the "
+                            f"stream was consumed"
+                        )
+                    if all(w.done() for w in workers):
                         raise TechnicalError(
                             f"Upload of {self._file_name} stopped before the "
                             f"stream was consumed"

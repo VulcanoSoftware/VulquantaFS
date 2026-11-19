@@ -699,6 +699,51 @@ class TestPartTimeout:
         assert client.save_big_file_part.await_count <= 4
 
     @pytest.mark.asyncio
+    async def test_a_part_nobody_answered_is_retried_while_others_come_back(
+        self, mocker
+    ):
+        """One dropped response is not a dead store.
+
+        The workers share one connection, so a part whose response never
+        arrives looks exactly like a store that went away -- but the parts
+        that keep coming back say it did not. Failing the upload there
+        discards a transfer the client cannot resume, one dropped response
+        into a 1 GB file; the retry budget is what that case is for. Only a
+        store that answers nothing at all gives up inside the bound.
+        """
+        self._config(mocker, upload_part_timeout_s=1, upload_workers_big=2)
+        client = mocker.AsyncMock(spec=ITDLibClient)
+        saved = []
+        hung = []
+
+        async def save_big_file_part(req):
+            if req.file_part == 2 and not hung:
+                hung.append(req.file_part)
+                await asyncio.sleep(60)  # the response that never comes
+            await asyncio.sleep(0.05)  # slow enough to outlast the bound
+            saved.append(req.file_part)
+            return SaveFilePartResp(success=True)
+
+        client.save_big_file_part = save_big_file_part
+        parts = 64
+
+        uploader = FileUploader(
+            client=client,
+            file_msg=FileMessageFromStream.new(
+                stream=self._stream(parts * self.PART), size=-1
+            ),
+        )
+
+        assert (
+            await asyncio.wait_for(uploader.upload(), timeout=20) == parts * self.PART
+        )
+        # The unanswered part was sent again and landed once, and nothing
+        # else was disturbed by its retry.
+        assert hung == [2]
+        assert sorted(saved) == list(range(parts))
+        assert uploader.get_uploaded_file().parts == parts
+
+    @pytest.mark.asyncio
     async def test_the_retry_budget_survives_for_errors_that_can_recover(
         self, no_backoff, mocker
     ):
@@ -863,10 +908,11 @@ class TestStreamedUploadFailurePropagation:
         )
 
         start = time.monotonic()
-        # The error surfaces either as the worker's ``RpcTimeoutError``
-        # (gathered by the cleanup) or as the feed's own bail-out on the
-        # full queue; both reach the failover path.
-        with pytest.raises((RpcTimeoutError, TechnicalError)):
+        # Whichever side notices first -- the cleanup gathering the dead
+        # worker, or the feed bailing out on a queue nobody drains -- the
+        # upload fails with the worker's own error, never with a bail-out
+        # message that hides the store's.
+        with pytest.raises(RpcTimeoutError):
             await asyncio.wait_for(uploader.upload(), timeout=10)
         assert time.monotonic() - start < 5
 
