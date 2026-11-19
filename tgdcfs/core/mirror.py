@@ -39,10 +39,10 @@ the first mirror that accepts them. That store then owns the version
 and the descriptor (both record the acting store's key), and the
 copies it left behind everywhere else are handed to the replication
 queue like any other gap: ``copy_into_primary`` and ``relocate`` bring
-both back to the primary once a write into it succeeds again. A
-primary that only fails at the start of a write marks itself dead; the
-caller's retry -- an upload stream cannot be replayed within the same
-attempt -- then goes straight to the acting store.
+both back to the primary once a write into it succeeds again. With
+``sync: tee``, a re-uploading mirror sees the stream from byte zero and
+can complete the original request even when the primary fails midway.
+Other modes cannot replay a consumed stream and need a fresh request.
 
 Names: every message a store keeps is named by the store's own part
 numbering with the file's own name, copies included. A mirror copy is
@@ -53,6 +53,7 @@ which is which.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from dataclasses import dataclass, field
@@ -74,6 +75,7 @@ MIRROR_MODES: tuple[MirrorMode, ...] = ("auto", "forward", "reupload")
 
 # How long reads prefer the mirrors after a primary-store failure.
 PRIMARY_DEAD_SECONDS = 60.0
+TEE_DESCRIPTOR_TIMEOUT_S = 8.0
 
 
 @dataclass
@@ -110,6 +112,7 @@ class MirrorGroup:
         stores: List[MirrorStore],
         mode: MirrorMode = "auto",
         strict: bool = False,
+        tee: bool = False,
     ):
         if mode not in MIRROR_MODES:
             raise ValueError(f"Unknown mirror mode: {mode}")
@@ -119,6 +122,8 @@ class MirrorGroup:
         self._strict = strict
         self._by_key = {ch.key: ch for ch in stores}
         self._primary_dead_until = 0.0
+        self._bound_mirror_descriptors = tee and not strict
+        self._fd_mirror_dead_until: Dict[str, float] = {}
 
     @property
     def primary(self) -> IStore:
@@ -218,6 +223,7 @@ class MirrorGroup:
                     res.replicas[ch.key] = await self._replicate(
                         ch, source, message_ids, sizes, cache, name
                     )
+                self._fd_mirror_dead_until.pop(ch.key, None)
             except Exception as ex:
                 self._handle_write_error(ch.key, "content parts", ex)
         return res
@@ -272,9 +278,9 @@ class MirrorGroup:
             async def run(branch: TeeBranch) -> Replica:
                 stream = branch.stream()
                 try:
-                    sent = await ch.store.upload(
-                        FileMessageFromStream.new(stream=stream, size=size, name=name)
-                    )
+                    msg = FileMessageFromStream.new(stream=stream, size=size, name=name)
+                    msg.failover = branch.has_alternative
+                    sent = await ch.store.upload(msg)
                 finally:
                     await stream.aclose()
                 return Replica(
@@ -295,8 +301,11 @@ class MirrorGroup:
         replicas: Dict[str, Replica] = {}
         for key, outcome in results.items():
             if isinstance(outcome, Exception):
+                if self._bound_mirror_descriptors:
+                    self._mark_fd_mirror_dead(key)
                 self._handle_write_error(key, "tee'd content", outcome)
             else:
+                self._fd_mirror_dead_until.pop(key, None)
                 replicas[key] = outcome
         return replicas
 
@@ -340,12 +349,21 @@ class MirrorGroup:
         if len(sizes) != len(version.message_ids):
             sizes = await self._part_sizes(source, version.message_ids)
         target = MirrorStore(key=self._primary.key, store=self._primary)
-        if self._fits_aligned(self._primary, source, sizes):
-            ids = await self._copy_to(target, source, version.message_ids, name=name)
+        if self._fits_aligned(self._primary, source, sizes) and (
+            source.backend == self._primary.backend or self._mode == "forward"
+        ):
+            ids = await self._copy_to(
+                target, source, version.message_ids, part_sizes=sizes, name=name
+            )
             version.mirrors[self._primary.key] = ids
         else:
             version.replicas[self._primary.key] = await self._replicate(
-                target, source, version.message_ids, sizes, name=name
+                target,
+                source,
+                version.message_ids,
+                sizes,
+                name=name,
+                restoring_version=version.id,
             )
         version.part_sizes = list(sizes)
         self.mark_primary_alive()
@@ -466,6 +484,7 @@ class MirrorGroup:
         part_sizes: List[int],
         cache: Optional["VersionCache"] = None,
         name: Optional[str] = None,
+        restoring_version: Optional[str] = None,
     ) -> Replica:
         """Re-partitioned copy: stream the whole version through the target.
 
@@ -477,43 +496,75 @@ class MirrorGroup:
         total = sum(part_sizes)
         local = cache.local() if cache is not None else None
         filler = cache.filler() if cache is not None and local is None else None
+        read = 0
+        last_progress = time.monotonic()
 
         async def content() -> AsyncGenerator[bytes, None]:
+            nonlocal read, last_progress
             if local is not None:
                 async for chunk in local.read(0, total - 1):
+                    read += len(chunk)
                     yield chunk
                 return
             for mid, size in zip(message_ids, part_sizes):
                 if size <= 0:
                     continue
                 resp = await source.download_file(mid, 0, size - 1)
+                part_read = 0
                 try:
                     async for chunk in resp.chunks:
+                        part_read += len(chunk)
+                        if part_read > size:
+                            raise TechnicalError(
+                                f"Store {source.key} returned more than {size} "
+                                f"bytes for message {mid}"
+                            )
                         if filler is not None:
                             await filler.write(chunk)
+                        read += len(chunk)
+                        if restoring_version is not None:
+                            now = time.monotonic()
+                            if now - last_progress >= 30:
+                                logger.info(
+                                    "Restoring version %s to %s: read %d/%d bytes "
+                                    "from %s",
+                                    restoring_version,
+                                    target.key,
+                                    read,
+                                    total,
+                                    source.key,
+                                )
+                                last_progress = now
                         yield chunk
+                    if part_read != size:
+                        raise TechnicalError(
+                            f"Store {source.key} returned {part_read} of {size} "
+                            f"bytes for message {mid}"
+                        )
                 finally:
                     if (aclose := getattr(resp.chunks, "aclose", None)) is not None:
                         await aclose()
 
         stream = content()
+        file_msg = FileMessageFromStream.new(
+            stream=stream,
+            size=total,
+            # The store numbers its parts exactly like the original write.
+            name=name or f"replica-{message_ids[0]}",
+        )
+        file_msg.background = restoring_version is not None
         try:
-            sent = await target.store.upload(
-                FileMessageFromStream.new(
-                    stream=stream,
-                    size=total,
-                    # The file's own name when it is known: the store
-                    # numbers its parts exactly like the primary's uploader
-                    # does, so the copy reads like the original messages.
-                    name=name or f"replica-{message_ids[0]}",
-                )
-            )
+            sent = await target.store.upload(file_msg)
         finally:
             # The target reads exactly ``total`` bytes and leaves the
             # generator suspended; close it so its downloads are released.
             await stream.aclose()
             if filler is not None:
                 await filler.close()
+        if read != total or sum(part.size for part in sent) != total:
+            raise TechnicalError(
+                f"Store {target.key} did not copy the complete {total}-byte version"
+            )
         return Replica(
             message_ids=[m.message_id for m in sent],
             part_sizes=[m.size for m in sent],
@@ -537,24 +588,47 @@ class MirrorGroup:
         """
         res: Dict[str, int] = dict(existing or {})
         for ch in self._stores:
-            if ch.key == skip:
+            if ch.key == skip or time.monotonic() < self._fd_mirror_dead_until.get(
+                ch.key, 0
+            ):
                 continue
             try:
-                if mid := res.get(ch.key):
-                    try:
-                        res[ch.key] = await ch.store.edit_message_text(
-                            message_id=mid, message=text
-                        )
-                        continue
-                    except MessageNotFound:
-                        logger.warning(
-                            f"FD mirror message {mid} in store {ch.key} is "
-                            f"gone, sending a fresh copy"
-                        )
-                res[ch.key] = await ch.store.send_text(text)
+                # A failed optional mirror may not block the authoritative
+                # descriptor commit. A successful data repair clears the
+                # cooldown so backfill can refresh the descriptor at once.
+                async with asyncio.timeout(
+                    TEE_DESCRIPTOR_TIMEOUT_S if self._bound_mirror_descriptors else None
+                ):
+                    if mid := res.get(ch.key):
+                        try:
+                            res[ch.key] = await ch.store.edit_message_text(
+                                message_id=mid, message=text
+                            )
+                            continue
+                        except MessageNotFound:
+                            logger.warning(
+                                f"FD mirror message {mid} in store {ch.key} is "
+                                "gone, sending a fresh copy"
+                            )
+                    res[ch.key] = await ch.store.send_text(text)
+            except TimeoutError as ex:
+                error: Exception = ex
+                if self._bound_mirror_descriptors:
+                    self._mark_fd_mirror_dead(ch.key)
+                    error = TechnicalError(
+                        f"no confirmation within {TEE_DESCRIPTOR_TIMEOUT_S:g}s"
+                    )
+                self._handle_write_error(
+                    ch.key,
+                    "file descriptor",
+                    error,
+                )
             except Exception as ex:
                 self._handle_write_error(ch.key, "file descriptor", ex)
         return res
+
+    def _mark_fd_mirror_dead(self, key: str) -> None:
+        self._fd_mirror_dead_until[key] = time.monotonic() + PRIMARY_DEAD_SECONDS
 
     # -- pinned metadata ---------------------------------------------------
 

@@ -133,7 +133,7 @@ The `telegram` block can be left out for a Discord-only setup (no store may then
   - `delete_messages_on_remove` *(bool, default `false`)*: Delete the channel messages when a file is removed from the file system.
   - `upload_max_retries` *(int, default `10`)*: Retries per failed attachment upload.
   - `upload_retry_interval` *(float, default `5.0`)*: Seconds between upload retries.
-  - `max_concurrent_uploads` *(int, default `max(3, number of bot tokens)`)*: Concurrent attachment uploads across the bot pool.
+  - `max_concurrent_uploads` *(int, default `max(3, number of bot tokens)`)*: Concurrent attachment uploads across the bot pool. An upload whose size is not known in advance (such as SFTP) uses at most two slots per file, leaving fewer attachments to confirm after the client closes it.
   - `max_concurrent_downloads` *(int, default `3`)*: Concurrent attachment downloads across the bot pool.
 
 ---
@@ -196,7 +196,7 @@ Main application parameters:
   - `read_parallel_window` *(int, default `8`)*: Piece reorder window for multi-source reads.
   - `connection_pool_size` *(int, default `1`)*: MTProto connections each bot opens.
   - `chunk_cache_mb` *(int, default `0` = off)*, `chunk_cache_readahead` *(int, default `2`)*, `chunk_cache_block_kb` *(int, default `1024`)*: In-memory cache for downloaded bytes.
-  - `tee_buffer_mb` *(int, default `64`)*: Bytes buffered per mirror during `sync: tee` writes.
+  - `tee_buffer_mb` *(int, default `64`)*: MiB buffered per store during `sync: tee` writes. Uploads whose size is not known in advance use at most 1 MiB per branch, so less of the transfer is still queued after the last client write.
 
 ---
 

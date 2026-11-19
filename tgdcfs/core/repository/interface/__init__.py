@@ -29,6 +29,10 @@ class IFileContentRepository(metaclass=ABCMeta):
     async def save(self, file_msg: UploadableFileMessage) -> List[SentFileMessage]:
         pass
 
+    def storage_name(self, name: str) -> str:
+        """Name used on remote documents, including during replication."""
+        return name
+
     @abstractmethod
     async def get(
         self,

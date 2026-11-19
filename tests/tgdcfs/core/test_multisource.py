@@ -117,6 +117,44 @@ class TestScheduler:
         # Every piece b failed was fetched from a instead.
         assert len(a.downloaded) >= 11
 
+    @pytest.mark.parametrize("response_started", [False, True])
+    async def test_silent_request_reassigns_pieces_to_other_store(
+        self, mocker, response_started
+    ):
+        mocker.patch(
+            "tgdcfs.core.multisource.PIECE_FAILOVER_TIMEOUT_S", 0.025, create=True
+        )
+        healthy = store_with(DATA, "tg:1", 2048)
+        silent = store_with(DATA, "dc:9", 1024, backend="discord")
+        original = silent.download_file
+        cancelled = asyncio.Event()
+        never = asyncio.Event()
+
+        async def stall():
+            try:
+                await never.wait()
+            finally:
+                cancelled.set()
+
+        async def download(mid, begin, end):
+            if not response_started:
+                await stall()
+            response = await original(mid, begin, end)
+            chunks = response.chunks
+
+            async def body():
+                yield await anext(chunks)
+                await stall()
+
+            response.chunks = body()
+            return response
+
+        mocker.patch.object(silent, "download_file", side_effect=download)
+        scheduler = read([view_of(silent, DATA, 1024), view_of(healthy, DATA, 2048)])
+        assert await asyncio.wait_for(collect(scheduler.stream()), 1) == DATA
+        assert cancelled.is_set()
+        assert silent.key in scheduler.benched
+
     async def test_read_fails_only_when_no_store_can_serve_a_piece(self):
         a = store_with(DATA, "tg:1", 2048)
         b = store_with(DATA, "tg:2", 2048)

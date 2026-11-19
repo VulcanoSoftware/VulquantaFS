@@ -400,23 +400,46 @@ class TelegramStore(MessageBroker, IStore):
             api = self.tdlib.next_bot
 
         uploader = FileUploader(api, file_msg)
+        # Bot identity is not needed to upload. Looking it up here would
+        # add a network call before the bounded part requests even start.
         logger.info(
             f"Uploading file {file_msg.name} of size {file_msg.size} bytes to "
-            f"channel {self.private_file_channel} using {(await api.get_me()).name}."
+            f"channel {self.private_file_channel}."
         )
         return uploader, await uploader.upload()
 
     async def _send_uploaded(
-        self, uploader: FileUploader, size: int, name: Optional[str]
+        self,
+        uploader: FileUploader,
+        size: int,
+        name: Optional[str],
+        *,
+        background: bool = False,
     ) -> SentFileMessage:
         """Turn an uploaded part into a channel message, retrying until it is."""
         last: Optional[Exception] = None
+        logger.info(
+            "Telegram upload of %s: publishing the %d-byte message",
+            name,
+            size,
+        )
         for attempt in range(1, MAX_SEND_ATTEMPTS + 1):
             try:
-                message = await bounded_part(
-                    f"the send of {name}",
-                    uploader.send(self.private_file_channel),
+                send = uploader.send(self.private_file_channel)
+                # A large message can take longer to publish than an
+                # individual upload chunk. Recovery has no SFTP client
+                # waiting for CLOSE, so let the transport's RPC timeout
+                # apply rather than aborting after the short failover bound.
+                message = await (
+                    send if background else bounded_part(f"the send of {name}", send)
                 )
+                if background:
+                    logger.info(
+                        "Telegram published %s as message %d in channel %s",
+                        name,
+                        message.message_id,
+                        self.private_file_channel,
+                    )
                 return SentFileMessage(message_id=message.message_id, size=size)
             except RpcTimeoutError:
                 raise
@@ -512,7 +535,12 @@ class TelegramStore(MessageBroker, IStore):
                 )
                 sends.append(
                     asyncio.create_task(
-                        self._send_uploaded(uploader, uploaded, file_msg.name)
+                        self._send_uploaded(
+                            uploader,
+                            uploaded,
+                            file_msg.name,
+                            background=file_msg.background,
+                        )
                     )
                 )
                 file_msg.next_part(part)

@@ -536,9 +536,9 @@ class TransferConfig:
     # their turn; the memory bound of one such read is this times the
     # piece size.
     read_parallel_window: int = 8
-    # ``sync: tee``: bytes buffered per mirror between the primary's reads
-    # of the upload stream and the mirror's upload; a full buffer makes
-    # the primary wait.
+    # ``sync: tee``: MiB buffered per store between the source and the
+    # respective uploader. Unknown-length streams also have a smaller
+    # built-in limit so they don't defer a backlog to SFTP CLOSE.
     tee_buffer_mb: int = 64
     # How long one call to a Telegram backend may stay unanswered before
     # the store counts the service as unreachable and raises. Telegram

@@ -2,7 +2,7 @@ import asyncio
 import logging
 import os
 from itertools import cycle
-from typing import List, Optional, Sequence
+from typing import AsyncIterator, Awaitable, Callable, List, Optional, Sequence, TypeVar
 
 from telethon import TelegramClient
 from telethon import functions as tlf
@@ -39,6 +39,7 @@ from tgdcfs.reqres import (
     SendFileReq,
     SendMessageResp,
     SendTextReq,
+    aclose_content,
 )
 from tgdcfs.utils.chunk_cache import chunk_cache
 from tgdcfs.utils.message_cache import channel_cache
@@ -53,6 +54,18 @@ logger = logging.getLogger(__name__)
 # at a multiple of its own size never straddles one, hence every download
 # starts at such an offset and the bytes before the wanted one are dropped.
 DOWNLOAD_REQUEST_SIZE = MAX_CHUNK_SIZE
+T = TypeVar("T")
+
+
+class _RPCOnlyTelegramClient(TelegramClient):
+    """The storage backend uses requests, not Telegram event handlers."""
+
+    async def _update_loop(self) -> None:
+        # Telethon 1.40 starts a difference/catch-up loop even when the
+        # server was told not to push updates. That loop can crash after
+        # reconnecting and disconnect the sender in the middle of an upload.
+        # Keep Telethon's sender, keepalive and RPC response handling intact.
+        return
 
 
 class TelethonAPI(ITDLibClient):
@@ -69,15 +82,45 @@ class TelethonAPI(ITDLibClient):
         # one, where the message cache and the session state live.
         self._transfer_clients: List[TelegramClient] = [client, *extra_connections]
         self.__transfer_cycle = cycle(self._transfer_clients)
+        self._reconnect_locks = {
+            id(conn): asyncio.Lock() for conn in self._transfer_clients
+        }
 
     @property
     def _transfer_client(self) -> TelegramClient:
         return next(self.__transfer_cycle)
 
+    async def _connected_rpc(
+        self, what: str, client: TelegramClient, action: Callable[[], Awaitable[T]]
+    ) -> T:
+        async def run() -> T:
+            # Telethon stops auto-reconnecting after its retry budget.
+            # A later queue attempt must be able to use the same session
+            # after the network returns, without restarting the server.
+            if not client.is_connected():
+                async with self._reconnect_locks[id(client)]:
+                    if not client.is_connected():
+                        await client.connect()
+            return await action()
+
+        try:
+            return await self._bounded(what, run())
+        except asyncio.CancelledError as ex:
+            task = asyncio.current_task()
+            if task is None or task.cancelling():
+                raise
+            # Disconnecting a Telethon sender cancels its pending RPC
+            # futures, not the caller's task. Part uploads can retry that
+            # request; an intentional caller shutdown must still propagate.
+            raise ConnectionError(
+                f"Telegram transport cancelled the request during {what}"
+            ) from ex
+
     async def __get_messages(self, *args, **kwargs) -> Sequence[tlt.Message]:
-        messages = await self._bounded(
+        messages = await self._connected_rpc(
             "get_messages",
-            self._client.get_messages(*args, **kwargs),
+            self._client,
+            lambda: self._client.get_messages(*args, **kwargs),
         )
         if not isinstance(messages, TotalList):
             raise TechnicalError("Unexpected response type from get_messages")
@@ -132,9 +175,10 @@ class TelethonAPI(ITDLibClient):
         return GetMessagesResp(cache.gets(req.message_ids))
 
     async def send_text(self, req: SendTextReq) -> SendMessageResp:
-        message = await self._bounded(
+        message = await self._connected_rpc(
             "send_text",
-            self._client.send_message(
+            self._client,
+            lambda: self._client.send_message(
                 entity=PeerChannel(channel_id=req.chat), message=req.text
             ),
         )
@@ -143,9 +187,10 @@ class TelethonAPI(ITDLibClient):
     async def edit_message_text(self, req: EditMessageTextReq) -> SendMessageResp:
         channel_cache(req.chat).id[req.message_id] = None
         chunk_cache().invalidate(req.chat, req.message_id)
-        message = await self._bounded(
+        message = await self._connected_rpc(
             "edit_message_text",
-            self._client.edit_message(
+            self._client,
+            lambda: self._client.edit_message(
                 entity=PeerChannel(channel_id=req.chat),
                 message=req.message_id,
                 text=req.text,
@@ -207,9 +252,11 @@ class TelethonAPI(ITDLibClient):
         )
 
     async def save_big_file_part(self, req: SaveBigFilePartReq) -> SaveFilePartResp:
-        success = await self._bounded(
+        client = self._transfer_client
+        success = await self._connected_rpc(
             "save_big_file_part",
-            self._transfer_client(
+            client,
+            lambda: client(
                 tlf.upload.SaveBigFilePartRequest(
                     file_id=req.file_id,
                     file_part=req.file_part,
@@ -221,9 +268,11 @@ class TelethonAPI(ITDLibClient):
         return SaveFilePartResp(success=success)
 
     async def save_file_part(self, req: SaveFilePartReq) -> SaveFilePartResp:
-        success = await self._bounded(
+        client = self._transfer_client
+        success = await self._connected_rpc(
             "save_file_part",
-            self._transfer_client(
+            client,
+            lambda: client(
                 tlf.upload.SaveFilePartRequest(
                     file_id=req.file_id,
                     file_part=req.file_part,
@@ -239,9 +288,10 @@ class TelethonAPI(ITDLibClient):
             parts=req.file.parts,
             name=req.file.name,
         )
-        message = await self._bounded(
+        message = await self._connected_rpc(
             "send_big_file",
-            self._client.send_file(
+            self._client,
+            lambda: self._client.send_file(
                 entity=PeerChannel(channel_id=req.chat),
                 file=file,
                 caption=req.caption,
@@ -259,9 +309,10 @@ class TelethonAPI(ITDLibClient):
             name=req.file.name,
             md5_checksum="",
         )
-        message = await self._bounded(
+        message = await self._connected_rpc(
             "send_small_file",
-            self._client.send_file(
+            self._client,
+            lambda: self._client.send_file(
                 entity=PeerChannel(channel_id=req.chat),
                 file=file,
                 caption=req.caption,
@@ -326,26 +377,40 @@ class TelethonAPI(ITDLibClient):
             doc = document
             offset = req.begin
             refreshed = False
+            retried_connection = False
 
             while rest > 0:
                 aligned = offset - offset % DOWNLOAD_REQUEST_SIZE
                 skip = offset - aligned
+                client = self._transfer_client
+                downloader: Optional[AsyncIterator[bytes]] = None
+
+                async def read_chunk() -> bytes:
+                    nonlocal downloader
+                    if downloader is None:
+                        iterator: AsyncIterator[bytes] = client.iter_download(
+                            file=InputDocumentFileLocation(
+                                id=doc.id,
+                                access_hash=doc.access_hash,
+                                file_reference=doc.file_reference,
+                                thumb_size="",
+                            ),
+                            offset=aligned,
+                            request_size=DOWNLOAD_REQUEST_SIZE,
+                        )
+                        downloader = iterator
+                    return await downloader.__anext__()
+
                 try:
-                    downloader = self._transfer_client.iter_download(
-                        file=InputDocumentFileLocation(
-                            id=doc.id,
-                            access_hash=doc.access_hash,
-                            file_reference=doc.file_reference,
-                            thumb_size="",
-                        ),
-                        offset=aligned,
-                        request_size=DOWNLOAD_REQUEST_SIZE,
-                    )
                     while True:
                         try:
-                            chunk = await self._bounded(
+                            # A cached document can skip the metadata RPC,
+                            # and the reader may use a different pooled client
+                            # anyway. Check the connection on the actual read.
+                            chunk = await self._connected_rpc(
                                 f"download of message {req.message_id}",
-                                downloader.__anext__(),
+                                client,
+                                read_chunk,
                             )
                         except StopAsyncIteration:
                             break
@@ -357,9 +422,9 @@ class TelethonAPI(ITDLibClient):
                             skip = 0
                         if len(chunk) > rest:
                             chunk = chunk[:rest]
-                        yield chunk
                         rest -= len(chunk)
                         offset += len(chunk)
+                        yield chunk
                         if rest <= 0:
                             break
                 except FileReferenceExpiredError:
@@ -371,6 +436,21 @@ class TelethonAPI(ITDLibClient):
                         req.chat, req.message_id, refresh=True
                     )
                     continue
+                except ConnectionError:
+                    # A disconnect can race the connection check or cancel
+                    # an in-flight request. Rebuild the iterator at the last
+                    # delivered byte; don't reuse its internal offset.
+                    if retried_connection:
+                        raise
+                    retried_connection = True
+                    continue
+                finally:
+                    if downloader is not None:
+                        # Telethon's iterator uses close(), not aclose().
+                        if (close := getattr(downloader, "close", None)) is not None:
+                            await close()
+                        else:
+                            await aclose_content(downloader)
                 break
 
             if rest > 0:
@@ -468,10 +548,11 @@ async def open_extra_connections(
     connections: List[TelegramClient] = []
     for i in range(extra):
         try:
-            connection = TelegramClient(
+            connection = _RPCOnlyTelegramClient(
                 StringSession(session_string),
                 config.telegram.api_id,
                 config.telegram.api_hash,
+                receive_updates=False,
             )
             await connection.connect()
             connections.append(connection)
@@ -496,10 +577,12 @@ async def login_as_account(config: Config) -> TelegramClient:
 
     session = Session(config.telegram.account.session_file)
     if sess := session.get():
-        client = TelegramClient(sess, api_id, api_hash)
+        client = _RPCOnlyTelegramClient(sess, api_id, api_hash, receive_updates=False)
         await client.connect()
     else:
-        client = TelegramClient(StringSession(), api_id, api_hash)
+        client = _RPCOnlyTelegramClient(
+            StringSession(), api_id, api_hash, receive_updates=False
+        )
         await client.connect()
 
         phone_number = input("Phone number (with country code): ")
@@ -540,10 +623,14 @@ async def login_as_bots(config: Config) -> List[TelegramClient]:
         )
 
         if sess := session.get():
-            client = TelegramClient(sess, api_id, api_hash)
+            client = _RPCOnlyTelegramClient(
+                sess, api_id, api_hash, receive_updates=False
+            )
             await client.connect()
         else:
-            client = TelegramClient(StringSession(), api_id, api_hash)
+            client = _RPCOnlyTelegramClient(
+                StringSession(), api_id, api_hash, receive_updates=False
+            )
             await client.connect()
             await client.start(bot_token=token)  # type: ignore
             session.save_multibot(client.session.save())  # type: ignore

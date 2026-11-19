@@ -434,6 +434,16 @@ async def drain(msg) -> int:
 class TestStreamedUpload:
     """Uploads whose size is unknown until the source runs dry."""
 
+    async def test_upload_does_not_query_bot_identity(
+        self, store, mock_tdlib, mock_uploader
+    ):
+        mock_tdlib.next_bot.get_me.side_effect = ConnectionError("disconnected")
+
+        sent = await store.upload(StreamedMockFileMessage("live.bin", 15))
+
+        assert [part.message_id for part in sent] == [12345]
+        mock_tdlib.next_bot.get_me.assert_not_awaited()
+
     async def test_unknown_size_is_streamed_part_by_part(
         self, store, mock_uploader, mocker
     ):
