@@ -65,6 +65,32 @@ class TestTelethonAPI:
     def telethon_api(self, mock_client) -> TelethonAPI:
         return TelethonAPI(mock_client)
 
+    async def test_later_upload_part_reconnects_after_telethon_gave_up(
+        self, mock_client
+    ):
+        connected = False
+
+        async def connect():
+            nonlocal connected
+            connected = True
+
+        mock_client.is_connected.side_effect = lambda: connected
+        mock_client.connect.side_effect = connect
+        mock_client.return_value = True
+        api = TelethonAPI(mock_client)
+
+        results = await asyncio.gather(
+            *(
+                api.save_file_part(
+                    SaveFilePartReq(file_id=1, bytes=b"data", file_part=i)
+                )
+                for i in range(2)
+            )
+        )
+
+        assert all(result.success for result in results)
+        mock_client.connect.assert_awaited_once()
+
     @pytest.fixture
     def mock_chat(self, mocker):
         return 123456789  # Use integer as chat ID instead of Mock

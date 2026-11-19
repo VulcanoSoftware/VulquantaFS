@@ -116,11 +116,13 @@ class EncryptingFileContentRepository(IFileContentRepository):
 
     # -- save --------------------------------------------------------------
 
+    def storage_name(self, name: str) -> str:
+        return encrypt_name(self._name_key, name) if self._name_key and name else name
+
     async def save(self, file_msg: UploadableFileMessage) -> List[SentFileMessage]:
-        if self._name_key is not None and file_msg.name:
-            # Obfuscate the Telegram-visible document name BEFORE wrapping,
-            # so the part-numbering loop downstream sees the encrypted form.
-            file_msg.name = encrypt_name(self._name_key, file_msg.name)
+        # Obfuscate the remote document name before wrapping, so the
+        # part-numbering loop downstream sees the encrypted form.
+        file_msg.name = self.storage_name(file_msg.name)
         # Build a fresh header (with a random salt) and derive the per-file
         # key. The header itself is written inline at the start of the
         # ciphertext stream.
@@ -161,8 +163,7 @@ class EncryptingFileContentRepository(IFileContentRepository):
         self, file_msg: UploadableFileMessage, version_id: str
     ) -> Optional[int]:
         # Same wrapping as ``save``: the cache below holds ciphertext.
-        if self._name_key is not None and file_msg.name:
-            file_msg.name = encrypt_name(self._name_key, file_msg.name)
+        file_msg.name = self.storage_name(file_msg.name)
         header = FileHeader.new(chunk_size=self._chunk_size)
         file_key = derive_file_key(self._master_key, header.file_salt)
         self._remember_header(file_msg, header, file_key)
@@ -181,8 +182,7 @@ class EncryptingFileContentRepository(IFileContentRepository):
         # except when the caller is the metadata layer talking to itself --
         # but the file content repository is only invoked for file content,
         # so encrypting unconditionally is correct here.
-        if self._name_key is not None and name:
-            name = encrypt_name(self._name_key, name)
+        name = self.storage_name(name)
         header = FileHeader.new(chunk_size=self._chunk_size)
         file_key = derive_file_key(self._master_key, header.file_salt)
         cipher = ChunkedAESGCM(

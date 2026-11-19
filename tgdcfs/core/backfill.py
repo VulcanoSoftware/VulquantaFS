@@ -35,6 +35,11 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _storage_name(client: "Client", name: str) -> str:
+    repo = getattr(client, "fc_repo", None)
+    return repo.storage_name(name) if repo is not None else name
+
+
 @dataclass
 class BackfillReport:
     files_scanned: int = 0
@@ -146,6 +151,7 @@ async def _distribute_pending(
 
     primary = client.store
     group = client.mirror_group
+    name = _storage_name(client, fr.name)
     planned = primary.plan_parts(local.size)
     replica_targets = (
         [ch for ch in group.stores if group.needs_replica(ch, planned)]
@@ -157,12 +163,12 @@ async def _distribute_pending(
     async def upload_primary() -> List[SentFileMessage]:
         from tgdcfs.core.local_cache import FileMessageFromCache
 
-        return await primary.upload(FileMessageFromCache.new(local, fr.name))
+        return await primary.upload(FileMessageFromCache.new(local, name))
 
     async def replicate(ch: MirrorStore) -> tuple[str, Replica]:
         if group is None:  # pragma: no cover - replica_targets is empty then
             raise TechnicalError("no mirror group")
-        return ch.key, await group.replicate_local(ch, local, fr.name)
+        return ch.key, await group.replicate_local(ch, local, name)
 
     primary_task = asyncio.create_task(upload_primary())
     replica_tasks = [asyncio.create_task(replicate(ch)) for ch in replica_targets]
@@ -233,6 +239,7 @@ async def backfill_file(
         await _verify_mirrors(client, fd)
 
     changed = False
+    name = _storage_name(client, fr.name)
     for version in fd.get_versions(exclude_invalid=True):
         report.versions_checked += 1
 
@@ -240,7 +247,7 @@ async def backfill_file(
         # the current primary first; that copy becomes its primary layout.
         if not version.owned_by(mirror_group.primary.key):
             try:
-                if await mirror_group.copy_into_primary(version, name=fr.name):
+                if await mirror_group.copy_into_primary(version, name=name):
                     report.versions_promoted += 1
                     changed = True
                 else:
@@ -268,7 +275,7 @@ async def backfill_file(
             version.part_sizes or None,
             only_stores=missing,
             cache=cache,
-            name=fr.name,
+            name=name,
         )
         if copies.store_keys:
             copies.apply_to(version)

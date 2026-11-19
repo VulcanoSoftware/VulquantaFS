@@ -8,9 +8,11 @@ from tgdcfs.core.mirror import MirrorGroup, MirrorStore
 from tgdcfs.core.model import TGFSFileVersion
 from tgdcfs.core.multisource import MultiSourceRead, StoreView, read_slots
 from tgdcfs.core.repository.interface import IFileContentRepository
+from tgdcfs.core.tee import TeeUpload
 from tgdcfs.errors import TechnicalError
 from tgdcfs.reqres import (
     FileContent,
+    Replica,
     SentFileMessage,
     UploadableFileMessage,
     aclose_content,
@@ -101,6 +103,12 @@ class StoreFileContentRepository(IFileContentRepository):
         return self._cache
 
     async def save(self, file_msg: UploadableFileMessage) -> List[SentFileMessage]:
+        group = self._mirror_group
+        if self._tee_mirroring and group is not None:
+            tee = group.tee(file_msg, self._tee_buffer)
+            if tee is not None:
+                return await self._save_tee(group, tee, file_msg.file_name())
+
         # Write failover: a primary the circuit breaker marks dead is
         # skipped before the first byte is read -- a consumed upload stream
         # cannot be replayed after a failed attempt, so the acting store
@@ -138,20 +146,9 @@ class StoreFileContentRepository(IFileContentRepository):
                 self._cache.pin(version_id)
                 file_msg = StagedFileMessage.wrap(file_msg, writer)
 
-        # Split the stream for the mirrors that would otherwise download
-        # it from the primary again (``sync: tee``): their uploads run
-        # while the primary's does, fed by the reads it takes.
-        tee = None
-        if self._tee_mirroring and self._mirror_group is not None:
-            tee = self._mirror_group.tee(file_msg, self._tee_buffer)
-            if tee is not None:
-                file_msg = tee.message
-
         try:
             res = await self._store.upload(file_msg)
         except BaseException:
-            if tee is not None:
-                await tee.abort()
             if writer is not None:
                 await writer.abort()
             # An exhausted stream rules out failing over inside this call:
@@ -166,23 +163,10 @@ class StoreFileContentRepository(IFileContentRepository):
         # Replicate the freshly uploaded parts into the mirror stores. The
         # mapping travels back to the caller inside the SentFileMessage
         # objects and ends up in TGFSFileVersion.mirrors / .replicas.
-        if self._mirror_group and res and (self._inline_mirroring or tee):
-            only_stores = None
-            if tee is not None:
-                # The tee'd mirrors finish on their own; the rest are the
-                # server-side copies, which are cheap enough to make inline.
-                res[0].replicas.update(
-                    self._mirror_group.collect_tee(await tee.collect())
-                )
-                only_stores = [
-                    key
-                    for key in self._mirror_group.store_keys
-                    if key not in tee.store_keys
-                ]
+        if self._mirror_group and res and self._inline_mirroring:
             copies = await self._mirror_group.mirror_parts(
                 [m.message_id for m in res],
                 [m.size for m in res],
-                only_stores=only_stores,
                 cache=version_cache_for(
                     self._cache, self._cache_scope, version_id, sum(m.size for m in res)
                 ),
@@ -197,6 +181,86 @@ class StoreFileContentRepository(IFileContentRepository):
             if self._cache is not None and version_id:
                 self._cache.release(version_id)
         return res
+
+    async def _save_tee(
+        self, group: MirrorGroup, tee: TeeUpload, name: str
+    ) -> List[SentFileMessage]:
+        async def primary(msg: UploadableFileMessage) -> List[SentFileMessage]:
+            try:
+                return await self._store.upload(msg)
+            except Exception as ex:
+                group.mark_primary_dead()
+                logger.warning(
+                    "Primary store %s failed during upload of %s: %s",
+                    self._store.key,
+                    name,
+                    ex,
+                )
+                raise
+
+        result = await tee.run(
+            self._store.key,
+            None if group.primary_dead() else primary,
+            self._tee_buffer,
+        )
+        total = result.size
+        mirrors = {
+            key: (
+                TechnicalError(f"Store {key} did not upload the complete stream")
+                if isinstance(copy, Replica)
+                and (
+                    total is None
+                    or not copy.message_ids
+                    or len(copy.message_ids) != len(copy.part_sizes)
+                    or copy.size != total
+                )
+                else copy
+            )
+            for key, copy in result.mirrors.items()
+        }
+        sent = result.primary
+        if (
+            isinstance(sent, list)
+            and total is not None
+            and sum(m.size for m in sent) == total
+        ):
+            if sent:
+                sent[0].replicas.update(group.collect_tee(mirrors))
+                copies = await group.mirror_parts(
+                    [m.message_id for m in sent],
+                    [m.size for m in sent],
+                    only_stores=[key for key in group.store_keys if key not in mirrors],
+                    name=name,
+                )
+                for key, ids in copies.mirrors.items():
+                    for part, message_id in zip(sent, ids):
+                        part.mirrors[key] = message_id
+                sent[0].replicas.update(copies.replicas)
+            return sent
+
+        complete = {
+            key: copy for key, copy in mirrors.items() if isinstance(copy, Replica)
+        }
+        if complete:
+            key = next(iter(complete))
+            copy = complete.pop(key)
+            # The rest of the descriptor write must also skip the failed
+            # primary, even when the transfer outlasted the breaker window.
+            group.mark_primary_dead()
+            logger.warning("Upload of %s completed on acting store %s", name, key)
+            sent = [
+                SentFileMessage(message_id=mid, size=size, store=key)
+                for mid, size in zip(copy.message_ids, copy.part_sizes)
+            ]
+            if sent:
+                sent[0].replicas.update(complete)
+            return sent
+        if isinstance(sent, Exception):
+            raise sent
+        if sent is None and (error := next(iter(mirrors.values()), None)) is not None:
+            if isinstance(error, Exception):
+                raise error
+        raise TechnicalError("No data store uploaded the complete stream")
 
     async def _save_acting(
         self,

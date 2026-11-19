@@ -4,27 +4,24 @@ A mirror that cannot take a server-side copy (a Discord store on either
 side, another backend, ``mode: reupload``) has to receive every byte of
 a version through this process. Today those bytes are read back from
 the primary store after the upload, or from the local cache when one
-is configured. With ``sync: tee`` the client's upload stream is split
-instead: the primary store consumes it as it always did, and every
-byte it takes is handed to one bounded buffer per such mirror, whose
-upload runs at the same time. Nothing is read back and nothing touches
-the disk; the price is that the client's upload runs at the pace of the
-slowest store, since a full buffer makes the primary's next read wait.
+is configured. With ``sync: tee`` an independent producer feeds the
+client's stream into a bounded buffer per store. A mirror can finish the
+same stream when the primary fails. Nothing is read back or staged to disk.
 
 The pieces:
 
 * :class:`TeeBranch` is one buffer: the producer ``feed``\\s chunks and
   waits while the branch holds ``capacity`` bytes; the consumer takes
   them off through ``stream``. ``finish`` marks the end of the bytes,
-  ``detach`` drops the branch when its mirror failed so the producer is
+  ``detach`` drops the branch when its store stops so the producer is
   never held up by a consumer that is gone.
-* :class:`TeeFileMessage` wraps the message the primary uploader reads
-  and feeds every branch as a side effect of ``read``. The end of the
+* :class:`TeeFileMessage` wraps the source and feeds every branch as a
+  side effect of ``read``. The end of the
   stream is signalled by the byte count when the size is known, by the
   stream's own EOF when it is not, never by ``close``: the Telegram
   uploader closes the message after every part.
-* :class:`TeeUpload` bundles the wrapped message with the mirror upload
-  tasks and collects their replicas once the primary is done.
+* :class:`TeeUpload` coordinates the producer and store tasks, then
+  returns each store's outcome.
 
 Encryption sits above the repository, so the branches carry exactly
 what the primary receives: ciphertext when encryption is on.
@@ -36,16 +33,21 @@ import asyncio
 import logging
 from collections import deque
 from dataclasses import dataclass, field
-from typing import AsyncGenerator, Awaitable, Callable, Deque, Dict, List
+from typing import Any, AsyncGenerator, Awaitable, Callable, Deque, Dict, List
 
 from tgdcfs.errors import TechnicalError
-from tgdcfs.reqres import Replica, UploadableFileMessage
+from tgdcfs.reqres import (
+    FileMessageFromStream,
+    Replica,
+    SentFileMessage,
+    UploadableFileMessage,
+)
 
 logger = logging.getLogger(__name__)
 
 
 class TeeBranch:
-    """A bounded byte queue between the primary's reads and one mirror."""
+    """A bounded byte queue between the source and one store."""
 
     def __init__(self, key: str, capacity: int):
         self.key = key
@@ -118,7 +120,7 @@ class TeeBranch:
 
 @dataclass
 class TeeFileMessage(UploadableFileMessage):
-    """The primary's upload message, feeding the branches as it is read."""
+    """The source upload message, feeding the branches as it is read."""
 
     inner: UploadableFileMessage = field(init=False)
     branches: List[TeeBranch] = field(init=False)
@@ -180,10 +182,18 @@ class TeeFileMessage(UploadableFileMessage):
 
 
 MirrorUpload = Callable[[TeeBranch], Awaitable[Replica]]
+PrimaryUpload = Callable[[UploadableFileMessage], Awaitable[List[SentFileMessage]]]
+
+
+@dataclass
+class TeeResult:
+    primary: List[SentFileMessage] | Exception | None
+    mirrors: Dict[str, Replica | Exception]
+    size: int | None
 
 
 class TeeUpload:
-    """One tee'd upload: the wrapped message and a task per mirror."""
+    """One tee'd upload: the wrapped source and its store tasks."""
 
     def __init__(
         self, message: TeeFileMessage, uploads: Dict[str, MirrorUpload]
@@ -210,28 +220,108 @@ class TeeUpload:
     def store_keys(self) -> List[str]:
         return list(self._tasks)
 
+    async def run(
+        self, primary_key: str, upload_primary: PrimaryUpload | None, capacity: int
+    ) -> TeeResult:
+        """Feed all stores independently from a single, forward-only source."""
+        primary_branch = TeeBranch(primary_key, capacity)
+        size = self.message.get_size()
+        source_finished = False
+        if upload_primary is not None:
+            self.message.branches.insert(0, primary_branch)
+
+        async def primary() -> List[SentFileMessage] | None:
+            if upload_primary is None:
+                return None
+            stream = primary_branch.stream()
+            msg = FileMessageFromStream.new(stream, size, self.message.file_name())
+            msg.caption = self.message.caption
+            msg.tags = self.message.tags
+            msg.task_tracker = self.message.task_tracker
+            msg.version_id = self.message.version_id
+            try:
+                return await upload_primary(msg)
+            finally:
+                await primary_branch.detach()
+                await stream.aclose()
+
+        async def produce() -> int:
+            nonlocal source_finished
+            await self.message.open()
+            try:
+                # This task alone reads and encrypts the source. Cancelling
+                # a failed store's reader cannot drop an in-progress chunk
+                # or close the client's one-shot iterator.
+                while size < 0 or self.message.fed < size:
+                    limit = min(capacity, 1024 * 1024)
+                    if size >= 0:
+                        limit = min(limit, size - self.message.fed)
+                    if not await self.message.read(max(1, limit)):
+                        break
+                if size >= 0 and self.message.fed != size:
+                    raise TechnicalError("Upload stream ended before its declared size")
+                await self.message.finish()
+                source_finished = True
+                return self.message.fed
+            finally:
+                await self.message.close()
+
+        producer = asyncio.create_task(produce())
+        primary_task = asyncio.create_task(primary())
+        consumers = asyncio.gather(
+            primary_task, *self._tasks.values(), return_exceptions=True
+        )
+        in_flight: set[asyncio.Future[Any]] = {producer, consumers}
+        try:
+            done, _ = await asyncio.wait(in_flight, return_when=asyncio.FIRST_COMPLETED)
+            # If every store stopped, don't leave the producer blocked
+            # waiting for the client to send more data.
+            total = await producer if producer in done or source_finished else None
+            await consumers
+            if primary_task.cancelled():
+                outcome: BaseException | None = TechnicalError(
+                    "Primary upload cancelled"
+                )
+            else:
+                outcome = primary_task.exception()
+            if outcome is not None and not isinstance(outcome, Exception):
+                raise outcome
+            return TeeResult(
+                outcome if outcome is not None else primary_task.result(),
+                self._outcomes(),
+                total,
+            )
+        finally:
+            producer.cancel()
+            consumers.cancel()
+            await asyncio.gather(producer, consumers, return_exceptions=True)
+            await self.abort()
+
     async def collect(self) -> Dict[str, Replica | Exception]:
         """Wait for every mirror; a failed one is returned as its error."""
         try:
             await self.message.finish()
-            results = await asyncio.gather(
-                *self._tasks.values(), return_exceptions=True
-            )
+            await asyncio.gather(*self._tasks.values(), return_exceptions=True)
         except asyncio.CancelledError:
             await self.abort()
             raise
+        return self._outcomes()
+
+    def _outcomes(self) -> Dict[str, Replica | Exception]:
         outcomes: Dict[str, Replica | Exception] = {}
-        for key, result in zip(self._tasks, results):
-            if isinstance(result, asyncio.CancelledError):
-                result = TechnicalError(f"tee upload into {key} was cancelled")
-            if isinstance(result, (Replica, Exception)):
-                outcomes[key] = result
+        for key, task in self._tasks.items():
+            if task.cancelled():
+                outcomes[key] = TechnicalError(f"tee upload into {key} was cancelled")
+            elif (error := task.exception()) is None:
+                outcomes[key] = task.result()
+            elif isinstance(error, Exception):
+                outcomes[key] = error
             else:
-                raise result
+                raise error
         return outcomes
 
     async def abort(self) -> None:
-        """The primary upload failed: stop every mirror upload."""
+        """Stop the mirror branches and wait for their uploads to unwind."""
         for branch in self._branches.values():
             await branch.detach()
         for task in self._tasks.values():

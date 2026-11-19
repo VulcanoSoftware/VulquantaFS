@@ -2,7 +2,7 @@ import asyncio
 import logging
 import os
 from itertools import cycle
-from typing import List, Optional, Sequence
+from typing import Awaitable, Callable, List, Optional, Sequence, TypeVar
 
 from telethon import TelegramClient
 from telethon import functions as tlf
@@ -53,6 +53,7 @@ logger = logging.getLogger(__name__)
 # at a multiple of its own size never straddles one, hence every download
 # starts at such an offset and the bytes before the wanted one are dropped.
 DOWNLOAD_REQUEST_SIZE = MAX_CHUNK_SIZE
+T = TypeVar("T")
 
 
 class TelethonAPI(ITDLibClient):
@@ -69,15 +70,34 @@ class TelethonAPI(ITDLibClient):
         # one, where the message cache and the session state live.
         self._transfer_clients: List[TelegramClient] = [client, *extra_connections]
         self.__transfer_cycle = cycle(self._transfer_clients)
+        self._reconnect_locks = {
+            id(conn): asyncio.Lock() for conn in self._transfer_clients
+        }
 
     @property
     def _transfer_client(self) -> TelegramClient:
         return next(self.__transfer_cycle)
 
+    async def _connected_rpc(
+        self, what: str, client: TelegramClient, action: Callable[[], Awaitable[T]]
+    ) -> T:
+        async def run() -> T:
+            # Telethon stops auto-reconnecting after its retry budget.
+            # A later queue attempt must be able to use the same session
+            # after the network returns, without restarting the server.
+            if not client.is_connected():
+                async with self._reconnect_locks[id(client)]:
+                    if not client.is_connected():
+                        await client.connect()
+            return await action()
+
+        return await self._bounded(what, run())
+
     async def __get_messages(self, *args, **kwargs) -> Sequence[tlt.Message]:
-        messages = await self._bounded(
+        messages = await self._connected_rpc(
             "get_messages",
-            self._client.get_messages(*args, **kwargs),
+            self._client,
+            lambda: self._client.get_messages(*args, **kwargs),
         )
         if not isinstance(messages, TotalList):
             raise TechnicalError("Unexpected response type from get_messages")
@@ -132,9 +152,10 @@ class TelethonAPI(ITDLibClient):
         return GetMessagesResp(cache.gets(req.message_ids))
 
     async def send_text(self, req: SendTextReq) -> SendMessageResp:
-        message = await self._bounded(
+        message = await self._connected_rpc(
             "send_text",
-            self._client.send_message(
+            self._client,
+            lambda: self._client.send_message(
                 entity=PeerChannel(channel_id=req.chat), message=req.text
             ),
         )
@@ -143,9 +164,10 @@ class TelethonAPI(ITDLibClient):
     async def edit_message_text(self, req: EditMessageTextReq) -> SendMessageResp:
         channel_cache(req.chat).id[req.message_id] = None
         chunk_cache().invalidate(req.chat, req.message_id)
-        message = await self._bounded(
+        message = await self._connected_rpc(
             "edit_message_text",
-            self._client.edit_message(
+            self._client,
+            lambda: self._client.edit_message(
                 entity=PeerChannel(channel_id=req.chat),
                 message=req.message_id,
                 text=req.text,
@@ -207,9 +229,11 @@ class TelethonAPI(ITDLibClient):
         )
 
     async def save_big_file_part(self, req: SaveBigFilePartReq) -> SaveFilePartResp:
-        success = await self._bounded(
+        client = self._transfer_client
+        success = await self._connected_rpc(
             "save_big_file_part",
-            self._transfer_client(
+            client,
+            lambda: client(
                 tlf.upload.SaveBigFilePartRequest(
                     file_id=req.file_id,
                     file_part=req.file_part,
@@ -221,9 +245,11 @@ class TelethonAPI(ITDLibClient):
         return SaveFilePartResp(success=success)
 
     async def save_file_part(self, req: SaveFilePartReq) -> SaveFilePartResp:
-        success = await self._bounded(
+        client = self._transfer_client
+        success = await self._connected_rpc(
             "save_file_part",
-            self._transfer_client(
+            client,
+            lambda: client(
                 tlf.upload.SaveFilePartRequest(
                     file_id=req.file_id,
                     file_part=req.file_part,
@@ -239,9 +265,10 @@ class TelethonAPI(ITDLibClient):
             parts=req.file.parts,
             name=req.file.name,
         )
-        message = await self._bounded(
+        message = await self._connected_rpc(
             "send_big_file",
-            self._client.send_file(
+            self._client,
+            lambda: self._client.send_file(
                 entity=PeerChannel(channel_id=req.chat),
                 file=file,
                 caption=req.caption,
@@ -259,9 +286,10 @@ class TelethonAPI(ITDLibClient):
             name=req.file.name,
             md5_checksum="",
         )
-        message = await self._bounded(
+        message = await self._connected_rpc(
             "send_small_file",
-            self._client.send_file(
+            self._client,
+            lambda: self._client.send_file(
                 entity=PeerChannel(channel_id=req.chat),
                 file=file,
                 caption=req.caption,

@@ -441,6 +441,60 @@ class Stack:
 
 
 class TestWritePath:
+    async def test_a_known_down_primary_is_skipped_for_the_entire_stream(self):
+        tg, dc = telegram_like(), discord_like()
+        stack = Stack(tg, dc)
+        stack.mirror_group.mark_primary_dead()
+
+        sent = await stack.fc_repo.save(FileMessageFromBuffer.new(DATA, "a.bin"))
+
+        assert "upload" not in tg.calls
+        assert all(part.store == dc.key for part in sent)
+        assert b"".join(dc.document_of(part.message_id) for part in sent) == DATA
+
+    async def test_disconnect_cancels_the_producer_and_all_store_uploads(self, mocker):
+        tg, dc = telegram_like(), discord_like()
+        stack = Stack(tg, dc)
+        reading, uploading_primary, uploading_mirror = (
+            asyncio.Event() for _ in range(3)
+        )
+        stopped: set[asyncio.Event] = set()
+
+        async def stall(event):
+            event.set()
+            try:
+                await asyncio.Future()
+            finally:
+                stopped.add(event)
+
+        async def stream():
+            yield b"prefix"
+            await stall(reading)
+
+        async def upload_primary(msg):
+            await stall(uploading_primary)
+
+        async def upload_mirror(msg):
+            await stall(uploading_mirror)
+
+        mocker.patch.object(tg, "upload", side_effect=upload_primary)
+        mocker.patch.object(dc, "upload", side_effect=upload_mirror)
+        task = asyncio.create_task(
+            stack.fc_repo.save(FileMessageFromStream.new(stream()))
+        )
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(
+                    reading.wait(), uploading_primary.wait(), uploading_mirror.wait()
+                ),
+                3,
+            )
+        finally:
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(task, 3)
+        assert stopped == {reading, uploading_primary, uploading_mirror}
+
     async def test_an_upload_lands_in_both_stores_without_a_read_back(self):
         tg, dc = telegram_like(), discord_like()
         stack = await Stack(tg, dc).init()
@@ -556,14 +610,40 @@ class TestWritePath:
         assert version.has_copy_in("dc:9")
         assert await stack.read("a.bin") == DATA
 
-    async def test_a_failing_primary_fails_the_write_and_stops_the_mirror(self):
+    async def test_a_primary_that_fails_before_reading_uses_the_mirror(self):
         tg, dc = telegram_like(), discord_like()
         stack = await Stack(tg, dc).init()
-        before = set(dc.messages)  # the metadata blob and its pinned copy
         tg.fail.add("upload")
+
+        await stack.put("a.bin", DATA)
+
+        assert (await stack.version("a.bin")).store == dc.key
+        assert await stack.read("a.bin") == DATA
+
+    async def test_all_failed_stores_stop_without_waiting_for_the_client(self):
+        tg, dc = telegram_like(), discord_like()
+        stack = await Stack(tg, dc).init()
+        tg.fail.add("upload")
+        dc.fail.add("upload")
+
+        async def source():
+            await asyncio.Event().wait()
+            yield b"never"
+
+        with pytest.raises(TechnicalError):
+            await asyncio.wait_for(
+                stack.fc_repo.save(FileMessageFromStream.new(source(), name="a")),
+                2,
+            )
+
+    async def test_early_sink_success_cannot_commit_an_incomplete_stream(self, mocker):
+        tg, dc = telegram_like(), discord_like()
+        stack = await Stack(tg, dc).init()
+        tg.fail.add("upload")
+        mocker.patch.object(dc, "upload", return_value=[])
+
         with pytest.raises(TechnicalError):
             await stack.put("a.bin", DATA)
-        assert set(dc.messages) == before
 
     async def test_a_copy_has_no_stream_and_goes_to_the_queue(self, tmp_path):
         queue = ReplicationQueue(path=str(tmp_path / "queue.json"))

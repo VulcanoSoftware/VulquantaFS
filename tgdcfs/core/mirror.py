@@ -39,10 +39,10 @@ the first mirror that accepts them. That store then owns the version
 and the descriptor (both record the acting store's key), and the
 copies it left behind everywhere else are handed to the replication
 queue like any other gap: ``copy_into_primary`` and ``relocate`` bring
-both back to the primary once a write into it succeeds again. A
-primary that only fails at the start of a write marks itself dead; the
-caller's retry -- an upload stream cannot be replayed within the same
-attempt -- then goes straight to the acting store.
+both back to the primary once a write into it succeeds again. With
+``sync: tee``, a re-uploading mirror sees the stream from byte zero and
+can complete the original request even when the primary fails midway.
+Other modes cannot replay a consumed stream and need a fresh request.
 
 Names: every message a store keeps is named by the store's own part
 numbering with the file's own name, copies included. A mirror copy is
@@ -340,8 +340,12 @@ class MirrorGroup:
         if len(sizes) != len(version.message_ids):
             sizes = await self._part_sizes(source, version.message_ids)
         target = MirrorStore(key=self._primary.key, store=self._primary)
-        if self._fits_aligned(self._primary, source, sizes):
-            ids = await self._copy_to(target, source, version.message_ids, name=name)
+        if self._fits_aligned(self._primary, source, sizes) and (
+            source.backend == self._primary.backend or self._mode == "forward"
+        ):
+            ids = await self._copy_to(
+                target, source, version.message_ids, part_sizes=sizes, name=name
+            )
             version.mirrors[self._primary.key] = ids
         else:
             version.replicas[self._primary.key] = await self._replicate(
@@ -514,6 +518,10 @@ class MirrorGroup:
             await stream.aclose()
             if filler is not None:
                 await filler.close()
+        if sum(part.size for part in sent) != total:
+            raise TechnicalError(
+                f"Store {target.key} did not copy the complete {total}-byte version"
+            )
         return Replica(
             message_ids=[m.message_id for m in sent],
             part_sizes=[m.size for m in sent],

@@ -1,24 +1,28 @@
 """End to end: writes fail over to a mirror while the primary store is
 down, and the recovered primary is filled back in afterwards.
 
-A Telegram primary with a Discord mirror, the shape of a real
-``mirrors: [...]`` filesystem with redundant pinned metadata. The
-Telegram store goes down mid session: the first write still fails (an
-upload stream cannot be replayed after the failed attempt), the retry
-lands in the Discord store, which then owns the version and the
-descriptor of the file. The replication queue brings both back to
-Telegram once it accepts writes again.
+A Telegram primary with a Discord mirror and redundant pinned metadata.
+In tee mode, the same upload finishes on Discord. In inline mode, a fresh
+request goes directly to Discord after the first write fails. The replica
+and descriptor move back to Telegram once it accepts writes again.
 """
 
 import asyncio
+from contextlib import AsyncExitStack
 from typing import List, Tuple, cast
 
+import asyncssh
 import pytest
 
 from tests.fakes.store import FakeStore
-from tgdcfs.config import Config
+from tests.tgdcfs.backends.discord.test_store import FakeBot, FakeChannel
+from tgdcfs.app.sftp.server import TGFSSFTPServer
+from tgdcfs.auth.user import AdminUser
+from tgdcfs.backends.discord.store import DiscordStore
+from tgdcfs.config import Config, EncryptionConfig
 from tgdcfs.core.client import Client
 from tgdcfs.core.replication import ReplicationQueue, ReplicationWorker
+from tgdcfs.crypto.header import MAGIC
 from tgdcfs.errors import FileOrDirectoryDoesNotExist, TechnicalError
 from tgdcfs.reqres import FileMessageFromBuffer
 
@@ -115,6 +119,157 @@ def read(client: Client, fr, name: str) -> bytes:
 
 
 class TestWriteFailover:
+    @pytest.mark.parametrize("encrypt", [False, True], ids=["plain", "encrypted"])
+    async def test_one_sftp_session_survives_primary_loss_and_heals(
+        self, tmp_path, mocker, encrypt
+    ):
+        raw = config_dict()
+        raw["filesystems"]["media"]["sync"] = "tee"
+        # Discord's message cache is per channel, and the two fake channels
+        # have independent message histories.
+        channel_id = 98_766 + int(encrypt)
+        raw["stores"]["dc-spare"]["channel"] = str(channel_id)
+        config = Config.from_dict(raw)
+        encryption = EncryptionConfig.from_dict(
+            {
+                "enabled": encrypt,
+                "encrypt_names": encrypt,
+                "passphrase": "integration-test",
+                "master_salt_file": str(tmp_path / "master.salt"),
+                "chunk_size": 1024,
+            }
+        )
+        queue_path = str(tmp_path / "queue.json")
+        queue = ReplicationQueue(path=queue_path)
+        tg = FakeStore(
+            key=config.stores["tg-main"].key,
+            backend_name="telegram",
+            max_part_bytes=16384,
+        )
+        discord_channel = FakeChannel()
+        discord_sent = asyncio.Event()
+
+        class Bot(FakeBot):
+            async def send_file(self, channel_id, data, name, caption=""):
+                if name.startswith("[part1]"):
+                    discord_sent.set()
+                return await super().send_file(channel_id, data, name, caption)
+
+        dc = DiscordStore(
+            [Bot(1, discord_channel), Bot(2, discord_channel)],
+            channel_id,
+            key=config.stores["dc-spare"].key,
+            max_part_bytes=4096,
+            max_concurrent_uploads=2,
+        )
+
+        async def stores(cfg):
+            return tg if cfg.backend == "telegram" else dc
+
+        mocker.patch.object(type(config.tgdcfs.transfer), "tee_buffer_bytes", 4096)
+        client = await Client.create(
+            config.filesystems["media"],
+            config,
+            stores,
+            encryption_cfg=encryption,
+            replication=queue,
+        )
+        data = bytes(range(256)) * 192
+        primary_read = asyncio.Event()
+        outage = asyncio.Event()
+        primary_failed = asyncio.Event()
+        original_upload = tg.upload
+
+        async def upload(msg):
+            if outage.is_set():
+                return await original_upload(msg)
+            await msg.open()
+            prefix = await msg.read(2048)
+            if encrypt:
+                assert prefix.startswith(MAGIC)
+            else:
+                assert prefix == data[:2048]
+            primary_read.set()
+            await outage.wait()
+            primary_failed.set()
+            raise TechnicalError("simulated Telegram outage mid-upload")
+
+        mocker.patch.object(tg, "upload", side_effect=upload)
+
+        class NoAuth(asyncssh.SSHServer):
+            def begin_auth(self, username: str) -> bool:
+                return False
+
+        def factory(chan):
+            server = TGFSSFTPServer(chan, {"media": client}, config)
+            server._user = AdminUser("admin")
+            return server
+
+        async with AsyncExitStack() as stack:
+            listener = await stack.enter_async_context(
+                asyncssh.listen(
+                    "127.0.0.1",
+                    0,
+                    server_factory=NoAuth,
+                    server_host_keys=[asyncssh.generate_private_key("ssh-ed25519")],
+                    sftp_factory=factory,
+                )
+            )
+            conn = await stack.enter_async_context(
+                asyncssh.connect(
+                    "127.0.0.1", listener.get_port(), username="test", known_hosts=None
+                )
+            )
+            sftp = await stack.enter_async_context(conn.start_sftp_client())
+            handle = await sftp.open("/media/outage.bin", "wb")
+            await asyncio.wait_for(handle.write(data[:8192], 0), 3)
+            await asyncio.wait_for(primary_read.wait(), 3)
+            tg.fail = set(PRIMARY_DOWN)
+            outage.set()
+            await asyncio.wait_for(primary_failed.wait(), 3)
+            for offset in range(8192, len(data), 8192):
+                await asyncio.wait_for(
+                    handle.write(data[offset : offset + 8192], offset), 3
+                )
+            await asyncio.wait_for(handle.close(), 3)
+            assert discord_sent.is_set()
+            async with await sftp.open("/media/outage.bin", "rb") as downloaded:
+                assert await downloaded.read() == data
+
+        fr = tree(client).find_file("outage.bin")
+        failed_over = (await client.file_api.desc(fr)).get_latest_version()
+        assert failed_over.store == dc.key and fr.store == dc.key
+        stored = b"".join(
+            discord_channel.messages[mid]["data"] for mid in failed_over.message_ids
+        )
+        if encrypt:
+            assert stored.startswith(MAGIC)
+            assert data not in stored
+        else:
+            assert stored == data
+        assert [item.path for item in queue.pending("media")] == ["/outage.bin"]
+        # Reload the persisted queue before exercising the recovery path.
+        persisted = ReplicationQueue(path=queue_path)
+        worker = ReplicationWorker(client, persisted)
+        assert not await worker.process_one("/outage.bin")
+        assert persisted.pending("media")
+
+        tg.fail.clear()
+        assert await worker.process_one("/outage.bin")
+        assert not persisted.pending("media")
+        healed = (await client.file_api.desc(fr)).get_latest_version()
+        assert healed.id == failed_over.id and healed.store == tg.key
+        assert fr.store == tg.key and healed.has_copy_in(dc.key)
+        assert len(healed.message_ids) < len(failed_over.message_ids)
+        assert b"".join(tg.document_of(mid) for mid in healed.message_ids) == stored
+        for mid in healed.message_ids:
+            name = tg.messages[mid].name
+            if encrypt:
+                assert "]TGFS1_" in name
+                assert "outage.bin" not in name
+            else:
+                assert name.endswith("]outage.bin")
+
     async def test_an_aborted_hanging_primary_marks_the_breaker(self):
         """The form a real outage takes: not an error, but silence.
 
