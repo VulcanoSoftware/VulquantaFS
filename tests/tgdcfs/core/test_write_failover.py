@@ -14,6 +14,7 @@ from typing import List, Tuple, cast
 
 import asyncssh
 import pytest
+from telethon.types import Message
 
 from tests.fakes.store import FakeStore
 from tests.tgdcfs.backends.discord.test_store import FakeBot, FakeChannel
@@ -21,13 +22,14 @@ from tgdcfs.app.sftp.server import TGFSSFTPServer
 from tgdcfs.auth.user import AdminUser
 from tgdcfs.backends.discord.store import DiscordStore
 from tgdcfs.backends.telegram import store as telegram_store
+from tgdcfs.backends.telegram.impl.telethon import TelethonAPI
 from tgdcfs.backends.telegram.store import TelegramStore
 from tgdcfs.config import Config, EncryptionConfig, TransferConfig
 from tgdcfs.core.client import Client
 from tgdcfs.core.replication import ReplicationQueue, ReplicationWorker
 from tgdcfs.crypto.header import MAGIC
 from tgdcfs.errors import FileOrDirectoryDoesNotExist, TechnicalError
-from tgdcfs.reqres import FileMessageFromBuffer, SaveFilePartResp, SendMessageResp
+from tgdcfs.reqres import FileMessageFromBuffer
 from tgdcfs.utils.message_cache import global_message_cache
 
 pytestmark = pytest.mark.asyncio
@@ -197,24 +199,48 @@ class TestWriteFailover:
         release_publish = asyncio.Event()
         original_upload = tg.upload
         telegram_chunks: dict[int, dict[int, bytes]] = {}
+        disconnects = 0
+        reconnects = 0
 
         class TelegramTransport:
-            async def save_file_part(self, req):
-                telegram_chunks.setdefault(req.file_id, {})[req.file_part] = req.bytes
-                return SaveFilePartResp(success=True)
+            connected = True
 
-            async def send_small_file(self, req):
+            def is_connected(self):
+                return self.connected
+
+            async def connect(self):
+                nonlocal reconnects
+                self.connected = True
+                reconnects += 1
+
+            async def __call__(self, req):
+                nonlocal disconnects
+                parts = telegram_chunks.setdefault(req.file_id, {})
+                if not disconnects and req.file_part == 4:
+                    assert len(parts) == 4
+                    disconnects += 1
+                    self.connected = False
+                    # Telethon's sender cancels this RPC future when it
+                    # disconnects. Nobody cancelled the uploader task.
+                    response = asyncio.get_running_loop().create_future()
+                    response.cancel()
+                    return await response
+                parts[req.file_part] = req.bytes
+                return True
+
+            async def send_file(self, *, file, **kwargs):
                 # As in production, successful part RPCs alone do not
                 # publish any document in the channel.
                 publishing.set()
                 await release_publish.wait()
-                chunks = telegram_chunks[req.file.id]
-                payload = b"".join(chunks[i] for i in range(req.file.parts))
-                return SendMessageResp(
-                    message_id=tg._add(document=payload, name=req.name)
+                chunks = telegram_chunks[file.id]
+                payload = b"".join(chunks[i] for i in range(file.parts))
+                return mocker.Mock(
+                    spec=Message, id=tg._add(document=payload, name=file.name)
                 )
 
-        telegram = TelegramStore(SimpleNamespace(next_bot=TelegramTransport()), 1001)  # type: ignore[arg-type]
+        api = TelethonAPI(TelegramTransport())  # type: ignore[arg-type]
+        telegram = TelegramStore(SimpleNamespace(next_bot=api), 1001)  # type: ignore[arg-type]
 
         async def upload(msg):
             if outage.is_set():
@@ -296,12 +322,16 @@ class TestWriteFailover:
         tg.fail.clear()
         limit_attachment_lookups = True
         mocker.patch.object(TransferConfig, "upload_part_size_bytes", 4096)
+        # Exercise the known-size big-file RPCs used in the 1 GiB incident
+        # without creating a gigabyte fixture.
+        mocker.patch("tgdcfs.backends.telegram.uploader.is_big_file", return_value=True)
         foreground_deadline = mocker.spy(telegram_store, "bounded_part")
         persisted.retry_now()
         worker.start()
         try:
             await asyncio.wait_for(publishing.wait(), 3)
             foreground_deadline.assert_not_called()
+            assert disconnects == reconnects == 1
             assert fr.store == dc.key and persisted.pending("media")
         finally:
             await worker.stop()

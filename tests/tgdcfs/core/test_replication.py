@@ -6,6 +6,7 @@ own layout. Reads fall over to the replica, promotion swaps the layouts,
 and the queue drives all of it in the background.
 """
 
+import asyncio
 import json
 from typing import cast
 
@@ -436,6 +437,51 @@ class TestBackgroundSync:
         assert await worker.run_once() == 1
         assert not queue.pending("fs")
         assert (await stack.version("a.bin")).has_copy_in(stack.mirror.key)
+
+    async def test_cancelled_store_request_does_not_stop_the_worker(
+        self, tmp_path, mocker
+    ):
+        mocker.patch("tgdcfs.core.replication.RETRY_BASE_SECONDS", 0.05)
+        path = str(tmp_path / "queue.json")
+        queue = ReplicationQueue(path)
+        stack = await Stack(
+            telegram_like(), discord_like(), inline=False, queue=queue
+        ).init()
+        await stack.put("a.bin", DATA)
+        failed = asyncio.Event()
+        done = asyncio.Event()
+        upload, mark_failed, mark_done = stack.mirror.upload, queue.failed, queue.done
+
+        async def upload_after_disconnect(message):
+            if not failed.is_set():
+                request = asyncio.get_running_loop().create_future()
+                request.cancel()
+                return await request
+            return await upload(message)
+
+        def on_failed(*args):
+            mark_failed(*args)
+            failed.set()
+
+        def on_done(*args):
+            mark_done(*args)
+            done.set()
+
+        mocker.patch.object(stack.mirror, "upload", side_effect=upload_after_disconnect)
+        mocker.patch.object(queue, "failed", side_effect=on_failed)
+        mocker.patch.object(queue, "done", side_effect=on_done)
+        worker = ReplicationWorker(stack, queue)  # type: ignore[arg-type]
+        worker.start()
+        try:
+            await asyncio.wait_for(failed.wait(), timeout=2)
+            item = ReplicationQueue(path).pending("fs")[0]
+            assert item.attempts == 1
+            assert "store cancelled an in-flight request" in (item.last_error or "")
+            await asyncio.wait_for(done.wait(), timeout=4)
+            assert not ReplicationQueue(path).pending("fs")
+            assert (await stack.version("a.bin")).has_copy_in(stack.mirror.key)
+        finally:
+            await worker.stop()
 
     async def test_removed_file_is_dropped_from_the_queue(self):
         queue = ReplicationQueue(None)

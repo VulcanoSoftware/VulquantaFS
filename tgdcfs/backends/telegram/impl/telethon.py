@@ -56,6 +56,17 @@ DOWNLOAD_REQUEST_SIZE = MAX_CHUNK_SIZE
 T = TypeVar("T")
 
 
+class _RPCOnlyTelegramClient(TelegramClient):
+    """The storage backend uses requests, not Telegram event handlers."""
+
+    async def _update_loop(self) -> None:
+        # Telethon 1.40 starts a difference/catch-up loop even when the
+        # server was told not to push updates. That loop can crash after
+        # reconnecting and disconnect the sender in the middle of an upload.
+        # Keep Telethon's sender, keepalive and RPC response handling intact.
+        return
+
+
 class TelethonAPI(ITDLibClient):
     def __init__(
         self,
@@ -91,7 +102,18 @@ class TelethonAPI(ITDLibClient):
                         await client.connect()
             return await action()
 
-        return await self._bounded(what, run())
+        try:
+            return await self._bounded(what, run())
+        except asyncio.CancelledError as ex:
+            task = asyncio.current_task()
+            if task is None or task.cancelling():
+                raise
+            # Disconnecting a Telethon sender cancels its pending RPC
+            # futures, not the caller's task. Part uploads can retry that
+            # request; an intentional caller shutdown must still propagate.
+            raise ConnectionError(
+                f"Telegram transport cancelled the request during {what}"
+            ) from ex
 
     async def __get_messages(self, *args, **kwargs) -> Sequence[tlt.Message]:
         messages = await self._connected_rpc(
@@ -496,10 +518,11 @@ async def open_extra_connections(
     connections: List[TelegramClient] = []
     for i in range(extra):
         try:
-            connection = TelegramClient(
+            connection = _RPCOnlyTelegramClient(
                 StringSession(session_string),
                 config.telegram.api_id,
                 config.telegram.api_hash,
+                receive_updates=False,
             )
             await connection.connect()
             connections.append(connection)
@@ -524,10 +547,12 @@ async def login_as_account(config: Config) -> TelegramClient:
 
     session = Session(config.telegram.account.session_file)
     if sess := session.get():
-        client = TelegramClient(sess, api_id, api_hash)
+        client = _RPCOnlyTelegramClient(sess, api_id, api_hash, receive_updates=False)
         await client.connect()
     else:
-        client = TelegramClient(StringSession(), api_id, api_hash)
+        client = _RPCOnlyTelegramClient(
+            StringSession(), api_id, api_hash, receive_updates=False
+        )
         await client.connect()
 
         phone_number = input("Phone number (with country code): ")
@@ -568,10 +593,14 @@ async def login_as_bots(config: Config) -> List[TelegramClient]:
         )
 
         if sess := session.get():
-            client = TelegramClient(sess, api_id, api_hash)
+            client = _RPCOnlyTelegramClient(
+                sess, api_id, api_hash, receive_updates=False
+            )
             await client.connect()
         else:
-            client = TelegramClient(StringSession(), api_id, api_hash)
+            client = _RPCOnlyTelegramClient(
+                StringSession(), api_id, api_hash, receive_updates=False
+            )
             await client.connect()
             await client.start(bot_token=token)  # type: ignore
             session.save_multibot(client.session.save())  # type: ignore
