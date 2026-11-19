@@ -619,6 +619,108 @@ class TestTelethonAPI:
 
         assert telethon_api._client.get_messages.call_count == 1
 
+    async def test_download_file_reconnects_a_stale_transfer_client(
+        self, mock_client, mock_chat, mock_document_message, mocker
+    ):
+        reader = mocker.Mock(spec=TelegramClient)
+        connected = False
+
+        async def connect():
+            nonlocal connected
+            connected = True
+
+        async def download(**_kwargs):
+            if not connected:
+                raise ConnectionError("Cannot send requests while disconnected")
+            yield b"payload"
+
+        reader.is_connected.side_effect = lambda: connected
+        reader.connect.side_effect = connect
+        reader.iter_download = download
+        mock_client.get_messages.return_value = TotalList([mock_document_message])
+        api = TelethonAPI(mock_client, [reader])
+        # The metadata client was already used by the preceding transfer.
+        assert api._transfer_client is mock_client
+        req = DownloadFileReq(chat=mock_chat, message_id=54321, begin=1, end=4)
+        resp = await api.download_file(req)
+
+        assert b"".join([chunk async for chunk in resp.chunks]) == b"aylo"
+        reader.connect.assert_awaited_once()
+        mock_client.connect.assert_not_awaited()
+
+    @pytest.mark.parametrize("cancel_rpc", [False, True])
+    async def test_download_file_resumes_at_exact_byte_after_disconnect(
+        self, telethon_api, mock_client, mock_chat, mock_document_message, cancel_rpc
+    ):
+        mock_client.get_messages.return_value = TotalList([mock_document_message])
+        connected = True
+        offsets = []
+        closed = []
+
+        async def connect():
+            nonlocal connected
+            connected = True
+
+        async def download(*, offset, **_kwargs):
+            nonlocal connected
+            offsets.append(offset)
+            attempt = len(offsets)
+            try:
+                if attempt == 1:
+                    yield b"0123456"
+                    connected = False
+                    if cancel_rpc:
+                        rpc = asyncio.get_running_loop().create_future()
+                        rpc.cancel()
+                        await rpc
+                    raise ConnectionError("Cannot send requests while disconnected")
+                assert connected
+                yield b"0123456789abcdef"
+            finally:
+                closed.append(attempt)
+
+        mock_client.is_connected.side_effect = lambda: connected
+        mock_client.connect.side_effect = connect
+        mock_client.iter_download = download
+        begin = DOWNLOAD_REQUEST_SIZE + 3
+        resp = await telethon_api.download_file(
+            DownloadFileReq(
+                chat=mock_chat, message_id=54321, begin=begin, end=begin + 9
+            )
+        )
+
+        assert [chunk async for chunk in resp.chunks] == [b"3456", b"789abc"]
+        assert offsets == [DOWNLOAD_REQUEST_SIZE, DOWNLOAD_REQUEST_SIZE]
+        assert closed == [1, 2]
+        mock_client.connect.assert_awaited_once()
+
+    async def test_download_file_does_not_retry_when_the_reader_is_cancelled(
+        self, telethon_api, mock_client, mock_chat, mock_document_message
+    ):
+        mock_client.get_messages.return_value = TotalList([mock_document_message])
+        started = asyncio.Event()
+        never = asyncio.Event()
+        attempts = 0
+
+        async def download(**_kwargs):
+            nonlocal attempts
+            attempts += 1
+            started.set()
+            await never.wait()
+            yield b"unreachable"
+
+        mock_client.iter_download = download
+        resp = await telethon_api.download_file(
+            DownloadFileReq(chat=mock_chat, message_id=54321, begin=0, end=1)
+        )
+        call = asyncio.create_task(resp.chunks.__anext__())
+        await asyncio.wait_for(started.wait(), 1)
+        call.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await call
+        assert attempts == 1
+        mock_client.connect.assert_not_awaited()
+
     @pytest.mark.asyncio
     async def test_download_file_refreshes_an_expired_file_reference(
         self, telethon_api, mock_chat, mock_document_message

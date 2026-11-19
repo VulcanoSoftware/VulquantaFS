@@ -29,8 +29,8 @@ from tgdcfs.core.client import Client
 from tgdcfs.core.replication import ReplicationQueue, ReplicationWorker
 from tgdcfs.crypto.header import MAGIC
 from tgdcfs.errors import FileOrDirectoryDoesNotExist, TechnicalError
-from tgdcfs.reqres import FileMessageFromBuffer
-from tgdcfs.utils.message_cache import global_message_cache
+from tgdcfs.reqres import Document, DownloadFileResp, FileMessageFromBuffer, MessageResp
+from tgdcfs.utils.message_cache import channel_cache, global_message_cache
 
 pytestmark = pytest.mark.asyncio
 
@@ -132,7 +132,12 @@ class TestWriteFailover:
         caplog.set_level("INFO", logger="tgdcfs.core.replication")
         caplog.set_level("INFO", logger="tgdcfs.backends.telegram.store")
         raw = config_dict()
-        raw["filesystems"]["media"]["sync"] = "tee"
+        raw["filesystems"]["media"].update(
+            sync="tee", read_parallel=True, read_preference=["dc-spare", "tg-main"]
+        )
+        raw["tgdcfs"]["transfer"] = {"download_piece_size_kb": 4}
+        mocker.patch.object(TransferConfig, "parallel_download_threshold_bytes", 4096)
+        mocker.patch("tgdcfs.core.multisource.PIECE_FAILOVER_TIMEOUT_S", 0.5)
         # Discord's message cache is per channel, and the two fake channels
         # have independent message histories.
         channel_id = 98_766 + int(encrypt)
@@ -191,7 +196,7 @@ class TestWriteFailover:
             encryption_cfg=encryption,
             replication=queue,
         )
-        data = bytes(range(256)) * 192
+        data = bytes((i // 53) % 251 for i in range(48 * 1024))
         primary_read = asyncio.Event()
         outage = asyncio.Event()
         primary_failed = asyncio.Event()
@@ -365,6 +370,104 @@ class TestWriteFailover:
                 assert "outage.bin" not in name
             else:
                 assert name.endswith("]outage.bin")
+
+        # The account used only for downloads never reconnected during the
+        # upload heal. Warm document lookup can skip its metadata RPCs too.
+        read_channel = 98_790 + int(encrypt)
+        reader_reconnects = 0
+
+        class DownloadTransport:
+            connected = False
+
+            def is_connected(self):
+                return self.connected
+
+            async def connect(self):
+                nonlocal reader_reconnects
+                self.connected = True
+                reader_reconnects += 1
+
+            async def iter_download(self, *, file, offset, request_size):
+                if not self.connected:
+                    raise ConnectionError("Cannot send requests while disconnected")
+                blob = tg.document_of(file.id)
+                for start in range(offset, len(blob), request_size):
+                    yield blob[start : start + request_size]
+
+        readers = [DownloadTransport() for _ in range(3)]
+        download_api = TelethonAPI(readers[0], readers[1:])  # type: ignore[arg-type]
+        download_store = TelegramStore(
+            SimpleNamespace(next_bot=download_api), read_channel  # type: ignore[arg-type]
+        )
+        original_tg_download = tg.download_file
+        original_dc_download = dc.download_file
+        initial_dc_parts = set(failed_over.message_ids[:16])
+        dc_parts = set(failed_over.message_ids)
+        dc_served = asyncio.Event()
+        dc_down = asyncio.Event()
+        dc_stalled = asyncio.Event()
+        dc_cancelled = asyncio.Event()
+        never = asyncio.Event()
+        tg_documents = channel_cache(read_channel).id
+        for mid in healed.message_ids:
+            tg_documents[mid] = MessageResp(
+                message_id=mid,
+                text="",
+                document=Document(len(tg.document_of(mid)), mid, 0, b"ref", None),
+            )
+
+        async def download_telegram(mid, begin, end):
+            if mid in healed.message_ids:
+                return await download_store.download_file(mid, begin, end)
+            return await original_tg_download(mid, begin, end)
+
+        async def download_discord(mid, begin, end):
+            resp = await original_dc_download(mid, begin, end)
+            if mid not in dc_parts:
+                return resp
+
+            async def chunks():
+                if mid not in initial_dc_parts:
+                    await dc_down.wait()
+                if dc_down.is_set():
+                    dc_stalled.set()
+                    try:
+                        await never.wait()
+                    finally:
+                        dc_cancelled.set()
+                async for chunk in resp.chunks:
+                    dc_served.set()
+                    yield chunk
+
+            return DownloadFileResp(chunks(), resp.size)
+
+        mocker.patch.object(tg, "download_file", side_effect=download_telegram)
+        mocker.patch.object(dc, "download_file", side_effect=download_discord)
+        try:
+            async with (
+                asyncssh.listen(
+                    "127.0.0.1",
+                    0,
+                    server_factory=NoAuth,
+                    server_host_keys=[asyncssh.generate_private_key("ssh-ed25519")],
+                    sftp_factory=factory,
+                ) as listener,
+                asyncssh.connect(
+                    "127.0.0.1", listener.get_port(), username="test", known_hosts=None
+                ) as conn,
+                conn.start_sftp_client() as sftp,
+                sftp.open("/media/outage.bin", "rb") as handle,
+            ):
+                prefix = await asyncio.wait_for(handle.read(2048), 2)
+                await asyncio.wait_for(dc_served.wait(), 2)
+                dc_down.set()
+                await asyncio.wait_for(dc_stalled.wait(), 2)
+                suffix = await asyncio.wait_for(handle.read(), 2)
+                assert prefix + suffix == data
+                assert dc_cancelled.is_set()
+                assert reader_reconnects == len(readers)
+        finally:
+            global_message_cache.pop(read_channel, None)
 
     @pytest.mark.parametrize(
         "read_parallel", [False, True], ids=["ordered", "parallel"]

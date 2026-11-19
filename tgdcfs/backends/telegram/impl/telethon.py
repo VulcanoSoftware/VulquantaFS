@@ -2,7 +2,7 @@ import asyncio
 import logging
 import os
 from itertools import cycle
-from typing import Awaitable, Callable, List, Optional, Sequence, TypeVar
+from typing import AsyncIterator, Awaitable, Callable, List, Optional, Sequence, TypeVar
 
 from telethon import TelegramClient
 from telethon import functions as tlf
@@ -39,6 +39,7 @@ from tgdcfs.reqres import (
     SendFileReq,
     SendMessageResp,
     SendTextReq,
+    aclose_content,
 )
 from tgdcfs.utils.chunk_cache import chunk_cache
 from tgdcfs.utils.message_cache import channel_cache
@@ -376,26 +377,40 @@ class TelethonAPI(ITDLibClient):
             doc = document
             offset = req.begin
             refreshed = False
+            retried_connection = False
 
             while rest > 0:
                 aligned = offset - offset % DOWNLOAD_REQUEST_SIZE
                 skip = offset - aligned
+                client = self._transfer_client
+                downloader: Optional[AsyncIterator[bytes]] = None
+
+                async def read_chunk() -> bytes:
+                    nonlocal downloader
+                    if downloader is None:
+                        iterator: AsyncIterator[bytes] = client.iter_download(
+                            file=InputDocumentFileLocation(
+                                id=doc.id,
+                                access_hash=doc.access_hash,
+                                file_reference=doc.file_reference,
+                                thumb_size="",
+                            ),
+                            offset=aligned,
+                            request_size=DOWNLOAD_REQUEST_SIZE,
+                        )
+                        downloader = iterator
+                    return await downloader.__anext__()
+
                 try:
-                    downloader = self._transfer_client.iter_download(
-                        file=InputDocumentFileLocation(
-                            id=doc.id,
-                            access_hash=doc.access_hash,
-                            file_reference=doc.file_reference,
-                            thumb_size="",
-                        ),
-                        offset=aligned,
-                        request_size=DOWNLOAD_REQUEST_SIZE,
-                    )
                     while True:
                         try:
-                            chunk = await self._bounded(
+                            # A cached document can skip the metadata RPC,
+                            # and the reader may use a different pooled client
+                            # anyway. Check the connection on the actual read.
+                            chunk = await self._connected_rpc(
                                 f"download of message {req.message_id}",
-                                downloader.__anext__(),
+                                client,
+                                read_chunk,
                             )
                         except StopAsyncIteration:
                             break
@@ -407,9 +422,9 @@ class TelethonAPI(ITDLibClient):
                             skip = 0
                         if len(chunk) > rest:
                             chunk = chunk[:rest]
-                        yield chunk
                         rest -= len(chunk)
                         offset += len(chunk)
+                        yield chunk
                         if rest <= 0:
                             break
                 except FileReferenceExpiredError:
@@ -421,6 +436,21 @@ class TelethonAPI(ITDLibClient):
                         req.chat, req.message_id, refresh=True
                     )
                     continue
+                except ConnectionError:
+                    # A disconnect can race the connection check or cancel
+                    # an in-flight request. Rebuild the iterator at the last
+                    # delivered byte; don't reuse its internal offset.
+                    if retried_connection:
+                        raise
+                    retried_connection = True
+                    continue
+                finally:
+                    if downloader is not None:
+                        # Telethon's iterator uses close(), not aclose().
+                        if (close := getattr(downloader, "close", None)) is not None:
+                            await close()
+                        else:
+                            await aclose_content(downloader)
                 break
 
             if rest > 0:
