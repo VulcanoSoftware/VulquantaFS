@@ -8,9 +8,11 @@ files API and compare -- closely enough that the store's real code paths
 it unchanged.
 """
 
+import asyncio
 import base64
 import hashlib
 import json
+import time
 from typing import Dict, List, Optional
 from unittest.mock import Mock, patch
 from urllib.parse import unquote
@@ -21,6 +23,12 @@ from github import GithubException, InputGitTreeElement
 
 from tgdcfs.config import GitlabRepoConfig
 from tgdcfs.core.model import TGFSDirectory, TGFSMetadata
+from tgdcfs.core.repository.impl.metadata import breaker as breaker_mod
+from tgdcfs.core.repository.impl.metadata.breaker import (
+    StoreCircuitBreaker,
+    StoreUnreachable,
+    is_unreachable_error,
+)
 from tgdcfs.core.repository.impl.metadata.github_repo.gh_directory import (
     GithubDirectory,
 )
@@ -364,6 +372,34 @@ class _Conflict(Exception):
     pass
 
 
+class DeadlineGitlab(FakeGitlab):
+    """A GitLab whose storage backend cannot do the work: the endpoints
+    selected by ``dead`` keep the request waiting for its whole timeout
+    window and finally answer with Gitaly's gRPC termination text (the
+    fake skips only the waiting)."""
+
+    DEADLINE_BODY = {"message": "4:Stream removed (Deadline Exceeded)."}
+
+    def __init__(self, *args, dead: str = "all", **kwargs):
+        super().__init__(*args, **kwargs)
+        self.dead = dead
+
+    def _route(self, method, url, params, body):
+        rest = unquote(url.split("/api/v4/projects/", 1)[1].partition("/")[2])
+        storage = rest.startswith(
+            (
+                "repository/branches",
+                "repository/commits",
+                "repository/files",
+                "repository/tree",
+            )
+        )
+        writes = method in ("POST", "PUT", "DELETE")
+        if storage and (self.dead == "all" or (self.dead == "writes" and writes)):
+            return 400, dict(self.DEADLINE_BODY)
+        return super()._route(method, url, params, body)
+
+
 @pytest.fixture(autouse=True)
 def stub_timestamp_store():
     """Keep the date cache out of the store tests, like
@@ -378,15 +414,37 @@ def stub_timestamp_store():
         yield store
 
 
-@pytest.fixture
-def gitlab(monkeypatch):
-    fake = FakeGitlab()
-
+def _route_session(monkeypatch, fake: FakeGitlab) -> FakeGitlab:
     def fake_request(self, method, url, params=None, json=None, timeout=None, **kw):
         return fake.handle(method, url, params, json)
 
     monkeypatch.setattr(requests.Session, "request", fake_request)
     return fake
+
+
+@pytest.fixture
+def gitlab(monkeypatch):
+    return _route_session(monkeypatch, FakeGitlab())
+
+
+@pytest.fixture
+def gitlab_dead_writes(monkeypatch):
+    return _route_session(monkeypatch, DeadlineGitlab(dead="writes"))
+
+
+@pytest.fixture
+def gitlab_dead_storage(monkeypatch):
+    return _route_session(monkeypatch, DeadlineGitlab(dead="all"))
+
+
+@pytest.fixture
+def stop_breakers():
+    """The breakers a test woke up; stopped in teardown, so a leftover
+    prober never reaches the network that a follow-up test patched."""
+    made: List[StoreCircuitBreaker] = []
+    yield made
+    for breaker in made:
+        breaker.stop()
 
 
 def gitlab_config(**overrides) -> GitlabRepoConfig:
@@ -811,3 +869,131 @@ class TestGitlabTreeStore:
         assert layer.metadata is tree
         assert isinstance(tree.dir, GithubDirectory)
         assert gitlab.file_content("main", "docs/readme.42") == ""
+
+
+class TestDeadlineAnswers:
+    """Gitaly's deadline text in an answer means the request hung for its
+    whole timeout window and the storage did no work: an outage, not a
+    refused request."""
+
+    async def test_a_deadline_answer_is_an_unreachable_service(
+        self, gitlab_dead_writes
+    ):
+        repo = GitlabRepository(gitlab_config())
+
+        with pytest.raises(StoreUnreachable):
+            repo.create_file("hello.txt", "create", "", "main")
+
+    async def test_a_probe_of_dead_storage_looks_unreachable(self, gitlab_dead_storage):
+        repo = GitlabRepository(gitlab_config())
+
+        with pytest.raises(StoreUnreachable):
+            repo.probe()
+
+    async def test_a_probe_of_a_missing_branch_still_counts_as_answered(self, gitlab):
+        repo = GitlabRepository(gitlab_config())
+
+        with pytest.raises(GithubException) as answered:
+            repo.probe()
+
+        assert answered.value.status == 404
+        assert not is_unreachable_error(answered.value)
+
+
+async def _wait_closed(store: StoreCircuitBreaker, timeout: float = 10.0) -> None:
+    deadline = time.monotonic() + timeout
+    while store._open and time.monotonic() < deadline:
+        await asyncio.sleep(0.005)
+    assert not store._open
+
+
+class TestFailFastGitlabTreeStore:
+    """While GitLab's storage cannot do the work, the store must refuse
+    its calls instead of cost the request timeout once per push, heal,
+    stats commit and listing -- the wait that made deleting files take a
+    minute each."""
+
+    def repository(self):
+        return GitlabTreeRepoMetadataRepository(gitlab_config())
+
+    async def test_a_deadlining_push_trips_the_breaker(
+        self, gitlab_dead_writes, stop_breakers
+    ):
+        repo = self.repository()
+        stop_breakers.append(repo._gitlab_breaker)
+        repo.metadata = sample_tree()
+
+        with pytest.raises(StoreUnreachable):
+            await repo.push_full()
+        assert repo._gitlab_breaker._open
+
+        # Known dead: the next push is refused without GitLab receiving
+        # another write attempt.
+        posts = [r for r in gitlab_dead_writes.requests if r[0] == "POST"]
+        start = time.monotonic()
+        with pytest.raises(StoreUnreachable):
+            await repo.push_full()
+        assert time.monotonic() - start < 1.0
+        assert [r for r in gitlab_dead_writes.requests if r[0] == "POST"] == posts
+
+    async def test_the_store_writes_again_once_gitlab_answers(
+        self, gitlab_dead_writes, stop_breakers, monkeypatch
+    ):
+        monkeypatch.setattr(breaker_mod, "PROBE_COOLDOWN_SECONDS", 0.05)
+        repo = self.repository()
+        stop_breakers.append(repo._gitlab_breaker)
+        repo.metadata = sample_tree()
+
+        with pytest.raises(StoreUnreachable):
+            await repo.push_full()
+
+        gitlab_dead_writes.dead = "none"
+        await _wait_closed(repo._gitlab_breaker)
+
+        await repo.push_full()
+
+        assert gitlab_dead_writes.file_content("main", "docs/readme.42") == ""
+
+    async def test_a_deadlining_mirror_does_not_stall_replicated_pushes(
+        self, gitlab_dead_writes, stop_breakers
+    ):
+        """The user-visible shape: file operations push the metadata, the
+        GitLab mirror cannot take it, and the operation must not pay the
+        hang more than the first time."""
+        from tgdcfs.core.repository.impl.metadata.replicated import (
+            MetadataStore,
+            ReplicatedMetadataRepository,
+        )
+
+        class PinnedStub(IMetaDataRepository):
+            def __init__(self, tree):
+                super().__init__()
+                self._tree = tree
+
+            async def get(self):
+                return self._tree
+
+            async def push(self):
+                pass
+
+        tree = sample_tree()
+        mirror = self.repository()
+        stop_breakers.append(mirror._gitlab_breaker)
+        layer = ReplicatedMetadataRepository(
+            [
+                MetadataStore(
+                    key="pinned@tg-main", repo=PinnedStub(tree), primary=True
+                ),
+                MetadataStore(key="gitlab_repo@g/p@main", repo=mirror),
+            ]
+        )
+
+        await layer.init()
+        assert layer.stale_stores() == ["gitlab_repo@g/p@main"]
+
+        posts = [r for r in gitlab_dead_writes.requests if r[0] == "POST"]
+        start = time.monotonic()
+        await layer.push()
+        assert time.monotonic() - start < 1.0
+        assert [r for r in gitlab_dead_writes.requests if r[0] == "POST"] == posts
+        assert layer.stale_stores() == ["gitlab_repo@g/p@main"]

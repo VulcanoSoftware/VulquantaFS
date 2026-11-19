@@ -29,6 +29,11 @@ from github.Repository import Repository
 
 from tgdcfs.config import GithubRepoConfig, GitlabRepoConfig
 from tgdcfs.core.model import TGFSMetadata
+from tgdcfs.core.repository.impl.metadata.breaker import (
+    FailFastRepository,
+    StoreCircuitBreaker,
+    StoreUnreachable,
+)
 from tgdcfs.core.repository.impl.metadata.github_repo import (
     GithubRepoMetadataRepository,
 )
@@ -45,6 +50,21 @@ logger = logging.getLogger(__name__)
 # truncated GitHub tree would.
 PER_PAGE = 100
 REQUEST_TIMEOUT_SECONDS = 60.0
+
+
+# GitLab answers a request its storage backend (Gitaly) could not complete
+# with a 4xx/5xx whose body carries the gRPC termination text. Such a call
+# kept the connection waiting for its whole request timeout and did no
+# work: it is an outage of the storage, not a refused request, and the
+# callers pay the same wait again on every listing, write and heal until
+# something notices. Raising :class:`StoreUnreachable` for it lets the
+# circuit breaker cut that off.
+GITALY_DEADLINE_MARKERS = ("Stream removed", "Deadline Exceeded")
+
+
+def _is_gitaly_deadline(data: dict) -> bool:
+    text = str(data)
+    return any(marker in text for marker in GITALY_DEADLINE_MARKERS)
 
 
 class _TreeEntry(NamedTuple):
@@ -204,15 +224,31 @@ class GitlabRepository:
             timeout=REQUEST_TIMEOUT_SECONDS,
         )
         if response.status_code >= 400:
-            raise GithubException(
-                response.status_code, _error_data(response), dict(response.headers)
-            )
+            data = _error_data(response)
+            if _is_gitaly_deadline(data):
+                raise StoreUnreachable(
+                    f"GitLab's storage did not complete the request "
+                    f"({data.get('message', data)})"
+                )
+            raise GithubException(response.status_code, data, dict(response.headers))
         return response
 
     def _json(self, response: requests.Response) -> Any:
         if not response.content:
             return {}
         return response.json()
+
+    def probe(self) -> None:
+        """A cheap read that rounds the same storage backend the writes
+        have to traverse: one page of the branch's commit history. A
+        missing branch answers 404, which means GitLab itself spoke --
+        whatever the probe raises beyond a transport- or deadline-level
+        failure counts as the service being up."""
+        self._request(
+            "GET",
+            "/repository/commits",
+            params={"ref_name": self._branch, "per_page": 1},
+        )
 
     def _paginated(self, path: str, params: dict) -> List[dict]:
         items: List[dict] = []
@@ -711,7 +747,17 @@ class GitlabTreeRepoMetadataRepository(GithubRepoMetadataRepository):
         name_key: Optional[bytes] = None,
         blob_key: Optional[bytes] = None,
     ):
-        self._gitlab = GitlabRepository(config)
+        raw = GitlabRepository(config)
+        # Like its GitHub sibling, behind a fail-fast wrapper: GitLab that
+        # cannot do the work (a hung storage backend, a dead connection)
+        # costs the full request timeout per call, and the replicated layer
+        # still writes the full tree here on every push -- which used to
+        # hold every file operation for that long, over and over, while
+        # GitLab was unwell. A deadline answer or a dead connection trips
+        # the breaker; a background probe alone waits until GitLab answers
+        # again, and the heal worker catches this store up afterwards.
+        self._gitlab_breaker = StoreCircuitBreaker(raw.probe)
+        self._gitlab = cast(Any, FailFastRepository(raw, self._gitlab_breaker))
         self._blob_key = blob_key
         self._document_path = config.file_path
         # Set once the document is confirmed gone (or never existed), so
@@ -729,6 +775,10 @@ class GitlabTreeRepoMetadataRepository(GithubRepoMetadataRepository):
             name_key=name_key,
             repo=cast(Repository, self._gitlab),
         )
+
+    async def close(self) -> None:
+        self._gitlab_breaker.stop()
+        await super().close()
 
     async def get(self) -> TGFSMetadata:
         metadata = await super().get()

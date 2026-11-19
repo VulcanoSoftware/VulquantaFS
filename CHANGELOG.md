@@ -18,6 +18,18 @@ the fact on the commits that shipped them.
 
 ### Fixed
 
+- A GitLab metadata mirror that could not do the work (its storage backend
+  answering "Deadline Exceeded"/"Stream removed" after the full request
+  timeout, or the connection dying) no longer holds every file operation
+  up. Every push writes the full metadata tree to the mirrors, so deleting
+  a file with a failing GitLab mirror cost its request timeout per removal
+  -- measured: minutes per file, days for a folder. The GitLab tree mirror
+  is now behind the same circuit breaker as the GitHub ones: transport
+  failures and such deadline answers trip it, every further call is
+  refused immediately (the store is marked stale and the heal worker
+  catches it up later, as before), and a cheap background probe alone
+  waits until GitLab answers again. One failing write pays the timeout
+  once; the operations after it are back to their normal speed.
 - The file data of a replicated file system now heals itself the way the
   metadata does. With ``sync: tee`` a mirror write that failed (a mirror
   store being temporarily down, for instance) was detected and the file's
