@@ -713,8 +713,8 @@ class TestPartTimeout:
         """
         self._config(mocker, upload_part_timeout_s=1, upload_workers_big=2)
         client = mocker.AsyncMock(spec=ITDLibClient)
-        saved = []
-        hung = []
+        saved: list[int] = []
+        hung: list[int] = []
 
         async def save_big_file_part(req):
             if req.file_part == 2 and not hung:
