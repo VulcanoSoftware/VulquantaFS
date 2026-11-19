@@ -29,7 +29,11 @@ the fact on the commits that shipped them.
   refused immediately (the store is marked stale and the heal worker
   catches it up later, as before), and a cheap background probe alone
   waits until GitLab answers again. One failing write pays the timeout
-  once; the operations after it are back to their normal speed.
+  once; after that an escalating probe back-off (twice the cooldown per
+  consecutive trip, up to sixteen times) keeps re-tries of a mirror
+  whose reads answer but whose writes keep deadlining rare, so a
+  permanently broken mirror costs one write timeout per escalating
+  interval instead of nearly constantly.
 - The file data of a replicated file system now heals itself the way the
   metadata does. With ``sync: tee`` a mirror write that failed (a mirror
   store being temporarily down, for instance) was detected and the file's
