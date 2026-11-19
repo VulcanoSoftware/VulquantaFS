@@ -211,6 +211,9 @@ class UploadableFileMessage(FileMessage):
     version_id: Optional[str] = field(default=None, kw_only=True)
     # A restore has no client waiting for its final upload acknowledgement.
     background: bool = field(default=False, kw_only=True)
+    # This live upload shares its stream with other stores. A stalled
+    # backend should get out of the way rather than retry in the foreground.
+    failover: bool = field(default=False, kw_only=True)
 
     def _get_size(self) -> int:
         return 0

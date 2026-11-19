@@ -366,6 +366,165 @@ class TestWriteFailover:
             else:
                 assert name.endswith("]outage.bin")
 
+    @pytest.mark.parametrize(
+        "read_parallel", [False, True], ids=["ordered", "parallel"]
+    )
+    async def test_same_sftp_session_survives_discord_upload_and_download_outages(
+        self, tmp_path, mocker, read_parallel
+    ):
+        raw = config_dict()
+        raw["filesystems"]["media"].update(
+            sync="tee",
+            read_parallel=read_parallel,
+            read_preference=["dc-spare", "tg-main"],
+        )
+        channel_id = 98_780 + int(read_parallel)
+        raw["stores"]["dc-spare"]["channel"] = str(channel_id)
+        raw["tgdcfs"]["transfer"] = {"download_piece_size_kb": 4}
+        config = Config.from_dict(raw)
+        mocker.patch.object(TransferConfig, "tee_buffer_bytes", 4096)
+        mocker.patch.object(TransferConfig, "parallel_download_threshold_bytes", 8192)
+        mocker.patch("tgdcfs.backends.discord.store.LIVE_PART_TIMEOUT_S", 0.15)
+        mocker.patch("tgdcfs.core.multisource.PIECE_FAILOVER_TIMEOUT_S", 0.15)
+        mocker.patch(
+            "tgdcfs.core.repository.impl.file_content.PIECE_FAILOVER_TIMEOUT_S", 0.15
+        )
+        queue = ReplicationQueue(path=str(tmp_path / "queue.json"))
+        tg = await store_factory(config.stores["tg-main"])
+        data = bytes((i // 53) % 251 for i in range(96 * 1024))
+        uploading = asyncio.Event()
+        discord_down = asyncio.Event()
+        download_prefix = asyncio.Event()
+        stalled_download = asyncio.Event()
+        download_cancelled = asyncio.Event()
+        stalled_sends = 0
+        late_descriptor_requests = 0
+        never = asyncio.Event()
+
+        class Bot(FakeBot):
+            async def send_file(self, channel_id, data, name, caption=""):
+                nonlocal stalled_sends
+                if discord_down.is_set():
+                    stalled_sends += 1
+                    await never.wait()
+                sent = await super().send_file(channel_id, data, name, caption)
+                if name.startswith("[part1]"):
+                    uploading.set()
+                return sent
+
+            async def edit_text(self, channel_id, message_id, text):
+                nonlocal late_descriptor_requests
+                if discord_down.is_set():
+                    late_descriptor_requests += 1
+                    await never.wait()
+                return await super().edit_text(channel_id, message_id, text)
+
+            async def download(self, channel_id, message_id, begin, end):
+                chunks, size = await super().download(
+                    channel_id, message_id, begin, end
+                )
+
+                async def body():
+                    try:
+                        async for chunk in chunks:
+                            if discord_down.is_set():
+                                stalled_download.set()
+                                await never.wait()
+                            yield chunk
+                            if self.messages[message_id]["name"].startswith("[part1]"):
+                                download_prefix.set()
+                    finally:
+                        if discord_down.is_set():
+                            download_cancelled.set()
+
+                # Let both stores acquire pieces, like a network request.
+                await asyncio.sleep(0.001)
+                return body(), size
+
+        dc = DiscordStore(
+            [Bot(1)],
+            channel_id,
+            key=config.stores["dc-spare"].key,
+            max_part_bytes=4096,
+            max_concurrent_uploads=2,
+        )
+
+        async def stores(cfg):
+            return tg if cfg.backend == "telegram" else dc
+
+        client = await Client.create(
+            config.filesystems["media"], config, stores, replication=queue
+        )
+
+        class NoAuth(asyncssh.SSHServer):
+            def begin_auth(self, username: str) -> bool:
+                return False
+
+        def factory(chan):
+            server = TGFSSFTPServer(chan, {"media": client}, config)
+            server._user = AdminUser("admin")
+            return server
+
+        async with AsyncExitStack() as stack:
+            listener = await stack.enter_async_context(
+                asyncssh.listen(
+                    "127.0.0.1",
+                    0,
+                    server_factory=NoAuth,
+                    server_host_keys=[asyncssh.generate_private_key("ssh-ed25519")],
+                    sftp_factory=factory,
+                )
+            )
+            conn = await stack.enter_async_context(
+                asyncssh.connect(
+                    "127.0.0.1", listener.get_port(), username="test", known_hosts=None
+                )
+            )
+            sftp = await stack.enter_async_context(conn.start_sftp_client())
+            path = "/media/discord-outage.bin"
+            handle = await sftp.open(path, "wb")
+            await asyncio.wait_for(handle.write(data[:8192]), 2)
+            await asyncio.wait_for(uploading.wait(), 2)
+            discord_down.set()
+            for offset in range(8192, len(data), 8192):
+                await asyncio.wait_for(
+                    handle.write(data[offset : offset + 8192], offset), 2
+                )
+            await asyncio.wait_for(handle.close(), 2)
+            assert stalled_sends > 0
+            # The stalled optional descriptor edit must not hold up CLOSE.
+            assert late_descriptor_requests == 0
+            fr = tree(client).find_file("discord-outage.bin")
+            version = (await client.file_api.desc(fr)).get_latest_version()
+            assert version.store == tg.key and not version.has_copy_in(dc.key)
+            assert b"".join(tg.document_of(mid) for mid in version.message_ids) == data
+            assert [item.path for item in queue.pending("media")] == [
+                "/discord-outage.bin"
+            ]
+
+            discord_down.clear()
+            worker = ReplicationWorker(client, queue)
+            assert await asyncio.wait_for(worker.run_once(), 2) == 1
+            assert not queue.pending("media")
+            healed = (await client.file_api.desc(fr)).get_latest_version()
+            assert healed.id == version.id and healed.has_copy_in(dc.key)
+            assert fr.mirrors[dc.key] > 0
+
+            # Keep using the same SSH connection and file handle. The
+            # store stalls mid-response and stays down until after EOF.
+            async with await sftp.open(path, "rb") as handle:
+                download = asyncio.create_task(handle.read())
+                try:
+                    await asyncio.wait_for(download_prefix.wait(), 2)
+                    discord_down.set()
+                    await asyncio.wait_for(stalled_download.wait(), 2)
+                    assert await asyncio.wait_for(download, 2) == data
+                    assert download_cancelled.is_set()
+                finally:
+                    download.cancel()
+                    await asyncio.gather(download, return_exceptions=True)
+            discord_down.clear()
+
     async def test_sftp_paces_writes_and_waits_for_discord_to_confirm_close(self):
         raw = config_dict()
         raw["filesystems"]["media"]["sync"] = "tee"

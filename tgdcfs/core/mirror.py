@@ -53,6 +53,7 @@ which is which.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from dataclasses import dataclass, field
@@ -74,6 +75,7 @@ MIRROR_MODES: tuple[MirrorMode, ...] = ("auto", "forward", "reupload")
 
 # How long reads prefer the mirrors after a primary-store failure.
 PRIMARY_DEAD_SECONDS = 60.0
+TEE_DESCRIPTOR_TIMEOUT_S = 8.0
 
 
 @dataclass
@@ -110,6 +112,7 @@ class MirrorGroup:
         stores: List[MirrorStore],
         mode: MirrorMode = "auto",
         strict: bool = False,
+        tee: bool = False,
     ):
         if mode not in MIRROR_MODES:
             raise ValueError(f"Unknown mirror mode: {mode}")
@@ -119,6 +122,8 @@ class MirrorGroup:
         self._strict = strict
         self._by_key = {ch.key: ch for ch in stores}
         self._primary_dead_until = 0.0
+        self._bound_mirror_descriptors = tee and not strict
+        self._fd_mirror_dead_until: Dict[str, float] = {}
 
     @property
     def primary(self) -> IStore:
@@ -218,6 +223,7 @@ class MirrorGroup:
                     res.replicas[ch.key] = await self._replicate(
                         ch, source, message_ids, sizes, cache, name
                     )
+                self._fd_mirror_dead_until.pop(ch.key, None)
             except Exception as ex:
                 self._handle_write_error(ch.key, "content parts", ex)
         return res
@@ -272,9 +278,9 @@ class MirrorGroup:
             async def run(branch: TeeBranch) -> Replica:
                 stream = branch.stream()
                 try:
-                    sent = await ch.store.upload(
-                        FileMessageFromStream.new(stream=stream, size=size, name=name)
-                    )
+                    msg = FileMessageFromStream.new(stream=stream, size=size, name=name)
+                    msg.failover = branch.has_alternative
+                    sent = await ch.store.upload(msg)
                 finally:
                     await stream.aclose()
                 return Replica(
@@ -295,8 +301,11 @@ class MirrorGroup:
         replicas: Dict[str, Replica] = {}
         for key, outcome in results.items():
             if isinstance(outcome, Exception):
+                if self._bound_mirror_descriptors:
+                    self._mark_fd_mirror_dead(key)
                 self._handle_write_error(key, "tee'd content", outcome)
             else:
+                self._fd_mirror_dead_until.pop(key, None)
                 replicas[key] = outcome
         return replicas
 
@@ -579,24 +588,47 @@ class MirrorGroup:
         """
         res: Dict[str, int] = dict(existing or {})
         for ch in self._stores:
-            if ch.key == skip:
+            if ch.key == skip or time.monotonic() < self._fd_mirror_dead_until.get(
+                ch.key, 0
+            ):
                 continue
             try:
-                if mid := res.get(ch.key):
-                    try:
-                        res[ch.key] = await ch.store.edit_message_text(
-                            message_id=mid, message=text
-                        )
-                        continue
-                    except MessageNotFound:
-                        logger.warning(
-                            f"FD mirror message {mid} in store {ch.key} is "
-                            f"gone, sending a fresh copy"
-                        )
-                res[ch.key] = await ch.store.send_text(text)
+                # A failed optional mirror may not block the authoritative
+                # descriptor commit. A successful data repair clears the
+                # cooldown so backfill can refresh the descriptor at once.
+                async with asyncio.timeout(
+                    TEE_DESCRIPTOR_TIMEOUT_S if self._bound_mirror_descriptors else None
+                ):
+                    if mid := res.get(ch.key):
+                        try:
+                            res[ch.key] = await ch.store.edit_message_text(
+                                message_id=mid, message=text
+                            )
+                            continue
+                        except MessageNotFound:
+                            logger.warning(
+                                f"FD mirror message {mid} in store {ch.key} is "
+                                "gone, sending a fresh copy"
+                            )
+                    res[ch.key] = await ch.store.send_text(text)
+            except TimeoutError as ex:
+                error: Exception = ex
+                if self._bound_mirror_descriptors:
+                    self._mark_fd_mirror_dead(ch.key)
+                    error = TechnicalError(
+                        f"no confirmation within {TEE_DESCRIPTOR_TIMEOUT_S:g}s"
+                    )
+                self._handle_write_error(
+                    ch.key,
+                    "file descriptor",
+                    error,
+                )
             except Exception as ex:
                 self._handle_write_error(ch.key, "file descriptor", ex)
         return res
+
+    def _mark_fd_mirror_dead(self, key: str) -> None:
+        self._fd_mirror_dead_until[key] = time.monotonic() + PRIMARY_DEAD_SECONDS
 
     # -- pinned metadata ---------------------------------------------------
 

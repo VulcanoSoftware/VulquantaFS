@@ -37,7 +37,7 @@ from typing import (
 from lru import LRU  # type: ignore
 
 from tgdcfs.backends.base import IStore, StoreCapabilities, make_store_key
-from tgdcfs.errors import MessageNotFound, TechnicalError
+from tgdcfs.errors import MessageNotFound, RpcTimeoutError, TechnicalError
 from tgdcfs.reqres import (
     DownloadFileResp,
     FileMessageFromStream,
@@ -45,6 +45,7 @@ from tgdcfs.reqres import (
     MessageRespWithDocument,
     SentFileMessage,
     UploadableFileMessage,
+    aclose_content,
 )
 from tgdcfs.utils.message_cache import channel_cache
 
@@ -70,6 +71,10 @@ READ_CHUNK = 1024 * 1024
 # Discord attachments have been accepted. Bound that tail per file,
 # without shrinking the bot pool available to other files.
 LIVE_PARTS_IN_FLIGHT = 2
+# A silent Discord HTTP request (including the library's retries) must not
+# hold a mirrored live upload past FileZilla's 20s inactivity timeout.
+# Standalone uploads and background copies keep the normal retry policy.
+LIVE_PART_TIMEOUT_S = 12.0
 
 # Discord's error code for an edit of a message another user sent.
 CANNOT_EDIT_FOREIGN_MESSAGE = 50005
@@ -343,7 +348,7 @@ class DiscordStore(IStore):
         return SentFileMessage(message_id=sent.message_id, size=len(data))
 
     async def _send_part_with_slot(
-        self, data: bytes, name: str, unstarted: List[int]
+        self, data: bytes, name: str, unstarted: List[int], live: bool
     ) -> SentFileMessage:
         """Send one part with the upload slot ``upload`` acquired for it and
         release the slot afterwards. ``unstarted`` counts the tasks that
@@ -351,7 +356,16 @@ class DiscordStore(IStore):
         step never reaches its ``finally``, so ``upload`` releases for it."""
         unstarted[0] -= 1
         try:
-            return await self._send_part(data, name)
+            if not live:
+                return await self._send_part(data, name)
+            try:
+                async with asyncio.timeout(LIVE_PART_TIMEOUT_S):
+                    return await self._send_part(data, name)
+            except TimeoutError as ex:
+                raise RpcTimeoutError(
+                    f"Discord store {self.key} did not confirm {name} "
+                    f"within {LIVE_PART_TIMEOUT_S:g}s"
+                ) from ex
         finally:
             self._upload_slots.release()
 
@@ -370,6 +384,7 @@ class DiscordStore(IStore):
         size = file_msg.get_size()
         tasks: List[asyncio.Task[SentFileMessage]] = []
         unstarted = [0]
+        live = size < 0 and file_msg.failover and not file_msg.background
         try:
             index = 0
             remaining = size
@@ -379,7 +394,14 @@ class DiscordStore(IStore):
                 limit = self._max_part_bytes
                 if size >= 0:
                     limit = min(limit, remaining)
-                await self._upload_slots.acquire()
+                try:
+                    async with asyncio.timeout(LIVE_PART_TIMEOUT_S if live else None):
+                        await self._upload_slots.acquire()
+                except TimeoutError as ex:
+                    raise RpcTimeoutError(
+                        f"Discord store {self.key} has no free upload slot "
+                        f"after {LIVE_PART_TIMEOUT_S:g}s for {file_name}"
+                    ) from ex
                 try:
                     data = await self._read_part(file_msg, limit) if limit > 0 else b""
                 except BaseException:
@@ -393,7 +415,10 @@ class DiscordStore(IStore):
                 tasks.append(
                     asyncio.create_task(
                         self._send_part_with_slot(
-                            data, f"[part{index}]{file_name}", unstarted
+                            data,
+                            f"[part{index}]{file_name}",
+                            unstarted,
+                            live=live,
                         )
                     )
                 )
@@ -444,9 +469,12 @@ class DiscordStore(IStore):
             )
 
         async def guarded() -> AsyncIterator[bytes]:
-            async with self._download_slots:
-                async for chunk in chunks:
-                    yield chunk
+            try:
+                async with self._download_slots:
+                    async for chunk in chunks:
+                        yield chunk
+            finally:
+                await aclose_content(chunks)
 
         return DownloadFileResp(chunks=guarded(), size=size)
 

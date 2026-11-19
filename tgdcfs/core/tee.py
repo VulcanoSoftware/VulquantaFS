@@ -62,6 +62,7 @@ class TeeBranch:
         self._eof = False
         self._detached = False
         self._changed = asyncio.Condition()
+        self.has_alternative = False
 
     @property
     def buffered(self) -> int:
@@ -234,6 +235,10 @@ class TeeUpload:
         source_finished = False
         if upload_primary is not None:
             self.message.branches.insert(0, primary_branch)
+        # The mirror tasks start on the next event-loop turn. Tell each
+        # backend whether this upload has another potential data copy.
+        for branch in self.message.branches:
+            branch.has_alternative = len(self.message.branches) > 1
 
         async def primary() -> List[SentFileMessage] | None:
             if upload_primary is None:
@@ -244,6 +249,7 @@ class TeeUpload:
             msg.tags = self.message.tags
             msg.task_tracker = self.message.task_tracker
             msg.version_id = self.message.version_id
+            msg.failover = primary_branch.has_alternative
             try:
                 return await upload_primary(msg)
             finally:

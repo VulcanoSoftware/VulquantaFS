@@ -1,3 +1,4 @@
+import asyncio
 import logging
 from dataclasses import dataclass
 from typing import AsyncIterator, Dict, Generator, Iterable, List, Optional, Sequence
@@ -6,7 +7,12 @@ from tgdcfs.backends.base import IStore
 from tgdcfs.core.local_cache import LocalCache, StagedFileMessage, version_cache_for
 from tgdcfs.core.mirror import MirrorGroup, MirrorStore
 from tgdcfs.core.model import TGFSFileVersion
-from tgdcfs.core.multisource import MultiSourceRead, StoreView, read_slots
+from tgdcfs.core.multisource import (
+    PIECE_FAILOVER_TIMEOUT_S,
+    MultiSourceRead,
+    StoreView,
+    read_slots,
+)
 from tgdcfs.core.repository.interface import IFileContentRepository
 from tgdcfs.core.tee import TeeUpload
 from tgdcfs.errors import TechnicalError
@@ -508,6 +514,8 @@ class StoreFileContentRepository(IFileContentRepository):
         part_idx: int,
         begin: int,
         end: int,
+        stalled: set[str],
+        has_other_layout: bool,
     ) -> AsyncIterator[bytes]:
         """Stream one part, failing over to the next candidate on error.
 
@@ -517,20 +525,37 @@ class StoreFileContentRepository(IFileContentRepository):
         sources = layout.candidates[part_idx]
         served = 0
         last_ex: Optional[Exception] = None
-        for store, mid in sources:
+        for idx, (store, mid) in enumerate(sources):
+            if store.key in stalled:
+                continue
+            can_fail_over = has_other_layout or any(
+                other.key not in stalled for other, _ in sources[idx + 1 :]
+            )
+            deadline = PIECE_FAILOVER_TIMEOUT_S if can_fail_over else None
             try:
-                resp = await store.download_file(mid, begin + served, end)
-                async for chunk in resp.chunks:
-                    yield chunk
-                    served += len(chunk)
+                async with asyncio.timeout(deadline):
+                    resp = await store.download_file(mid, begin + served, end)
+                try:
+                    while True:
+                        async with asyncio.timeout(deadline):
+                            chunk = await anext(resp.chunks, None)
+                        if chunk is None:
+                            break
+                        yield chunk
+                        served += len(chunk)
+                finally:
+                    await aclose_content(resp.chunks)
                 return
             except Exception as ex:
+                if isinstance(ex, TimeoutError) and can_fail_over:
+                    stalled.add(store.key)
                 last_ex = ex
                 if store is self._store and self._mirror_group:
                     self._mirror_group.mark_primary_dead()
                 logger.warning(
                     f"Downloading part {part_idx} (message {mid}) of layout "
-                    f"'{layout.label}' from store {store.key} failed: {ex}"
+                    f"'{layout.label}' from store {store.key} failed: "
+                    f"{str(ex) or type(ex).__name__}"
                 )
         if last_ex:
             raise last_ex
@@ -539,10 +564,18 @@ class StoreFileContentRepository(IFileContentRepository):
         )
 
     def _stream_layout(
-        self, layout: Layout, version_id: str, begin: int, end: int
+        self,
+        layout: Layout,
+        version_id: str,
+        begin: int,
+        end: int,
+        stalled: set[str],
+        has_other_layout: bool,
     ) -> FileContent:
         parts = [
-            self._download_part(layout, part_idx, part_begin, part_end)
+            self._download_part(
+                layout, part_idx, part_begin, part_end, stalled, has_other_layout
+            )
             for part_idx, _, part_begin, part_end in self._map_range(
                 [mid for sources in layout.candidates for _, mid in sources[:1]],
                 layout.part_sizes,
@@ -673,11 +706,20 @@ class StoreFileContentRepository(IFileContentRepository):
         async def stream() -> AsyncIterator[bytes]:
             served = 0
             last_ex: Optional[Exception] = None
-            for layout in layouts:
+            stalled: set[str] = set()
+            for i, layout in enumerate(layouts):
+                if begin + served > last:
+                    return
+                content = self._stream_layout(
+                    layout,
+                    version_id,
+                    begin + served,
+                    end,
+                    stalled,
+                    i + 1 < len(layouts),
+                )
                 try:
-                    async for chunk in self._stream_layout(
-                        layout, version_id, begin + served, end
-                    ):
+                    async for chunk in content:
                         yield chunk
                         served += len(chunk)
                     return
@@ -687,6 +729,8 @@ class StoreFileContentRepository(IFileContentRepository):
                         f"Layout '{layout.label}' of {name}@{version_id} failed after "
                         f"{served} bytes: {ex}; trying the next one"
                     )
+                finally:
+                    await aclose_content(content)
             if last_ex:
                 raise last_ex
 

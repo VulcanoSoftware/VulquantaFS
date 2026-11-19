@@ -460,6 +460,47 @@ class TestUpload:
         assert [s.size for s in sent] == [10] * 6
         assert len(reads) == 6
 
+    async def test_live_upload_fails_over_when_a_background_send_holds_the_slot(
+        self, bot, mocker
+    ):
+        mocker.patch(
+            "tgdcfs.backends.discord.store.LIVE_PART_TIMEOUT_S", 0.05, create=True
+        )
+        real = bot.send_file
+        entered = asyncio.Event()
+        resume = asyncio.Event()
+        store = DiscordStore(
+            [bot], CHANNEL, max_part_bytes=10, max_concurrent_uploads=1
+        )
+
+        async def send(channel_id, data, name, caption=""):
+            if name.endswith("background"):
+                entered.set()
+                await resume.wait()
+            return await real(channel_id, data, name, caption)
+
+        mocker.patch.object(bot, "send_file", side_effect=send)
+
+        async def source():
+            yield b"new part"
+
+        background = asyncio.create_task(
+            store.upload(FileMessageFromBuffer.new(b"old part", "background"))
+        )
+        try:
+            await asyncio.wait_for(entered.wait(), 1)
+            mirrored = FileMessageFromStream.new(source(), name="live")
+            mirrored.failover = True
+            with pytest.raises(TechnicalError, match="no free upload slot"):
+                await asyncio.wait_for(store.upload(mirrored), 1)
+            assert not background.done()
+        finally:
+            resume.set()
+            sent = await asyncio.wait_for(background, 1)
+        assert len(sent) == 1
+        retried = await store.upload(FileMessageFromStream.new(source(), name="live"))
+        assert len(retried) == 1
+
     async def test_transient_failures_are_retried(self, store, bot):
         bot.fail_next["send_file"] = [RateLimited(), RateLimited()]
         sent = await store.upload(FileMessageFromBuffer.new(buffer=b"data", name="f"))

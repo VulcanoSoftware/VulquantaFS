@@ -301,16 +301,28 @@ async def backfill_file(
             # needed for replication.
             cache.release()
 
-    fd_missing = set(mirror_group.store_keys) - {
-        key for key, mid in fr.mirrors.items() if mid > 0
-    }
+    fd_missing = (
+        set(mirror_group.store_keys)
+        - {key for key, mid in fr.mirrors.items() if mid > 0}
+        - {fr.store}
+    )
 
     if changed or fd_missing:
         # Commit point: the (possibly updated) mirrors map is persisted
         # in the FD message, and the FD itself gets its mirror copies.
         resp = await fd_repo.save(fd, fr)
         _sync_ref(fr, resp)
-        if fd_missing:
+        descriptors_missing = (
+            fd_missing
+            - {key for key, mid in fr.mirrors.items() if mid > 0}
+            - {fr.store}
+        )
+        if descriptors_missing:
+            report.failures.append(
+                f"{fr.name}: could not refresh the descriptor in "
+                f"{', '.join(sorted(descriptors_missing))}"
+            )
+        if fd_missing - descriptors_missing:
             report.fds_mirrored += 1
 
 

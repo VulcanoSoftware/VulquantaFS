@@ -20,7 +20,8 @@ from dataclasses import dataclass, field
 from typing import AsyncIterator, Callable, Dict, Generator, List, Optional, Set
 
 from tgdcfs.backends.base import IStore
-from tgdcfs.errors import TechnicalError
+from tgdcfs.errors import RpcTimeoutError, TechnicalError
+from tgdcfs.reqres import aclose_content
 
 logger = logging.getLogger(__name__)
 
@@ -28,6 +29,10 @@ logger = logging.getLogger(__name__)
 BENCH_AFTER = 2
 # Workers per store when the store does not say how many it can keep busy.
 DEFAULT_SLOTS = 2
+# One stalled piece prevents later pieces from reaching the client even
+# when the other store is reading normally. Leave time for it to fetch
+# the replacement before an SFTP client times out.
+PIECE_FAILOVER_TIMEOUT_S = 10.0
 
 # Maps ``[begin, end]`` of a version onto ``(part index, message id,
 # begin within the part, end within the part)`` for one store's layout.
@@ -127,8 +132,11 @@ class MultiSourceRead:
             piece.end,
         ):
             resp = await view.store.download_file(mid, part_begin, part_end)
-            async for chunk in resp.chunks:
-                out.extend(chunk)
+            try:
+                async for chunk in resp.chunks:
+                    out.extend(chunk)
+            finally:
+                await aclose_content(resp.chunks)
         expected = piece.end - piece.begin + 1
         if len(out) != expected:
             raise TechnicalError(
@@ -136,6 +144,24 @@ class MultiSourceRead:
                 f"({expected} expected)"
             )
         return bytes(out)
+
+    async def _fetch_with_failover(self, view: StoreView, piece: _Piece) -> bytes:
+        if not any(
+            other.key != view.key
+            and other.key not in self._benched
+            and other.key not in piece.tried
+            for other in self._views
+        ):
+            # Don't impose a failover deadline on the only remaining copy.
+            return await self._fetch(view, piece)
+        try:
+            async with asyncio.timeout(PIECE_FAILOVER_TIMEOUT_S):
+                return await self._fetch(view, piece)
+        except TimeoutError as ex:
+            raise RpcTimeoutError(
+                f"{view.key} did not finish serving bytes {piece.begin}-{piece.end} "
+                f"within {PIECE_FAILOVER_TIMEOUT_S:g}s"
+            ) from ex
 
     async def _worker(self, view: StoreView) -> None:
         while True:
@@ -156,7 +182,7 @@ class MultiSourceRead:
                         return
                     await self._changed.wait()
             try:
-                data = await self._fetch(view, piece)
+                data = await self._fetch_with_failover(view, piece)
             except Exception as ex:
                 async with self._changed:
                     piece.tried.add(view.key)

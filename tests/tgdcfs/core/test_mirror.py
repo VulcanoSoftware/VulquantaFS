@@ -1,3 +1,4 @@
+import asyncio
 import datetime
 import json
 from types import SimpleNamespace
@@ -462,6 +463,29 @@ class TestMirrorGroup:
 
         # A stale FD copy is still recoverable, so the id is kept.
         assert res == {"tg:999": 20}
+
+    @pytest.mark.asyncio
+    async def test_tee_does_not_wait_indefinitely_for_an_optional_descriptor(
+        self, mocker
+    ):
+        group, primary, mirror = make_group(mocker)
+        group = MirrorGroup(primary, group.stores, tee=True)
+        mocker.patch("tgdcfs.core.mirror.TEE_DESCRIPTOR_TIMEOUT_S", 0.025)
+
+        async def hang(*args, **kwargs):
+            await asyncio.Event().wait()
+
+        mirror.send_text.side_effect = hang
+        assert await asyncio.wait_for(group.mirror_fd("{}"), 1) == {}
+        assert await group.mirror_fd("{}") == {}
+        mirror.send_text.assert_awaited_once_with("{}")
+
+        # Once the store confirms data, it is worth trying its descriptor
+        # immediately rather than waiting for the cooldown.
+        group.collect_tee({"tg:999": Replica(message_ids=[51], part_sizes=[4])})
+        mirror.send_text.side_effect = None
+        mirror.send_text.return_value = 52
+        assert await group.mirror_fd("{}") == {"tg:999": 52}
 
 
 def make_sent_version(mirrors=None):
