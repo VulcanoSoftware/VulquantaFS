@@ -18,6 +18,17 @@ the fact on the commits that shipped them.
 
 ### Fixed
 
+- Deleting files and folders is no longer held up by a metadata mirror that
+  keeps failing. A mirror that had missed a write (a GitLab mirror whose
+  full re-sync ran into the server's deadline, for instance) was written
+  again by *every* metadata push, and by the background heal at the same
+  time, so each delete queued behind two of those minute-long attempts --
+  about 2.5 minutes per file over SFTP. A stale mirror is now left to the
+  background heal; pushes write the primary and the mirrors that are up to
+  date, and only when the primary failed do they still try a stale mirror.
+  A heal write that raced a newer push no longer clears the stale mark, so
+  the mirror cannot end up behind without anyone noticing.
+
 - The file data of a replicated file system now heals itself the way the
   metadata does. With ``sync: tee`` a mirror write that failed (a mirror
   store being temporarily down, for instance) was detected and the file's

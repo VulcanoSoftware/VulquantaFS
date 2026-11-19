@@ -10,10 +10,14 @@ or Discord, each its own store), a GitHub repo and a GitLab repo.
 
 Behaviour:
 
-* Every ``push`` writes the primary store and then every mirror. A
-  mirror that fails is logged, marked *stale* and skipped -- the write
-  still succeeds as long as one store holds the tree, and the next push
-  writes the stale store again.
+* Every ``push`` writes the primary store and then every mirror that is
+  up to date. A mirror that fails is logged and marked *stale* -- the
+  write still succeeds as long as one store holds the tree. A stale
+  mirror is *not* written by the pushes that follow: a full re-sync of a
+  struggling store can take a minute or more (a GitLab commit that runs
+  into its deadline, say), and no file operation should wait for it. The
+  background heal re-writes it instead. Only when the primary failed too
+  does a push still try the stale mirrors, so the tree lands somewhere.
 * ``init`` loads the tree from the primary; when the primary cannot be
   read (store down, repository unreachable) it fails over to the first
   mirror that holds one. A store that holds no document at all counts as
@@ -93,6 +97,10 @@ class ReplicatedMetadataRepository(IMetaDataRepository):
         # (a pinned copy whose messages are too small), with the reason.
         # Re-checked on every heal: a smaller tree fits again.
         self._skipped: dict[str, str] = {}
+        # Counts the pushes. A write that was started before a later push
+        # does not carry that push's changes, so it cannot clear a stale
+        # mark (see ``_write``).
+        self._generation = 0
         super().__init__()
         # Read as a plain attribute by the API layer, so it is copied from
         # the primary instead of forwarded dynamically.
@@ -124,7 +132,9 @@ class ReplicatedMetadataRepository(IMetaDataRepository):
     async def init(self) -> None:
         tree = await self._load()
         self.metadata = tree
-        await self.push()
+        # The boot syncs the stores that missed writes right away; only
+        # the pushes of a running system leave them to the heal.
+        await self._push(sync_stale_mirrors=True)
 
     async def _load(self) -> TGFSMetadata:
         """The tree to serve: the most recent one across the stores.
@@ -220,13 +230,27 @@ class ReplicatedMetadataRepository(IMetaDataRepository):
     # -- writing ---------------------------------------------------------------
 
     async def push(self) -> None:
+        await self._push(sync_stale_mirrors=False)
+
+    async def _push(self, sync_stale_mirrors: bool) -> None:
         if not self.metadata:
             raise MetadataNotInitialized()
         self._stamp_revision()
+        self._generation += 1
 
         any_store_ok = False
         errors: List[str] = []
         for i, store in enumerate(self._stores):
+            if (
+                i > 0
+                and any_store_ok
+                and not sync_stale_mirrors
+                and store.key in self._stale
+            ):
+                # A mirror that already missed a write is brought in line
+                # by the heal, off the request path. Waiting for it here
+                # made every file operation pay the store's timeouts.
+                continue
             # The primary gets its regular write (a github repo primary has
             # already written incrementally while the tree was mutated); the
             # mirrors always get the full sync, since they may have missed
@@ -262,6 +286,7 @@ class ReplicatedMetadataRepository(IMetaDataRepository):
         """Write the whole tree to ``store``; reports success and, on
         failure, a short reason. Failures mark the store stale (or
         skipped, when it cannot hold the document at all) for the heal."""
+        generation = self._generation
         try:
             if full:
                 await store.repo.push_full()
@@ -285,7 +310,10 @@ class ReplicatedMetadataRepository(IMetaDataRepository):
                 f"be re-synced once it is available again: {reason}"
             )
             return False, reason
-        self._stale.discard(store.key)
+        if generation == self._generation:
+            self._stale.discard(store.key)
+        # else: the tree changed while this write ran, so the store may
+        # lack those changes; it stays stale and the heal writes it again.
         self._skipped.pop(store.key, None)
         return True, None
 

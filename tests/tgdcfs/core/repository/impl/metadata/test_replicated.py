@@ -326,19 +326,80 @@ class TestPush:
             await layer.push()
         assert layer.stale_stores() == ["mirror", "primary"]
 
-    async def test_a_recovered_store_is_retried_on_the_next_push(self):
+    async def test_a_stale_mirror_is_left_to_the_heal(self):
         primary = FakeMetadataRepo("primary")
         mirror = FakeMetadataRepo("mirror", push_full_error=TechnicalError("down"))
         layer = replicated(primary, mirror)
         layer.metadata = tree("a")
         await layer.push()
-        assert "mirror" in layer.stale_stores()
+        assert layer.stale_stores() == ["mirror"]
+        assert mirror.push_full_calls == 1
 
+        # Even a mirror that came back is not waited for by the push: the
+        # file operation that triggered it must not pay for a re-sync.
         mirror.push_full_error = None
         layer.metadata.dir.create_dir("b")
         await layer.push()
 
+        assert mirror.push_full_calls == 1
+        assert primary.push_calls == 2
+        assert layer.stale_stores() == ["mirror"]
+
+        await layer.heal()
+
         assert mirror.stored is layer.metadata
+        assert mirror.push_full_calls == 2
+        assert layer.stale_stores() == []
+
+    async def test_a_stale_mirror_is_still_tried_when_the_primary_failed(self):
+        primary = FakeMetadataRepo("primary", push_error=TechnicalError("down"))
+        mirror = FakeMetadataRepo("mirror")
+        layer = replicated(primary, mirror)
+        layer.metadata = tree("a")
+        layer._stale.add("mirror")
+
+        await layer.push()
+
+        # The tree has to land somewhere, so the stale mirror is written.
+        assert mirror.stored is layer.metadata
+        assert mirror.push_full_calls == 1
+
+    async def test_the_boot_syncs_a_stale_mirror_right_away(self):
+        primary = FakeMetadataRepo("primary", tree("a"))
+        mirror = FakeMetadataRepo("mirror", empty=True)
+        layer = replicated(primary, mirror)
+
+        await layer.init()
+
+        assert mirror.stored is layer.metadata
+        assert layer.stale_stores() == []
+
+    async def test_a_heal_that_raced_a_push_keeps_the_store_stale(self):
+        primary = FakeMetadataRepo("primary")
+        mirror = FakeMetadataRepo("mirror")
+        layer = replicated(primary, mirror)
+        layer.metadata = tree("a")
+        layer._stale.add("mirror")
+
+        original = mirror.push_full
+
+        async def push_full_while_a_push_lands():
+            await original()
+            # A file operation pushes while the mirror is being written.
+            layer.metadata.dir.create_dir("b")
+            await layer.push()
+
+        mirror.push_full = push_full_while_a_push_lands
+
+        await layer.heal()
+
+        # The write started before that push, so it may lack its changes.
+        assert layer.stale_stores() == ["mirror"]
+        assert mirror.push_full_calls == 1
+
+        mirror.push_full = original
+        await layer.heal()
+
         assert layer.stale_stores() == []
         assert mirror.push_full_calls == 2
 
