@@ -400,9 +400,11 @@ class TelegramStore(MessageBroker, IStore):
             api = self.tdlib.next_bot
 
         uploader = FileUploader(api, file_msg)
+        # Bot identity is not needed to upload. Looking it up here would
+        # add a network call before the bounded part requests even start.
         logger.info(
             f"Uploading file {file_msg.name} of size {file_msg.size} bytes to "
-            f"channel {self.private_file_channel} using {(await api.get_me()).name}."
+            f"channel {self.private_file_channel}."
         )
         return uploader, await uploader.upload()
 

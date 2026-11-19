@@ -315,6 +315,27 @@ class TestMirrorGroupTee:
         assert all(isinstance(o, Exception) for o in outcome.values())
         assert all(b.detached for b in tee.message.branches)
 
+    async def test_cancelling_collection_stops_all_mirror_uploads(self):
+        tg, a, b = telegram_like(), discord_like("dc:1"), discord_like("dc:2")
+        a.hold_uploads = b.hold_uploads = asyncio.Event()
+        tee = make_group(tg, a, b).tee(
+            FileMessageFromBuffer.new(buffer=DATA, name="a.bin"), 16
+        )
+        assert tee is not None
+
+        collecting = asyncio.create_task(tee.collect())
+        await asyncio.sleep(0)
+        collecting.cancel()
+        try:
+            done, _ = await asyncio.wait({collecting}, timeout=2)
+            assert collecting in done
+            with pytest.raises(asyncio.CancelledError):
+                await collecting
+            assert all(branch.detached for branch in tee.message.branches)
+        finally:
+            a.hold_uploads.set()
+            await asyncio.gather(collecting, return_exceptions=True)
+
     async def test_an_unknown_size_is_still_teed(self):
         tg, dc = telegram_like(), discord_like()
         group = make_group(tg, dc)

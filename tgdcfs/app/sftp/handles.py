@@ -5,7 +5,7 @@ import os
 import shutil
 import tempfile
 import time
-from typing import AsyncIterator, List, Optional
+from typing import AsyncIterator, Awaitable, Callable, List, Optional
 
 from tgdcfs.core import Ops
 from tgdcfs.errors import TechnicalError
@@ -196,12 +196,14 @@ class WriteHandle(Handle):
         buffer_max_bytes: int,
         buffer_dir: Optional[str] = None,
         max_gap_bytes: int = DEFAULT_MAX_AHEAD_GAP_BYTES,
+        wait_disconnected: Optional[Callable[[], Awaitable[None]]] = None,
     ):
         self._ops = ops
         self._path = path
         self._buffer_max_bytes = buffer_max_bytes
         self._buffer_dir = buffer_dir
         self._max_gap_bytes = max_gap_bytes
+        self._wait_disconnected = wait_disconnected
 
         self._queue: Optional[asyncio.Queue[Optional[bytes]]] = None
         self._task: Optional[asyncio.Task] = None
@@ -490,7 +492,10 @@ class WriteHandle(Handle):
 
         logger.info("Streaming upload of %s started", self._path)
         try:
-            await self._ops.upload_from_stream(stream(), -1, self._path)
+            await self._upload_until_disconnect(stream())
+        except HandleClosedError as ex:
+            self._error = ex
+            logger.debug("Aborting upload of %s: %s", self._path, ex)
         except Exception as ex:
             self._error = ex
             logger.error(
@@ -513,6 +518,32 @@ class WriteHandle(Handle):
         finally:
             async with cond:
                 cond.notify_all()
+
+    async def _upload_until_disconnect(self, stream: AsyncIterator[bytes]) -> None:
+        if self._wait_disconnected is None:
+            await self._ops.upload_from_stream(stream, -1, self._path)
+            return
+
+        # AsyncSSH runs requests serially. If a write is waiting on a full
+        # queue (or CLOSE is waiting on the backend), AsyncSSH cannot get
+        # to its normal handle cleanup even when the channel is gone.
+        upload = asyncio.create_task(
+            self._ops.upload_from_stream(stream, -1, self._path)
+        )
+        disconnected = asyncio.ensure_future(self._wait_disconnected())
+        try:
+            done, _ = await asyncio.wait(
+                {upload, disconnected}, return_when=asyncio.FIRST_COMPLETED
+            )
+            if upload in done:
+                upload.result()
+            else:
+                disconnected.result()
+                raise HandleClosedError("SFTP channel closed during upload")
+        finally:
+            for task in (upload, disconnected):
+                task.cancel()
+            await asyncio.gather(upload, disconnected, return_exceptions=True)
 
     def _raise_if_failed(self) -> None:
         if self._error is not None:

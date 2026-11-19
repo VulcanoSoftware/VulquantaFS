@@ -212,16 +212,23 @@ class TeeUpload:
 
     async def collect(self) -> Dict[str, Replica | Exception]:
         """Wait for every mirror; a failed one is returned as its error."""
-        await self.message.finish()
-        res: Dict[str, Replica | Exception] = {}
-        for key, task in self._tasks.items():
-            try:
-                res[key] = await task
-            except asyncio.CancelledError:
-                res[key] = TechnicalError(f"tee upload into {key} was cancelled")
-            except Exception as ex:
-                res[key] = ex
-        return res
+        try:
+            await self.message.finish()
+            results = await asyncio.gather(
+                *self._tasks.values(), return_exceptions=True
+            )
+        except asyncio.CancelledError:
+            await self.abort()
+            raise
+        outcomes: Dict[str, Replica | Exception] = {}
+        for key, result in zip(self._tasks, results):
+            if isinstance(result, asyncio.CancelledError):
+                result = TechnicalError(f"tee upload into {key} was cancelled")
+            if isinstance(result, (Replica, Exception)):
+                outcomes[key] = result
+            else:
+                raise result
+        return outcomes
 
     async def abort(self) -> None:
         """The primary upload failed: stop every mirror upload."""
