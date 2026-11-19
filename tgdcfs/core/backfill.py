@@ -208,10 +208,12 @@ async def backfill_file(
         return
 
     fd = await fd_repo.get(fr, include_all_versions=True)  # type: ignore[call-arg]
+    if not fd.complete:
+        # A store outage can make validation return a partial descriptor.
+        # Do not drop queued work or save an incompletely checked version list.
+        report.failures.append(f"{fr.name}: file descriptor is temporarily unavailable")
+        return
     if not fd.get_versions():
-        # Unreadable or fully invalid descriptor (fd_repo.get returns an
-        # empty FD in that case). Never save it back -- that would
-        # overwrite the real descriptor message with an empty one.
         return
 
     # Write-back uploads first: a pending version has no store copy at all
@@ -247,6 +249,13 @@ async def backfill_file(
         # the current primary first; that copy becomes its primary layout.
         if not version.owned_by(mirror_group.primary.key):
             try:
+                logger.info(
+                    "Restoring %s@%s from %s to primary store %s",
+                    fr.name,
+                    version.id,
+                    version.store,
+                    mirror_group.primary.key,
+                )
                 if await mirror_group.copy_into_primary(version, name=name):
                     report.versions_promoted += 1
                     changed = True

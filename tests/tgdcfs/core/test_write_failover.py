@@ -9,6 +9,7 @@ and descriptor move back to Telegram once it accepts writes again.
 
 import asyncio
 from contextlib import AsyncExitStack
+from types import SimpleNamespace
 from typing import List, Tuple, cast
 
 import asyncssh
@@ -19,12 +20,15 @@ from tests.tgdcfs.backends.discord.test_store import FakeBot, FakeChannel
 from tgdcfs.app.sftp.server import TGFSSFTPServer
 from tgdcfs.auth.user import AdminUser
 from tgdcfs.backends.discord.store import DiscordStore
-from tgdcfs.config import Config, EncryptionConfig
+from tgdcfs.backends.telegram import store as telegram_store
+from tgdcfs.backends.telegram.store import TelegramStore
+from tgdcfs.config import Config, EncryptionConfig, TransferConfig
 from tgdcfs.core.client import Client
 from tgdcfs.core.replication import ReplicationQueue, ReplicationWorker
 from tgdcfs.crypto.header import MAGIC
 from tgdcfs.errors import FileOrDirectoryDoesNotExist, TechnicalError
-from tgdcfs.reqres import FileMessageFromBuffer
+from tgdcfs.reqres import FileMessageFromBuffer, SaveFilePartResp, SendMessageResp
+from tgdcfs.utils.message_cache import global_message_cache
 
 pytestmark = pytest.mark.asyncio
 
@@ -121,8 +125,10 @@ def read(client: Client, fr, name: str) -> bytes:
 class TestWriteFailover:
     @pytest.mark.parametrize("encrypt", [False, True], ids=["plain", "encrypted"])
     async def test_one_sftp_session_survives_primary_loss_and_heals(
-        self, tmp_path, mocker, encrypt
+        self, tmp_path, mocker, caplog, encrypt
     ):
+        caplog.set_level("INFO", logger="tgdcfs.core.replication")
+        caplog.set_level("INFO", logger="tgdcfs.backends.telegram.store")
         raw = config_dict()
         raw["filesystems"]["media"]["sync"] = "tee"
         # Discord's message cache is per channel, and the two fake channels
@@ -148,6 +154,7 @@ class TestWriteFailover:
         )
         discord_channel = FakeChannel()
         discord_sent = asyncio.Event()
+        limit_attachment_lookups = False
 
         class Bot(FakeBot):
             async def send_file(self, channel_id, data, name, caption=""):
@@ -155,11 +162,19 @@ class TestWriteFailover:
                     discord_sent.set()
                 return await super().send_file(channel_id, data, name, caption)
 
+            async def get_messages(self, channel_id, message_ids):
+                if limit_attachment_lookups and any(
+                    self.messages.get(mid, {}).get("name", "").startswith("[part")
+                    for mid in message_ids
+                ):
+                    raise AssertionError("Fetched recently uploaded Discord media")
+                return await super().get_messages(channel_id, message_ids)
+
         dc = DiscordStore(
             [Bot(1, discord_channel), Bot(2, discord_channel)],
             channel_id,
             key=config.stores["dc-spare"].key,
-            max_part_bytes=4096,
+            max_part_bytes=512,
             max_concurrent_uploads=2,
         )
 
@@ -178,11 +193,34 @@ class TestWriteFailover:
         primary_read = asyncio.Event()
         outage = asyncio.Event()
         primary_failed = asyncio.Event()
+        publishing = asyncio.Event()
+        release_publish = asyncio.Event()
         original_upload = tg.upload
+        telegram_chunks: dict[int, dict[int, bytes]] = {}
+
+        class TelegramTransport:
+            async def save_file_part(self, req):
+                telegram_chunks.setdefault(req.file_id, {})[req.file_part] = req.bytes
+                return SaveFilePartResp(success=True)
+
+            async def send_small_file(self, req):
+                # As in production, successful part RPCs alone do not
+                # publish any document in the channel.
+                publishing.set()
+                await release_publish.wait()
+                chunks = telegram_chunks[req.file.id]
+                payload = b"".join(chunks[i] for i in range(req.file.parts))
+                return SendMessageResp(
+                    message_id=tg._add(document=payload, name=req.name)
+                )
+
+        telegram = TelegramStore(SimpleNamespace(next_bot=TelegramTransport()), 1001)  # type: ignore[arg-type]
 
         async def upload(msg):
             if outage.is_set():
-                return await original_upload(msg)
+                if tg.fail:
+                    return await original_upload(msg)
+                return await telegram.upload(msg)
             await msg.open()
             prefix = await msg.read(2048)
             if encrypt:
@@ -239,6 +277,7 @@ class TestWriteFailover:
         fr = tree(client).find_file("outage.bin")
         failed_over = (await client.file_api.desc(fr)).get_latest_version()
         assert failed_over.store == dc.key and fr.store == dc.key
+        assert len(failed_over.message_ids) > 90
         stored = b"".join(
             discord_channel.messages[mid]["data"] for mid in failed_over.message_ids
         )
@@ -255,8 +294,35 @@ class TestWriteFailover:
         assert persisted.pending("media")
 
         tg.fail.clear()
-        assert await worker.process_one("/outage.bin")
+        limit_attachment_lookups = True
+        mocker.patch.object(TransferConfig, "upload_part_size_bytes", 4096)
+        foreground_deadline = mocker.spy(telegram_store, "bounded_part")
+        persisted.retry_now()
+        worker.start()
+        try:
+            await asyncio.wait_for(publishing.wait(), 3)
+            foreground_deadline.assert_not_called()
+            assert fr.store == dc.key and persisted.pending("media")
+        finally:
+            await worker.stop()
+
+        # Simulate stopping the server while Telegram is publishing,
+        # then resume the on-disk work without re-uploading from SFTP.
+        persisted = ReplicationQueue(path=queue_path)
+        worker = ReplicationWorker(client, persisted)
+        assert [item.path for item in persisted.pending("media")] == ["/outage.bin"]
+        global_message_cache.pop(channel_id, None)
+        assert await worker.run_once() == 0  # The cold cache hits the simulated limit.
+        assert [item.path for item in persisted.pending("media")] == ["/outage.bin"]
+
+        limit_attachment_lookups = False
+        persisted.retry_now()
+        release_publish.set()
+        assert await worker.run_once() == 1
         assert not persisted.pending("media")
+        assert "interrupted; still queued" in caplog.text
+        assert "Telegram published [part1]" in caplog.text
+        assert "(1 versions restored to primary)" in caplog.text
         healed = (await client.file_api.desc(fr)).get_latest_version()
         assert healed.id == failed_over.id and healed.store == tg.key
         assert fr.store == tg.key and healed.has_copy_in(dc.key)

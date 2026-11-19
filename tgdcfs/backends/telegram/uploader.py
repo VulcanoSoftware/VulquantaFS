@@ -243,7 +243,12 @@ class FileUploader:
                 return 0
             size_to_read = min(self._file_size - self._read_size, self._chunk_size)
             content = await self._read(size_to_read)
-            self._read_size += size_to_read
+            if len(content) != size_to_read:
+                raise TechnicalError(
+                    f"Premature EOF uploading {self._file_name}: read "
+                    f"{self._read_size + len(content)} of {self._file_size} bytes"
+                )
+            self._read_size += len(content)
 
         await self._upload_chunk(FileChunk(content=content, file_part=part))
         return size_to_read
@@ -293,7 +298,7 @@ class FileUploader:
         ]
         try:
             await asyncio.gather(*workers)
-        except Exception:
+        except BaseException:
             # One dead part makes the whole file_id unusable, so the other
             # workers should stop feeding it instead of uploading into a
             # file that can never be sent.

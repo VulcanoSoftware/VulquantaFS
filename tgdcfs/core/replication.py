@@ -218,18 +218,35 @@ class ReplicationWorker:
             self._queue.done(self.name, path)
             return True
         report = BackfillReport()
+        started = time.monotonic()
+        logger.info("Background replication of %s in '%s' started", path, self.name)
         try:
             await backfill_file(self._client, fr, verify=False, report=report)
             if report.failures:
                 raise RuntimeError("; ".join(report.failures))
             if self._client.metadata_api:
                 await self._client.metadata_api.push()
+        except asyncio.CancelledError:
+            logger.info(
+                "Background replication of %s in '%s' interrupted; still queued",
+                path,
+                self.name,
+            )
+            raise
         except Exception as ex:
             logger.warning(f"Replication of {path} in '{self.name}' failed: {ex}")
             self._queue.failed(self.name, path, str(ex))
             return False
         self.last_report = report
         self._queue.done(self.name, path)
+        logger.info(
+            "Background replication of %s in '%s' completed in %.1fs "
+            "(%d versions restored to primary)",
+            path,
+            self.name,
+            time.monotonic() - started,
+            report.versions_promoted,
+        )
         return True
 
     async def run_once(self) -> int:

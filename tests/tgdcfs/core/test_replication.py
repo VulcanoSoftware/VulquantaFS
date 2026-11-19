@@ -411,6 +411,32 @@ class TestBackgroundSync:
         queue.retry_now()
         assert await worker.run_once() == 1
 
+    async def test_worker_keeps_item_when_descriptor_is_temporarily_unreadable(
+        self, mocker
+    ):
+        queue = ReplicationQueue(None)
+        stack = await Stack(
+            telegram_like(), discord_like(), inline=False, queue=queue
+        ).init()
+        await stack.put("a.bin", DATA)
+        # The shared metadata store can stay up even if both data
+        # endpoints are temporarily unable to serve the descriptor.
+        push = mocker.patch.object(stack.metadata_api, "push")
+        stack.primary.fail.add("get_messages")
+        stack.mirror.fail.add("get_messages")
+        worker = ReplicationWorker(stack, queue)  # type: ignore[arg-type]
+        assert await worker.run_once() == 0
+        push.assert_not_awaited()
+        item = queue.pending("fs")[0]
+        assert "descriptor is temporarily unavailable" in (item.last_error or "")
+
+        stack.primary.fail.clear()
+        stack.mirror.fail.clear()
+        queue.retry_now()
+        assert await worker.run_once() == 1
+        assert not queue.pending("fs")
+        assert (await stack.version("a.bin")).has_copy_in(stack.mirror.key)
+
     async def test_removed_file_is_dropped_from_the_queue(self):
         queue = ReplicationQueue(None)
         stack = await Stack(

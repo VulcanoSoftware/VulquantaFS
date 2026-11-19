@@ -209,6 +209,8 @@ class UploadableFileMessage(FileMessage):
     # before the bytes move so the content repository can stage them in
     # the local cache under the same id the metadata will carry.
     version_id: Optional[str] = field(default=None, kw_only=True)
+    # A restore has no client waiting for its final upload acknowledgement.
+    background: bool = field(default=False, kw_only=True)
 
     def _get_size(self) -> int:
         return 0

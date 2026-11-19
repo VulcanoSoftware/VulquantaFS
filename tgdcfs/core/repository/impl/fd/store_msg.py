@@ -254,7 +254,7 @@ class StoreFDRepository(IFDRepository):
 
     async def _acting_map(
         self, versions: List[TGFSFileVersion]
-    ) -> Dict[int, MessageResp]:
+    ) -> Tuple[Dict[Tuple[str, int], MessageResp], set[str]]:
         """Look up the parts of acting-owned versions in their stores.
 
         A version a failed-over write owns lives in a live mirror; its
@@ -263,7 +263,7 @@ class StoreFDRepository(IFDRepository):
         simply contributes nothing, like a mirror below.
         """
         if self._mirror_group is None:
-            return {}
+            return {}, set()
         by_store: Dict[str, List[int]] = {}
         for version in versions:
             if version.owned_by(self.key):
@@ -276,7 +276,8 @@ class StoreFDRepository(IFDRepository):
             by_store.setdefault(version.store, []).extend(
                 mid for mid in version.message_ids if mid > 0
             )
-        res: Dict[int, MessageResp] = {}
+        res: Dict[Tuple[str, int], MessageResp] = {}
+        unavailable: set[str] = set()
         for store_key, ids in by_store.items():
             api = self._mirror_group.store_for(store_key)
             if api is None:
@@ -287,13 +288,14 @@ class StoreFDRepository(IFDRepository):
                     api.get_messages(ids),
                 )
             except Exception as ex:
+                unavailable.add(store_key)
                 logger.warning(
                     f"Could not check the acting store {store_key} for the "
                     f"parts it owns: {ex}"
                 )
                 continue
-            res.update({m.message_id: m for m in found if m})
-        return res
+            res.update({(store_key, m.message_id): m for m in found if m})
+        return res, unavailable
 
     async def _validate_fv(
         self, fd: TGFSFileDesc, include_all_versions: bool
@@ -331,7 +333,7 @@ class StoreFDRepository(IFDRepository):
             fd.complete = False
 
         message_map = {msg.message_id: msg for msg in file_messages if msg}
-        acting_map = await self._acting_map(versions)
+        acting_map, unavailable = await self._acting_map(versions)
 
         has_valid_version = False
 
@@ -346,15 +348,19 @@ class StoreFDRepository(IFDRepository):
             # Each version's ids are checked against the store that owns
             # them: the primary, or the acting store a failed-over write
             # went to. Anything else reads the mirrors.
-            own_map = message_map if owned else acting_map if acting else None
             version.part_sizes = []
             primary_layout_ok = True
             for j, message_id in enumerate(version.message_ids):
-                if (
-                    own_map is not None
-                    and (file_message := own_map.get(message_id, None))
-                    and file_message.document
-                ):
+                file_message = (
+                    message_map.get(message_id)
+                    if owned
+                    else (
+                        acting_map.get((version.store, message_id))
+                        if acting and version.store is not None
+                        else None
+                    )
+                )
+                if file_message and file_message.document:
                     version.part_sizes.append(file_message.document.size)
                     continue
 
@@ -367,11 +373,12 @@ class StoreFDRepository(IFDRepository):
                 ]
                 mirror_sizes = await self._lookup_mirror_parts(mirror_candidates)
                 if mirror_sizes:
-                    logger.warning(
-                        f"File message {message_id} for part {j + 1} of "
-                        f"{fd.name}@{version.id} not found in the primary "
-                        f"store, serving from mirror"
-                    )
+                    if not acting or (version.store, message_id) not in mirror_sizes:
+                        logger.warning(
+                            f"File message {message_id} for part {j + 1} of "
+                            f"{fd.name}@{version.id} not found in the owning "
+                            f"store, serving from mirror"
+                        )
                     version.part_sizes.append(next(iter(mirror_sizes.values())))
                     continue
 
@@ -391,6 +398,8 @@ class StoreFDRepository(IFDRepository):
                     version.part_sizes = []
                     version._size = INVALID_FILE_SIZE
                 else:
+                    if version.store in unavailable:
+                        fd.complete = False
                     logger.warning(
                         f"File messages of {fd.name}@{version.id} not found in any store"
                     )

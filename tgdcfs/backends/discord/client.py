@@ -49,6 +49,7 @@ DOWNLOAD_READ_TIMEOUT = 120.0
 @dataclass
 class SentMessage:
     message_id: int
+    document: Optional[Document] = None
 
 
 def _to_message_resp(message: discord.Message) -> MessageResp:
@@ -138,7 +139,9 @@ class DiscordBotAPI:
         message = await channel.send(
             content=caption or None, file=discord.File(io.BytesIO(data), filename=name)
         )
-        return SentMessage(message_id=message.id)
+        return SentMessage(
+            message_id=message.id, document=_to_message_resp(message).document
+        )
 
     async def get_author_id(self, channel_id: int, message_id: int) -> int:
         """The user id of whoever sent the message.

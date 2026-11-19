@@ -308,6 +308,16 @@ class TestUploaderFromStream:
         mock_client.save_file_part.assert_called()
 
     @pytest.mark.asyncio
+    async def test_known_size_stream_cannot_upload_a_truncated_chunk(self, mock_client):
+        file_msg = FileMessageFromStream.new(
+            stream=self.create_test_stream([b"only 12 byte"]), size=16, name="partial"
+        )
+        uploader = FileUploader(client=mock_client, file_msg=file_msg)
+        with pytest.raises(TechnicalError, match="read 12 of 16 bytes"):
+            await uploader.upload()
+        mock_client.save_file_part.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_stream_default_name(self, mock_client):
         chunks = [b"data"]
         total_size = sum(len(chunk) for chunk in chunks)

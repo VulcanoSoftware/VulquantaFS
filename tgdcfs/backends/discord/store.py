@@ -333,6 +333,13 @@ class DiscordStore(IStore):
             f"upload of {name}",
             lambda bot: bot.send_file(self.channel_id, data, name),
         )
+        # Discord's POST response already identifies and sizes the
+        # attachment. A queued heal may validate hundreds of these
+        # messages immediately after upload: don't GET all of them again.
+        if sent.document is not None:
+            channel_cache(self.channel_id).id[sent.message_id] = MessageResp(
+                message_id=sent.message_id, text="", document=sent.document
+            )
         return SentFileMessage(message_id=sent.message_id, size=len(data))
 
     async def _send_part_with_slot(

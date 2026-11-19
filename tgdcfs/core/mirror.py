@@ -349,7 +349,12 @@ class MirrorGroup:
             version.mirrors[self._primary.key] = ids
         else:
             version.replicas[self._primary.key] = await self._replicate(
-                target, source, version.message_ids, sizes, name=name
+                target,
+                source,
+                version.message_ids,
+                sizes,
+                name=name,
+                restoring_version=version.id,
             )
         version.part_sizes = list(sizes)
         self.mark_primary_alive()
@@ -470,6 +475,7 @@ class MirrorGroup:
         part_sizes: List[int],
         cache: Optional["VersionCache"] = None,
         name: Optional[str] = None,
+        restoring_version: Optional[str] = None,
     ) -> Replica:
         """Re-partitioned copy: stream the whole version through the target.
 
@@ -481,44 +487,72 @@ class MirrorGroup:
         total = sum(part_sizes)
         local = cache.local() if cache is not None else None
         filler = cache.filler() if cache is not None and local is None else None
+        read = 0
+        last_progress = time.monotonic()
 
         async def content() -> AsyncGenerator[bytes, None]:
+            nonlocal read, last_progress
             if local is not None:
                 async for chunk in local.read(0, total - 1):
+                    read += len(chunk)
                     yield chunk
                 return
             for mid, size in zip(message_ids, part_sizes):
                 if size <= 0:
                     continue
                 resp = await source.download_file(mid, 0, size - 1)
+                part_read = 0
                 try:
                     async for chunk in resp.chunks:
+                        part_read += len(chunk)
+                        if part_read > size:
+                            raise TechnicalError(
+                                f"Store {source.key} returned more than {size} "
+                                f"bytes for message {mid}"
+                            )
                         if filler is not None:
                             await filler.write(chunk)
+                        read += len(chunk)
+                        if restoring_version is not None:
+                            now = time.monotonic()
+                            if now - last_progress >= 30:
+                                logger.info(
+                                    "Restoring version %s to %s: read %d/%d bytes "
+                                    "from %s",
+                                    restoring_version,
+                                    target.key,
+                                    read,
+                                    total,
+                                    source.key,
+                                )
+                                last_progress = now
                         yield chunk
+                    if part_read != size:
+                        raise TechnicalError(
+                            f"Store {source.key} returned {part_read} of {size} "
+                            f"bytes for message {mid}"
+                        )
                 finally:
                     if (aclose := getattr(resp.chunks, "aclose", None)) is not None:
                         await aclose()
 
         stream = content()
+        file_msg = FileMessageFromStream.new(
+            stream=stream,
+            size=total,
+            # The store numbers its parts exactly like the original write.
+            name=name or f"replica-{message_ids[0]}",
+        )
+        file_msg.background = restoring_version is not None
         try:
-            sent = await target.store.upload(
-                FileMessageFromStream.new(
-                    stream=stream,
-                    size=total,
-                    # The file's own name when it is known: the store
-                    # numbers its parts exactly like the primary's uploader
-                    # does, so the copy reads like the original messages.
-                    name=name or f"replica-{message_ids[0]}",
-                )
-            )
+            sent = await target.store.upload(file_msg)
         finally:
             # The target reads exactly ``total`` bytes and leaves the
             # generator suspended; close it so its downloads are released.
             await stream.aclose()
             if filler is not None:
                 await filler.close()
-        if sum(part.size for part in sent) != total:
+        if read != total or sum(part.size for part in sent) != total:
             raise TechnicalError(
                 f"Store {target.key} did not copy the complete {total}-byte version"
             )
