@@ -1,0 +1,29 @@
+#!/bin/bash
+# dns-block block|unblock
+# env: MODE=DROP|REJECT
+MODE=${MODE:-DROP}; CHAIN=DNSBLOCK
+[[ $EUID -eq 0 ]] || { echo "Draai als root (sudo)."; exit 1; }
+unblock() {
+  for t in iptables ip6tables; do
+    for h in OUTPUT FORWARD; do while $t -D $h -j $CHAIN 2>/dev/null; do :; done; done
+    $t -F $CHAIN 2>/dev/null; $t -X $CHAIN 2>/dev/null
+  done
+}
+block() {
+  unblock
+  for t in iptables ip6tables; do
+    $t -N $CHAIN 2>/dev/null; $t -F $CHAIN
+    $t -A $CHAIN -o lo -j RETURN                 # lokale stub-resolver blijft bereikbaar; alleen de upstream valt weg
+    $t -A $CHAIN -p udp --dport 53 -j "$MODE"
+    $t -A $CHAIN -p tcp --dport 53 -j "$MODE"
+    $t -A $CHAIN -p tcp --dport 853 -j "$MODE"   # DNS-over-TLS
+    for h in OUTPUT FORWARD; do $t -I $h 1 -j $CHAIN; done
+  done
+  resolvectl flush-caches 2>/dev/null; systemctl try-restart nscd 2>/dev/null
+  echo "DNS geblokkeerd ($MODE): poort 53 en 853 naar buiten dicht, bestaande verbindingen blijven werken"
+}
+case "$1" in
+  block) block ;;
+  unblock) unblock; echo "DNS weer bereikbaar" ;;
+  *) echo "gebruik: $0 block|unblock"; exit 1 ;;
+esac

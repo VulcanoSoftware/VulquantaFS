@@ -1,3 +1,4 @@
+import asyncio
 import datetime
 
 import asyncssh
@@ -63,7 +64,12 @@ def build_client(mocker, name: str) -> Client:
 
 
 def build_server(mocker, user=None, clients=None) -> TGFSSFTPServer:
+    async def wait_closed():
+        await asyncio.Event().wait()
+
     chan = mocker.Mock()
+    chan.wait_closed = mocker.AsyncMock(side_effect=wait_closed)
+    chan.is_closing = mocker.Mock(return_value=False)
     chan.get_extra_info = mocker.Mock(
         side_effect=lambda key, default=None: (
             user if key == USER_INFO_KEY else default
@@ -348,6 +354,68 @@ class TestUnsupportedOperations:
 
         assert attrs.bavail > 0
         assert attrs.namemax == 255
+
+
+class TestClose:
+    async def test_a_close_on_a_live_session_commits_the_upload(self, admin, mocker):
+        handle = await admin.open(b"/notes/new.txt", 0x02 | 0x08, asyncssh.SFTPAttrs())
+        close = mocker.spy(handle, "close")
+        abort = mocker.spy(handle, "abort")
+
+        await admin.close(handle)
+
+        close.assert_called_once()
+        abort.assert_not_called()
+
+    async def test_a_close_while_the_session_ends_aborts_the_upload(
+        self, admin, mocker
+    ):
+        # asyncssh closes the open handles itself when the connection drops,
+        # before exit(): that must not commit a truncated file.
+        handle = await admin.open(b"/notes/new.txt", 0x02 | 0x08, asyncssh.SFTPAttrs())
+        await handle.write(0, b"partial")
+        close = mocker.spy(handle, "close")
+        abort = mocker.spy(handle, "abort")
+        admin._channel.is_closing.return_value = True
+
+        await admin.close(handle)
+
+        abort.assert_called_once()
+        close.assert_not_called()
+        assert admin._handles == []
+
+    async def test_a_read_handle_still_closes_while_the_session_ends(self, admin):
+        handle = await admin.open(b"/notes/note.txt", 0x01, asyncssh.SFTPAttrs())
+        admin._channel.is_closing.return_value = True
+
+        await admin.close(handle)
+
+        assert admin._handles == []
+
+
+class TestErrorLogging:
+    def test_one_traceback_for_an_error_shared_by_many_requests(self, caplog):
+        from tgdcfs.app.sftp.server import _to_sftp_error
+        from tgdcfs.errors import TechnicalError
+
+        error = TechnicalError("upload stopped")
+        with caplog.at_level("DEBUG", logger="tgdcfs.app.sftp.server"):
+            for _ in range(50):
+                result = _to_sftp_error(error)
+                assert isinstance(result, asyncssh.SFTPFailure)
+
+        tracebacks = [r for r in caplog.records if r.levelname == "ERROR"]
+        assert len(tracebacks) == 1
+
+    def test_a_closed_handle_is_not_an_unexpected_error(self, caplog):
+        from tgdcfs.app.sftp.handles import HandleClosedError
+        from tgdcfs.app.sftp.server import _to_sftp_error
+
+        with caplog.at_level("DEBUG", logger="tgdcfs.app.sftp.server"):
+            result = _to_sftp_error(HandleClosedError("write on a closed handle"))
+
+        assert isinstance(result, asyncssh.SFTPFailure)
+        assert not [r for r in caplog.records if r.levelname == "ERROR"]
 
 
 class TestExit:

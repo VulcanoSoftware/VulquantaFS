@@ -1,0 +1,43 @@
+#!/bin/bash
+# internet-block block|unblock
+# env: MODE=DROP|REJECT  AUTO=<minuten auto-herstel, standaard 15, 0=uit>  SSH_PORT=22
+MODE=${MODE:-DROP}; SSH_PORT=${SSH_PORT:-22}; AUTO=${AUTO:-15}; CHAIN=NETBLOCK
+SELF=$(readlink -f "$0")
+[[ $EUID -eq 0 ]] || { echo "Draai als root (sudo)."; exit 1; }
+unblock() {
+  systemctl stop internet-block-revert.timer >/dev/null 2>&1
+  for t in iptables ip6tables; do
+    for h in OUTPUT FORWARD; do while $t -D $h -j $CHAIN 2>/dev/null; do :; done; done
+    $t -F $CHAIN 2>/dev/null; $t -X $CHAIN 2>/dev/null
+  done
+}
+block() {
+  unblock
+  for t in iptables ip6tables; do $t -N $CHAIN 2>/dev/null; $t -F $CHAIN; done
+  iptables -A $CHAIN -o lo -j ACCEPT
+  for n in 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 169.254.0.0/16 224.0.0.0/4 255.255.255.255/32; do iptables -A $CHAIN -d $n -j ACCEPT; done
+  iptables -A $CHAIN -p tcp --sport "$SSH_PORT" -j ACCEPT     # SSH-antwoorden blijven werken
+  iptables -A $CHAIN -p udp --dport 67:68 -j ACCEPT           # DHCP
+  iptables -A $CHAIN -j "$MODE"
+  ip6tables -A $CHAIN -o lo -j ACCEPT
+  for n in fe80::/10 fc00::/7 ff00::/8; do ip6tables -A $CHAIN -d $n -j ACCEPT; done
+  ip6tables -A $CHAIN -p tcp --sport "$SSH_PORT" -j ACCEPT
+  ip6tables -A $CHAIN -p udp --dport 546:547 -j ACCEPT
+  ip6tables -A $CHAIN -j "$MODE"
+  for t in iptables ip6tables; do for h in OUTPUT FORWARD; do
+    $t -C $h -j $CHAIN 2>/dev/null || $t -I $h 1 -j $CHAIN
+  done; done
+  echo "Internet geblokkeerd ($MODE); LAN, loopback en SSH (poort $SSH_PORT) blijven werken"
+  if [[ $AUTO -gt 0 ]] 2>/dev/null; then
+    if systemd-run --quiet --unit=internet-block-revert --on-active="${AUTO}m" "$SELF" unblock; then
+      echo "Automatisch herstel over ${AUTO} min (AUTO=0 schakelt dit uit)"
+    else
+      echo "Auto-herstel plannen mislukt; herstel zelf met: internet-block unblock"
+    fi
+  fi
+}
+case "$1" in
+  block) block ;;
+  unblock) unblock; echo "Internet weer bereikbaar" ;;
+  *) echo "gebruik: $0 block|unblock"; exit 1 ;;
+esac

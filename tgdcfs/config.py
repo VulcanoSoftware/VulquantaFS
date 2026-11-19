@@ -161,6 +161,25 @@ class EncryptionConfig:
         )
 
 
+class MetadataLayout(Enum):
+    # How a repository metadata store keeps the directory tree: mirrored
+    # into the repo's own directory structure (one blob per directory,
+    # written incrementally -- the ``github_repo`` shape) or as one JSON
+    # document that is rewritten on every push (the pinned-message shape,
+    # a drop-in redundant copy next to any other metadata store).
+    TREE = "tree"
+    DOCUMENT = "document"
+
+
+def _parse_metadata_layout(field: str, value: object) -> MetadataLayout:
+    raw = str(value or MetadataLayout.TREE.value).strip().lower()
+    try:
+        return MetadataLayout(raw)
+    except ValueError:
+        allowed = ", ".join(layout.value for layout in MetadataLayout)
+        raise ValueError(f"{field} must be one of {allowed}, got {raw!r}") from None
+
+
 @dataclass
 class GithubRepoConfig:
     # How many directories the truncated-tree fallback reads in parallel.
@@ -173,6 +192,16 @@ class GithubRepoConfig:
     commit: str
     access_token: str
     tree_fetch_concurrency: int = DEFAULT_TREE_FETCH_CONCURRENCY
+    # How the metadata tree is stored in the repo: mirrored into the
+    # repo's own directory structure (one blob per directory, written
+    # incrementally) or as one JSON document that is rewritten on every
+    # push, the same shape the pinned-message store uses.
+    layout: MetadataLayout = MetadataLayout.TREE
+    # Where the document layout keeps the JSON document; unused by the
+    # tree layout.
+    file_path: str = "metadata.json"
+
+    DEFAULT_FILE_PATH = "metadata.json"
 
     @classmethod
     def from_dict(cls, data: dict) -> Self:
@@ -184,23 +213,37 @@ class GithubRepoConfig:
                 "metadata.github_repo.tree_fetch_concurrency must be "
                 f"positive, got {concurrency}"
             )
+        file_path = str(data.get("file_path") or cls.DEFAULT_FILE_PATH).strip("/")
+        if not file_path or file_path.endswith("/"):
+            raise ValueError(
+                f"metadata.github_repo.file_path must name a file, got {file_path!r}"
+            )
         return cls(
             repo=data["repo"],
             commit=data["commit"],
             access_token=data["access_token"],
             tree_fetch_concurrency=concurrency,
+            layout=_parse_metadata_layout(
+                "metadata.github_repo.layout", data.get("layout")
+            ),
+            file_path=file_path,
         )
 
 
 class MetadataType(Enum):
     PINNED_MESSAGE = "pinned_message"
     GITHUB_REPO = "github_repo"
+    GITLAB_REPO = "gitlab_repo"
 
 
-class MetadataConfigDict(TypedDict):
+class MetadataConfigDict(TypedDict, total=False):
     name: str
     type: str
+    # ``pinned_message`` only: the store whose channel holds the pinned
+    # metadata document. Empty means the file system's primary store.
+    store: str
     github_repo: Optional[Dict]
+    gitlab_repo: Optional[Dict]
 
 
 @dataclass
@@ -208,6 +251,13 @@ class MetadataConfig:
     name: str
     type: MetadataType
     github_repo: Optional[GithubRepoConfig]
+    # ``pinned_message`` only: name of the store (``stores:`` entry) whose
+    # channel holds the pinned metadata document. ``None`` means the file
+    # system's primary store; :meth:`FilesystemConfig.from_dict` fills it.
+    # This is what makes a pinned copy in a Telegram channel and one in a
+    # Discord channel two separate, individually configurable stores.
+    store: Optional[str] = None
+    gitlab_repo: Optional["GitlabRepoConfig"] = None
 
     @classmethod
     def from_dict(cls, data: MetadataConfigDict) -> Self:
@@ -219,6 +269,7 @@ class MetadataConfig:
                 name=data.get("name", "default"),
                 type=MetadataType.PINNED_MESSAGE,
                 github_repo=None,
+                store=data.get("store") or None,
             )
         if data["type"] == MetadataType.GITHUB_REPO.value:
             if not (gh_repo_config := data.get("github_repo")):
@@ -230,8 +281,100 @@ class MetadataConfig:
                 type=MetadataType.GITHUB_REPO,
                 github_repo=GithubRepoConfig.from_dict(gh_repo_config),
             )
+        if data["type"] == MetadataType.GITLAB_REPO.value:
+            if not (gl_repo_config := data.get("gitlab_repo")):
+                raise ValueError(
+                    "GitLab repo configuration is required for GITLAB_REPO type"
+                )
+            return cls(
+                name=data.get("name", "default"),
+                type=MetadataType.GITLAB_REPO,
+                github_repo=None,
+                gitlab_repo=GitlabRepoConfig.from_dict(gl_repo_config),
+            )
         raise ValueError(
             f"Unknown metadata type: {data['type']}, available options: {', '.join(e.value for e in MetadataType)}"
+        )
+
+    @property
+    def key(self) -> str:
+        """Stable identifier of this metadata store within its file system.
+
+        Used for logs, the manager API and the stale-store bookkeeping of
+        the replicated metadata layer. Two stores of one file system never
+        share a key (validated on load).
+        """
+        if self.type == MetadataType.PINNED_MESSAGE:
+            return f"pinned_message@{self.store or 'primary'}"
+        if self.type == MetadataType.GITHUB_REPO:
+            if self.github_repo is None:
+                return "github_repo@<unconfigured>"
+            return f"github_repo@{self.github_repo.repo}@{self.github_repo.commit}"
+        if self.gitlab_repo is None:
+            return "gitlab_repo@<unconfigured>"
+        return f"gitlab_repo@{self.gitlab_repo.repo}@{self.gitlab_repo.branch}"
+
+
+@dataclass
+class GitlabRepoConfig:
+    """A GitLab repository holding the metadata.
+
+    By default the tree is mirrored into the repo's own directory
+    structure, exactly like ``github_repo``. With ``layout: document`` it
+    keeps the whole tree in a single file -- ``metadata.json`` by default
+    -- and rewrites it on every push, the same shape the pinned-message
+    store uses. That keeps it small and makes it a drop-in redundant copy
+    next to any other metadata store.
+
+    ``repo`` is ``group/project`` (URL-quoted for the API) or a numeric
+    project id. ``base_url`` points at a self-hosted GitLab; it defaults
+    to gitlab.com. ``access_token`` needs ``api`` or ``write_repository``
+    scope.
+    """
+
+    repo: str
+    branch: str
+    access_token: str
+    base_url: str = "https://gitlab.com"
+    file_path: str = "metadata.json"
+    # Like ``github_repo``: the tree mirrored into the repo's own
+    # directory structure (the default, the same shape ``github_repo``
+    # uses), or one JSON document at ``file_path``. A copy written by an
+    # older release (before the layout existed) is a document and is
+    # migrated automatically: the tree layout falls back to reading it
+    # until the first push has mirrored the tree.
+    layout: MetadataLayout = MetadataLayout.TREE
+
+    DEFAULT_BASE_URL = "https://gitlab.com"
+    DEFAULT_FILE_PATH = "metadata.json"
+
+    @classmethod
+    def from_dict(cls, data: dict) -> Self:
+        if not (repo := data.get("repo")):
+            raise ValueError("metadata.gitlab_repo.repo is required")
+        if not (branch := data.get("branch")):
+            raise ValueError("metadata.gitlab_repo.branch is required")
+        if not (access_token := data.get("access_token")):
+            raise ValueError("metadata.gitlab_repo.access_token is required")
+        base_url = str(data.get("base_url") or cls.DEFAULT_BASE_URL).rstrip("/")
+        if not base_url.startswith(("http://", "https://")):
+            raise ValueError(
+                f"metadata.gitlab_repo.base_url must be an http(s) URL, got {base_url}"
+            )
+        file_path = str(data.get("file_path") or cls.DEFAULT_FILE_PATH).strip("/")
+        if not file_path or file_path.endswith("/"):
+            raise ValueError(
+                f"metadata.gitlab_repo.file_path must name a file, got {file_path!r}"
+            )
+        return cls(
+            repo=str(repo),
+            branch=str(branch),
+            access_token=str(access_token),
+            base_url=base_url,
+            file_path=file_path,
+            layout=_parse_metadata_layout(
+                "metadata.gitlab_repo.layout", data.get("layout")
+            ),
         )
 
 
@@ -393,10 +536,31 @@ class TransferConfig:
     # their turn; the memory bound of one such read is this times the
     # piece size.
     read_parallel_window: int = 8
-    # ``sync: tee``: bytes buffered per mirror between the primary's reads
-    # of the upload stream and the mirror's upload; a full buffer makes
-    # the primary wait.
+    # ``sync: tee``: MiB buffered per store between the source and the
+    # respective uploader. Unknown-length streams also have a smaller
+    # built-in limit so they don't defer a backlog to SFTP CLOSE.
     tee_buffer_mb: int = 64
+    # How long one call to a Telegram backend may stay unanswered before
+    # the store counts the service as unreachable and raises. Telegram
+    # normally answers within seconds; a network that just drops packets
+    # (a down service, a VPN that stopped routing) never answers at all,
+    # and without this bound every call into it hangs forever -- the
+    # circuit breaker of a mirror group only trips on exceptions, so
+    # nothing would ever fail over. ``0`` turns the bound off. Generous
+    # by default: a server-demanded flood wait is a legitimate silence,
+    # and so is every part upload, which has a much shorter bound of its
+    # own (see ``upload_part_timeout_s``).
+    rpc_timeout_s: int = 120
+    # How long one part upload may stay unanswered before the uploader
+    # gives the part up without a retry. The part uploads pace the SFTP
+    # write acknowledgements -- a frozen part freezes them, and an SFTP
+    # client that waits out its inactivity timeout (FileZilla: 20 s)
+    # drops the session and looks at a stalled transfer. This bound has
+    # to sit below that timeout, so the write fails, the breaker trips
+    # and the client's retry reaches a mirror store while it is still
+    # willing to retry. ``0`` turns the bound off and leaves the part to
+    # ``rpc_timeout_s``.
+    upload_part_timeout_s: int = 15
 
     DEFAULT_UPLOAD_PARTS_IN_FLIGHT = 1
     DEFAULT_READ_PARALLEL_WINDOW = 8
@@ -414,6 +578,8 @@ class TransferConfig:
     DEFAULT_CHUNK_CACHE_MB = 0
     DEFAULT_CHUNK_CACHE_READAHEAD = 2
     DEFAULT_CHUNK_CACHE_BLOCK_KB = 1024
+    DEFAULT_RPC_TIMEOUT_S = 120
+    DEFAULT_UPLOAD_PART_TIMEOUT_S = 15
 
     @property
     def download_piece_size_bytes(self) -> int:
@@ -499,6 +665,10 @@ class TransferConfig:
                 "read_parallel_window", cls.DEFAULT_READ_PARALLEL_WINDOW
             ),
             tee_buffer_mb=positive("tee_buffer_mb", cls.DEFAULT_TEE_BUFFER_MB),
+            rpc_timeout_s=non_negative("rpc_timeout_s", cls.DEFAULT_RPC_TIMEOUT_S),
+            upload_part_timeout_s=non_negative(
+                "upload_part_timeout_s", cls.DEFAULT_UPLOAD_PART_TIMEOUT_S
+            ),
         )
 
 
@@ -977,6 +1147,13 @@ class FilesystemConfig:
     strict: bool
     read_preference: List[str]
     metadata: MetadataConfig
+    # Redundant metadata stores (RAID-1 like the file stores): every push
+    # goes to the primary metadata store and to each of these; a store
+    # that is temporarily unreachable is skipped and re-synced once it is
+    # back. Empty: the primary metadata store only, and a ``pinned_message``
+    # one keeps maintaining its pinned copies in the mirror stores the way
+    # it always did (the explicit list below replaces that behaviour).
+    metadata_mirrors: List[MetadataConfig] = field(default_factory=list)
     allow_shared_store: bool = False
     # True when ``sync`` was not configured and may be replaced by the
     # value derived from the stores.
@@ -1045,6 +1222,15 @@ class FilesystemConfig:
         }
         metadata_data.update(data.get("metadata") or {})  # type: ignore[typeddict-item]
         metadata = MetadataConfig.from_dict(metadata_data)
+        if metadata.type == MetadataType.PINNED_MESSAGE and not metadata.store:
+            metadata.store = str(primary)
+        metadata_mirrors = [
+            MetadataConfig.from_dict(m) for m in (data.get("metadata_mirrors") or [])
+        ]
+        for mirror in metadata_mirrors:
+            if mirror.type == MetadataType.PINNED_MESSAGE and not mirror.store:
+                mirror.store = str(primary)
+        _validate_metadata_stores(name, metadata, metadata_mirrors)
         return cls(
             name=name,
             primary=str(primary),
@@ -1054,12 +1240,18 @@ class FilesystemConfig:
             strict=strict,
             read_preference=[str(s) for s in (data.get("read_preference") or [])],
             metadata=metadata,
+            metadata_mirrors=metadata_mirrors,
             allow_shared_store=bool(data.get("allow_shared_store", False)),
             sync_is_default=sync_is_default,
             write_ack=write_ack,  # type: ignore[arg-type]
             read_parallel=bool(data.get("read_parallel", False)),
             read_sources=[str(s) for s in (data.get("read_sources") or [])],
         )
+
+    @property
+    def metadata_stores(self) -> List[MetadataConfig]:
+        """Every metadata store of this file system, primary first."""
+        return [self.metadata, *self.metadata_mirrors]
 
     @property
     def store_names(self) -> List[str]:
@@ -1165,7 +1357,42 @@ def _legacy_stores_and_filesystems(
             # tgfs allowed any channel arrangement; keep that.
             allow_shared_store=True,
         )
+        # For the manager API's sake the pinned store names its channel.
+        metadata.store = store_name(channel)
     return stores, filesystems
+
+
+def _validate_metadata_stores(
+    fs_name: str,
+    metadata: MetadataConfig,
+    metadata_mirrors: List[MetadataConfig],
+) -> None:
+    """The metadata stores of one file system must not collide.
+
+    A channel holds exactly one pinned message, so two ``pinned_message``
+    stores cannot share a store; two entries for the same git repository
+    and branch would overwrite each other's commits.
+    """
+    stores = [metadata, *metadata_mirrors]
+    seen_pinned: Dict[str, str] = {}
+    seen_keys: Dict[str, str] = {}
+    for entry in stores:
+        if entry.type == MetadataType.PINNED_MESSAGE:
+            target = entry.store or ""
+            if target in seen_pinned:
+                raise ValueError(
+                    f"filesystems.{fs_name}: two pinned_message metadata stores "
+                    f"point at store '{target}'; a channel holds only one pinned "
+                    f"message, so they cannot be separate stores"
+                )
+            seen_pinned[target] = entry.key
+        key = entry.key
+        if key in seen_keys:
+            raise ValueError(
+                f"filesystems.{fs_name}: metadata store '{key}' is listed "
+                f"twice (primary and/or metadata_mirrors)"
+            )
+        seen_keys[key] = fs_name
 
 
 def _validate_filesystems(
@@ -1187,6 +1414,17 @@ def _validate_filesystems(
                 raise ValueError(
                     f"filesystems.{fs.name}: read_sources names '{store_name}', "
                     f"which is neither its primary nor one of its mirrors"
+                )
+        for entry in fs.metadata_stores:
+            if (
+                entry.type == MetadataType.PINNED_MESSAGE
+                and (store := entry.store) is not None
+                and store not in fs.store_names
+            ):
+                raise ValueError(
+                    f"filesystems.{fs.name}: metadata store '{entry.key}' points "
+                    f"at store '{store}', which is neither the file system's "
+                    f"primary nor one of its mirrors"
                 )
         if (other := primaries.get(fs.primary)) is not None:
             raise ValueError(

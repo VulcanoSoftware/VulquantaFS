@@ -1,25 +1,33 @@
 import asyncio
 import base64
+import bisect
 import datetime
 import hashlib
 import json
 import logging
 import time
 from concurrent.futures import ThreadPoolExecutor
-from typing import Iterable, NamedTuple, Optional, Sequence
+from typing import Iterable, NamedTuple, Optional, Sequence, Set, cast
 
-from github import Github, GithubException, InputGitTreeElement
+from github import Github, GithubException, GithubRetry, InputGitTreeElement
 from github.ContentFile import ContentFile
+from github.Repository import Repository
 
 from tgdcfs.config import GithubRepoConfig, expand_path
-from tgdcfs.core.model import FileStat, TGFSDirectory, TGFSMetadata
+from tgdcfs.core.model import FileStat, TGFSDirectory, TGFSFileRef, TGFSMetadata
+from tgdcfs.core.repository.impl.metadata.breaker import (
+    FailFastRepository,
+    StoreCircuitBreaker,
+    probe_github_branch,
+)
 from tgdcfs.core.repository.interface import IMetaDataRepository
 from tgdcfs.crypto.path_names import (
     PathNameEncryptionError,
     decrypt_path_name,
+    encrypt_path_name,
     is_encrypted_path_name,
 )
-from tgdcfs.errors import TechnicalError
+from tgdcfs.errors import MetadataNotInitialized, TechnicalError
 
 from .dir_timestamps import DirTimestampStore, cache_file_name
 from .gh_directory import GithubConfig, GithubDirectory
@@ -39,6 +47,8 @@ class _TreeEntry(NamedTuple):
 
 # How often a stats commit is retried when the branch moved under it.
 STATS_COMMIT_ATTEMPTS = 3
+# How often the full-tree sync commit is retried when the branch moved.
+SYNC_COMMIT_ATTEMPTS = 3
 
 
 def _blob_sha(content: str) -> str:
@@ -51,12 +61,35 @@ def _blob_sha(content: str) -> str:
 
 
 class GithubRepoMetadataRepository(IMetaDataRepository):
-    def __init__(self, config: GithubRepoConfig, name_key: Optional[bytes] = None):
+    def __init__(
+        self,
+        config: GithubRepoConfig,
+        name_key: Optional[bytes] = None,
+        repo: Optional[Repository] = None,
+    ):
         super().__init__()
         self._stats_loads: dict[int, asyncio.Future[bool]] = {}
 
-        gh = Github(config.access_token)
-        repo = gh.get_repo(config.repo)
+        gh = Github(config.access_token, retry=GithubRetry(total=1))
+        # Injectable for a store that speaks the PyGithub surface without
+        # being GitHub (the GitLab tree mirror); the default client talks
+        # to GitHub itself. The lazy flag keeps the resolution request out
+        # of the constructor: the repository completes on its first API
+        # call, which runs on a worker thread. An unreachable GitHub at
+        # boot must surface as this store's read error -- so the
+        # replicated layer fails over to a healthy mirror and the heal
+        # worker catches this store up once it answers again -- never as a
+        # minutes-long blocking call on the event loop before the layer
+        # even exists. The fail-fast wrapper keeps it that way afterwards:
+        # once a call ran into a dead connection, every further call of
+        # this store is refused until a background probe finds the
+        # service again, so one outage costs its connect timeouts once --
+        # not once per listing, write, stats commit and heal.
+        self._breaker: Optional[StoreCircuitBreaker] = None
+        if repo is None:
+            raw = gh.get_repo(config.repo, lazy=True)
+            self._breaker = StoreCircuitBreaker(probe_github_branch(raw, config.commit))
+            repo = cast(Repository, FailFastRepository(raw, self._breaker))
 
         self._timestamps = DirTimestampStore(
             repo=repo,
@@ -74,8 +107,249 @@ class GithubRepoMetadataRepository(IMetaDataRepository):
             tree_fetch_concurrency=config.tree_fetch_concurrency,
         )
 
+    # -- the shared tree -----------------------------------------------------
+    #
+    # The replicated layer hands every store the same tree object, loaded
+    # from whichever store could serve it. Mutations persist through the
+    # ``GithubDirectory`` nodes (the incremental writes) and ``push_full``
+    # diffs whatever tree it is given, so a tree that arrived as plain
+    # ``TGFSDirectory`` nodes -- loaded from a pinned message or a document
+    # store -- is converted in place: same object, store-backed nodes, with
+    # the mirrors, store key, stat and dates of every file ref and folder
+    # preserved.
+
+    @property
+    def metadata(self) -> Optional[TGFSMetadata]:
+        return self._metadata
+
+    @metadata.setter
+    def metadata(self, value: Optional[TGFSMetadata]) -> None:
+        self._metadata = None if value is None else self._as_github_tree(value)
+
+    def _as_github_tree(self, metadata: TGFSMetadata) -> TGFSMetadata:
+        if isinstance(metadata.dir, GithubDirectory):
+            return metadata
+        plain_root = metadata.dir
+        root = GithubDirectory(
+            self._ghc, name="root", parent=None, children=[], files=[]
+        )
+        root.created_at = plain_root.created_at
+        root.modified_at = plain_root.modified_at
+        self._convert_directory(plain_root, root)
+        metadata.dir = root
+        return metadata
+
+    def _convert_directory(
+        self, source: TGFSDirectory, target: GithubDirectory
+    ) -> None:
+        for child in source.find_dirs():
+            # New nodes follow the configured name key, like freshly created
+            # directories do; the plaintext names of a document store get
+            # encrypted on the way out.
+            node = GithubDirectory(
+                self._ghc,
+                name=child.name,
+                parent=target,
+                stored_encrypted=None,
+                defer_timestamps=True,
+            )
+            target.children.append(node)
+            node.created_at = child.created_at
+            node.modified_at = child.modified_at
+            self._convert_directory(child, node)
+        for fr in source.find_files():
+            # Built directly instead of via ``attach_file_ref``, which loses
+            # the mirrors, store key and stat of a loaded ref.
+            target.files.append(
+                TGFSFileRef(
+                    message_id=fr.message_id,
+                    name=fr.name,
+                    location=target,
+                    mirrors=dict(fr.mirrors),
+                    store=fr.store,
+                    stat=fr.stat,
+                    stat_epoch=fr.stat_epoch,
+                )
+            )
+
     async def push(self) -> None:
         pass
+
+    # -- full-tree sync (``push_full``) -------------------------------------
+    #
+    # As the primary metadata store the repo is written incrementally while
+    # the tree is mutated (``GithubDirectory``), so ``push`` has nothing to
+    # do. As a redundant copy under the replicated metadata layer -- and as
+    # the healing step after this store missed incremental writes -- the
+    # whole in-memory tree is diffed against the repo and reconciled in one
+    # commit.
+
+    async def push_full(self) -> None:
+        if not self.metadata:
+            raise MetadataNotInitialized()
+        # Under the write lock, like the incremental writes: a deferred file
+        # reference create that is still retrying must not race the sync.
+        # The tree is read on the event loop (it is mutated there); only the
+        # GitHub round trips run on the writer thread.
+        async with self._ghc.lock:
+            desired_blobs = self._desired_blobs()
+            await self._ghc.write(self._sync_tree_commit, desired_blobs)
+
+    def _desired_blobs(self) -> Set[str]:
+        """The blob paths the in-memory tree implies."""
+        if self.metadata is None:
+            raise MetadataNotInitialized()
+        metadata = self.metadata
+        blob_paths: Set[str] = set()
+        dir_paths: Set[str] = set()
+
+        def walk(directory: TGFSDirectory) -> None:
+            path = self._dir_storage_path(directory)
+            dir_paths.add(path)
+            for fr in directory.find_files():
+                blob_paths.add(self._ref_blob_path(directory, path, fr))
+            for child in directory.find_dirs():
+                walk(child)
+
+        walk(metadata.dir)
+        # Git cannot represent an empty directory: every directory without
+        # a blob beneath it gets a ``.gitkeep``, like ``create_dir`` makes.
+        sorted_blobs = sorted(blob_paths)
+        for path in dir_paths:
+            if not path:
+                continue
+            marker = f"{path}/"
+            i = bisect.bisect_left(sorted_blobs, marker)
+            if i >= len(sorted_blobs) or not sorted_blobs[i].startswith(marker):
+                blob_paths.add(f"{marker}.gitkeep")
+        return blob_paths
+
+    def _dir_storage_path(self, directory: TGFSDirectory) -> str:
+        """On-repo path of ``directory``; per-directory encrypted state is
+        preserved for a tree of ``GithubDirectory`` nodes, a plain tree
+        (loaded from another metadata store) follows the configured key."""
+        if isinstance(directory, GithubDirectory):
+            return directory._github_path
+        segments: list[str] = []
+        node: Optional[TGFSDirectory] = directory
+        while node is not None and node.parent is not None:
+            segments.append(self._encode_segment(node.name))
+            node = node.parent
+        return GithubDirectory.join_path(*reversed(segments))
+
+    def _encode_segment(self, name: str) -> str:
+        key = self._ghc.name_key
+        return encrypt_path_name(key, name) if key is not None else name
+
+    def _ref_blob_path(
+        self, directory: TGFSDirectory, path: str, fr: TGFSFileRef
+    ) -> str:
+        if isinstance(directory, GithubDirectory):
+            segment = directory._file_ref_storage_name(fr.name, fr.message_id)
+        else:
+            segment = f"{self._encode_segment(fr.name)}.{fr.message_id}"
+        return GithubDirectory.join_path(path, segment)
+
+    @staticmethod
+    def _is_managed_blob(path: str) -> bool:
+        """Whether the sync may delete this blob: file references (``name.id``
+        -- the same shape the loader parses) and ``.gitkeep`` placeholders.
+        Anything else in the repo (stats files, a README) is left alone."""
+        segment = path.rsplit("/", 1)[-1]
+        if segment == ".gitkeep":
+            return True
+        if segment == STATS_FILE_NAME:
+            return False
+        _, _, suffix = segment.rpartition(".")
+        return suffix.isdigit()
+
+    def _sync_tree_commit(self, desired_blobs: Set[str]) -> None:
+        """Diff the repo against the desired blobs and commit the delta.
+
+        Blocking; raises when the sync cannot be done safely. Retried when
+        the branch moved under it, like the stats commit. A repo without
+        the branch yet (a fresh mirror) gets an initial commit.
+        """
+        repo = self._ghc.repo
+        for attempt in range(SYNC_COMMIT_ATTEMPTS):
+            try:
+                ref = repo.get_git_ref(f"heads/{self._ghc.commit}")
+            except GithubException as ex:
+                if getattr(ex, "status", None) != 404:
+                    raise
+                self._initial_sync_commit(desired_blobs)
+                return
+            base_commit = repo.get_git_commit(ref.object.sha)
+            tree = repo.get_git_tree(base_commit.tree.sha, recursive=True)
+            if tree.truncated:
+                # A truncated listing would make the rewrite below drop
+                # every blob it did not see. Never sync from that.
+                raise TechnicalError(
+                    f"The tree of {self._ghc.repo_name}@{self._ghc.commit} is "
+                    f"truncated; the metadata sync cannot run safely"
+                )
+            current = {e.path: (e.sha, e.mode) for e in tree.tree if e.type == "blob"}
+            creates = sorted(desired_blobs - set(current))
+            deletes = sorted(
+                path
+                for path in current
+                if path not in desired_blobs and self._is_managed_blob(path)
+            )
+            if not creates and not deletes:
+                return
+            elements = [
+                # The content creates the blob server side; an element that
+                # also carries a sha (even null) is rejected with a 422.
+                InputGitTreeElement(path=path, mode="100644", type="blob", content="")
+                for path in creates
+            ]
+            elements += [
+                InputGitTreeElement(path=path, mode=mode, type="blob", sha=sha)
+                for path, (sha, mode) in sorted(current.items())
+                if path not in set(deletes)
+            ]
+            new_tree = repo.create_git_tree(elements)
+            commit = repo.create_git_commit(
+                f"Sync TGDCFS metadata tree ({len(creates)} created, "
+                f"{len(deletes)} deleted)",
+                new_tree,
+                [base_commit],
+            )
+            try:
+                ref.edit(commit.sha)
+                logger.info(
+                    f"Synced the metadata tree to {self._ghc.repo_name}@"
+                    f"{self._ghc.commit}: {len(creates)} created, "
+                    f"{len(deletes)} deleted"
+                )
+                return
+            except GithubException as ex:
+                if attempt + 1 == SYNC_COMMIT_ATTEMPTS:
+                    raise
+                logger.info(
+                    f"Branch {self._ghc.commit} moved while syncing the "
+                    f"metadata tree ({ex.status}), retrying"
+                )
+
+    def _initial_sync_commit(self, desired_blobs: Set[str]) -> None:
+        """First commit on a branch that does not exist yet."""
+        repo = self._ghc.repo
+        elements = [
+            # See _sync_tree_commit: content must go alone.
+            InputGitTreeElement(path=path, mode="100644", type="blob", content="")
+            for path in sorted(desired_blobs)
+        ]
+        new_tree = repo.create_git_tree(elements)
+        commit = repo.create_git_commit(
+            f"Sync TGDCFS metadata tree ({len(desired_blobs)} created)",
+            new_tree,
+            [],
+        )
+        repo.create_git_ref(f"refs/heads/{self._ghc.commit}", commit.sha)
+        logger.info(
+            f"Created {self._ghc.repo_name}@{self._ghc.commit} with the "
+            f"synced metadata tree ({len(desired_blobs)} blobs)"
+        )
 
     # -- file stats (``listing.stat_in_metadata``) -------------------------
     #
@@ -232,7 +506,25 @@ class GithubRepoMetadataRepository(IMetaDataRepository):
         # Off the loop too: with a large repo the walk is a request per
         # directory. The structure is built fresh, so nothing is shared.
         root_dir = await asyncio.to_thread(self._build_directory_structure)
-        return TGFSMetadata(dir=root_dir)
+        metadata = TGFSMetadata(dir=root_dir)
+        # The replicated layer compares stores by this date: the branch head
+        # is when this copy was written last. A store that proves dead later
+        # during the read fails the load anyway; an empty repository has no
+        # head and simply dates as unknown.
+        metadata.revision = await asyncio.to_thread(self._head_commit_epoch)
+        return metadata
+
+    def _head_commit_epoch(self) -> Optional[float]:
+        """When the branch was written last, as a Unix epoch, or None."""
+        try:
+            ref = self._ghc.repo.get_git_ref(f"heads/{self._ghc.commit}")
+            commit = self._ghc.repo.get_git_commit(ref.object.sha)
+            date = commit.committer.date
+        except Exception:
+            return None
+        if not isinstance(date, datetime.datetime):
+            return None
+        return date.timestamp()
 
     def _build_directory_structure(self) -> GithubDirectory:
         root = GithubDirectory(
@@ -247,8 +539,27 @@ class GithubRepoMetadataRepository(IMetaDataRepository):
             else:
                 contents = self._ghc.repo.get_contents("", ref=self._ghc.commit)
                 self._process_contents(contents, root)
+        except GithubException as ex:
+            if ex.status in (404, 409):
+                # An empty repository, or the branch does not exist yet:
+                # there is no tree, which is how every installation starts.
+                logger.warning(
+                    f"{self._ghc.repo_name}@{self._ghc.commit} holds no tree "
+                    f"yet ({ex.status}); starting with an empty directory tree"
+                )
+            else:
+                raise TechnicalError(
+                    f"Could not read the metadata tree from "
+                    f"{self._ghc.repo_name}@{self._ghc.commit}: {ex}"
+                ) from ex
         except Exception as ex:
-            logger.error(ex)
+            # An unreachable repo must surface as a failure (the replicated
+            # layer fails over to another metadata store), never as a
+            # silently empty tree that would go on to diverge from the repo.
+            raise TechnicalError(
+                f"Could not read the metadata tree from "
+                f"{self._ghc.repo_name}@{self._ghc.commit}: {ex}"
+            ) from ex
 
         return root
 

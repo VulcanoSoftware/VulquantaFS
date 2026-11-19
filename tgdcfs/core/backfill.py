@@ -35,6 +35,11 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _storage_name(client: "Client", name: str) -> str:
+    repo = getattr(client, "fc_repo", None)
+    return repo.storage_name(name) if repo is not None else name
+
+
 @dataclass
 class BackfillReport:
     files_scanned: int = 0
@@ -146,6 +151,7 @@ async def _distribute_pending(
 
     primary = client.store
     group = client.mirror_group
+    name = _storage_name(client, fr.name)
     planned = primary.plan_parts(local.size)
     replica_targets = (
         [ch for ch in group.stores if group.needs_replica(ch, planned)]
@@ -157,12 +163,12 @@ async def _distribute_pending(
     async def upload_primary() -> List[SentFileMessage]:
         from tgdcfs.core.local_cache import FileMessageFromCache
 
-        return await primary.upload(FileMessageFromCache.new(local, fr.name))
+        return await primary.upload(FileMessageFromCache.new(local, name))
 
     async def replicate(ch: MirrorStore) -> tuple[str, Replica]:
         if group is None:  # pragma: no cover - replica_targets is empty then
             raise TechnicalError("no mirror group")
-        return ch.key, await group.replicate_local(ch, local, fr.name)
+        return ch.key, await group.replicate_local(ch, local, name)
 
     primary_task = asyncio.create_task(upload_primary())
     replica_tasks = [asyncio.create_task(replicate(ch)) for ch in replica_targets]
@@ -202,10 +208,12 @@ async def backfill_file(
         return
 
     fd = await fd_repo.get(fr, include_all_versions=True)  # type: ignore[call-arg]
+    if not fd.complete:
+        # A store outage can make validation return a partial descriptor.
+        # Do not drop queued work or save an incompletely checked version list.
+        report.failures.append(f"{fr.name}: file descriptor is temporarily unavailable")
+        return
     if not fd.get_versions():
-        # Unreadable or fully invalid descriptor (fd_repo.get returns an
-        # empty FD in that case). Never save it back -- that would
-        # overwrite the real descriptor message with an empty one.
         return
 
     # Write-back uploads first: a pending version has no store copy at all
@@ -233,6 +241,7 @@ async def backfill_file(
         await _verify_mirrors(client, fd)
 
     changed = False
+    name = _storage_name(client, fr.name)
     for version in fd.get_versions(exclude_invalid=True):
         report.versions_checked += 1
 
@@ -240,7 +249,14 @@ async def backfill_file(
         # the current primary first; that copy becomes its primary layout.
         if not version.owned_by(mirror_group.primary.key):
             try:
-                if await mirror_group.copy_into_primary(version):
+                logger.info(
+                    "Restoring %s@%s from %s to primary store %s",
+                    fr.name,
+                    version.id,
+                    version.store,
+                    mirror_group.primary.key,
+                )
+                if await mirror_group.copy_into_primary(version, name=name):
                     report.versions_promoted += 1
                     changed = True
                 else:
@@ -268,6 +284,7 @@ async def backfill_file(
             version.part_sizes or None,
             only_stores=missing,
             cache=cache,
+            name=name,
         )
         if copies.store_keys:
             copies.apply_to(version)
@@ -284,16 +301,28 @@ async def backfill_file(
             # needed for replication.
             cache.release()
 
-    fd_missing = set(mirror_group.store_keys) - {
-        key for key, mid in fr.mirrors.items() if mid > 0
-    }
+    fd_missing = (
+        set(mirror_group.store_keys)
+        - {key for key, mid in fr.mirrors.items() if mid > 0}
+        - {fr.store}
+    )
 
     if changed or fd_missing:
         # Commit point: the (possibly updated) mirrors map is persisted
         # in the FD message, and the FD itself gets its mirror copies.
         resp = await fd_repo.save(fd, fr)
         _sync_ref(fr, resp)
-        if fd_missing:
+        descriptors_missing = (
+            fd_missing
+            - {key for key, mid in fr.mirrors.items() if mid > 0}
+            - {fr.store}
+        )
+        if descriptors_missing:
+            report.failures.append(
+                f"{fr.name}: could not refresh the descriptor in "
+                f"{', '.join(sorted(descriptors_missing))}"
+            )
+        if fd_missing - descriptors_missing:
             report.fds_mirrored += 1
 
 

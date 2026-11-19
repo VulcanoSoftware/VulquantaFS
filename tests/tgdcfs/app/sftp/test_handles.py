@@ -268,3 +268,87 @@ class TestWriteHandle:
             await handle.write(4, b"more")
         with pytest.raises(TechnicalError):
             await handle.close()
+
+
+class TestWriteHandleCancellation:
+    """A request the transport tears down must take the upload task with it.
+
+    asyncssh serves SFTP requests one by one and an in-flight ``write`` or
+    ``close`` is only ever cancelled from the outside (the event loop's
+    shutdown, a cancelled session task), never by the client dropping the
+    session. If such a cancellation left the upload task running, every
+    abandoned attempt would keep its store write slots -- and the tee
+    branches that upload alongside it -- for as long as the task lives,
+    until later attempts started queueing up behind it.
+    """
+
+    @pytest.fixture
+    def ops(self, mocker):
+        ops = mocker.Mock(spec=Ops)
+        return ops
+
+    async def test_a_cancelled_write_stops_the_upload_task(self, ops, mocker):
+        release = asyncio.Event()
+
+        async def upload_from_stream(stream, size, remote):
+            # Never consume: the one-slot queue stays full and the next
+            # write blocks on its acknowledgement, as against a store
+            # that stopped accepting bytes.
+            await release.wait()
+
+        ops.upload_from_stream = mocker.AsyncMock(side_effect=upload_from_stream)
+        handle = WriteHandle(ops, "/file.bin", buffer_max_bytes=1024)
+        await handle.write(0, b"data")
+        blocked = asyncio.create_task(handle.write(4, b"more"))
+        for _ in range(1000):
+            await asyncio.sleep(0)
+            if not blocked.done():
+                break
+        assert not blocked.done()
+
+        blocked.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await blocked
+        task = handle._task
+        assert task is not None
+        await asyncio.gather(task, return_exceptions=True)
+
+        # The torn-down write cancelled the upload task instead of
+        # leaving it running with the store's write slot.
+        assert task.cancelled()
+        release.set()
+
+    async def test_a_cancelled_close_stops_the_upload_task(self, ops, mocker):
+        release = asyncio.Event()
+
+        async def upload_from_stream(stream, size, remote):
+            async for _ in stream:
+                pass
+            # The stream ended, but the upload is still "finalizing".
+            await release.wait()
+
+        ops.upload_from_stream = mocker.AsyncMock(side_effect=upload_from_stream)
+        handle = WriteHandle(ops, "/file.bin", buffer_max_bytes=1024)
+        await handle.write(0, b"data")
+        closer = asyncio.create_task(handle.close())
+        for _ in range(1000):
+            await asyncio.sleep(0)
+            if not closer.done():
+                break
+        assert not closer.done()
+
+        closer.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await closer
+        release.set()
+        task = handle._task
+        assert task is not None
+        await asyncio.gather(task, return_exceptions=True)
+
+        # A handle whose close was torn down cancelled its task directly;
+        # a task that merely kept running to the end would not be
+        # cancelled ("_abort_locked" returns early on the closed flag).
+        assert task.cancelled()
+
+        with pytest.raises(ValueError):
+            await handle.write(0, b"late")

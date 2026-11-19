@@ -1,5 +1,5 @@
 from contextlib import asynccontextmanager
-from typing import AsyncIterator, Iterable
+from typing import AsyncIterator, Iterable, List
 
 from tgdcfs.core.model import TGFSDirectory, TGFSMetadata
 from tgdcfs.core.repository.interface import IMetaDataRepository
@@ -61,3 +61,16 @@ class MetaDataApi:
         self, directories: Iterable[TGFSDirectory], keep: bool
     ) -> None:
         await self.__metadata_repo.save_stats(directories, keep)
+
+    # -- metadata redundancy -------------------------------------------------
+
+    async def heal(self) -> None:
+        """Re-write the metadata stores that missed a write; a no-op while
+        every store is up to date."""
+        await self.__metadata_repo.heal()
+
+    def stale_stores(self) -> List[str]:
+        return self.__metadata_repo.stale_stores()
+
+    async def close(self) -> None:
+        await self.__metadata_repo.close()

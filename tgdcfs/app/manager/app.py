@@ -96,6 +96,20 @@ def create_manager_app(
                 "read_sources": list(fs.read_sources),
                 "write_ack": fs.write_ack,
                 "metadata": fs.metadata.type.value,
+                "metadata_stores": [
+                    {
+                        "role": "primary" if i == 0 else "mirror",
+                        "type": cfg.type.value,
+                        "name": cfg.name,
+                        "store": cfg.store,
+                    }
+                    for i, cfg in enumerate(fs.metadata_stores)
+                ],
+                "metadata_stale": (
+                    client.metadata_api.stale_stores()
+                    if client and client.metadata_api
+                    else []
+                ),
                 "primary_dead": bool(
                     client
                     and client.mirror_group

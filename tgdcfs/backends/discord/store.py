@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from itertools import cycle
 from typing import (
     Any,
@@ -36,7 +37,7 @@ from typing import (
 from lru import LRU  # type: ignore
 
 from tgdcfs.backends.base import IStore, StoreCapabilities, make_store_key
-from tgdcfs.errors import MessageNotFound, TechnicalError
+from tgdcfs.errors import MessageNotFound, RpcTimeoutError, TechnicalError
 from tgdcfs.reqres import (
     DownloadFileResp,
     FileMessageFromStream,
@@ -44,6 +45,7 @@ from tgdcfs.reqres import (
     MessageRespWithDocument,
     SentFileMessage,
     UploadableFileMessage,
+    aclose_content,
 )
 from tgdcfs.utils.message_cache import channel_cache
 
@@ -64,6 +66,15 @@ OVERFLOW_CAPTION = "TGDCFS_OVERFLOW"
 
 # Reads a part in this many bytes at a time while buffering it.
 READ_CHUNK = 1024 * 1024
+
+# A live upload can have all its WRITEs acknowledged before the final
+# Discord attachments have been accepted. Bound that tail per file,
+# without shrinking the bot pool available to other files.
+LIVE_PARTS_IN_FLIGHT = 2
+# A silent Discord HTTP request (including the library's retries) must not
+# hold a mirrored live upload past FileZilla's 20s inactivity timeout.
+# Standalone uploads and background copies keep the normal retry policy.
+LIVE_PART_TIMEOUT_S = 12.0
 
 # Discord's error code for an edit of a message another user sent.
 CANNOT_EDIT_FOREIGN_MESSAGE = 50005
@@ -327,10 +338,17 @@ class DiscordStore(IStore):
             f"upload of {name}",
             lambda bot: bot.send_file(self.channel_id, data, name),
         )
+        # Discord's POST response already identifies and sizes the
+        # attachment. A queued heal may validate hundreds of these
+        # messages immediately after upload: don't GET all of them again.
+        if sent.document is not None:
+            channel_cache(self.channel_id).id[sent.message_id] = MessageResp(
+                message_id=sent.message_id, text="", document=sent.document
+            )
         return SentFileMessage(message_id=sent.message_id, size=len(data))
 
     async def _send_part_with_slot(
-        self, data: bytes, name: str, unstarted: List[int]
+        self, data: bytes, name: str, unstarted: List[int], live: bool
     ) -> SentFileMessage:
         """Send one part with the upload slot ``upload`` acquired for it and
         release the slot afterwards. ``unstarted`` counts the tasks that
@@ -338,7 +356,16 @@ class DiscordStore(IStore):
         step never reaches its ``finally``, so ``upload`` releases for it."""
         unstarted[0] -= 1
         try:
-            return await self._send_part(data, name)
+            if not live:
+                return await self._send_part(data, name)
+            try:
+                async with asyncio.timeout(LIVE_PART_TIMEOUT_S):
+                    return await self._send_part(data, name)
+            except TimeoutError as ex:
+                raise RpcTimeoutError(
+                    f"Discord store {self.key} did not confirm {name} "
+                    f"within {LIVE_PART_TIMEOUT_S:g}s"
+                ) from ex
         finally:
             self._upload_slots.release()
 
@@ -348,23 +375,33 @@ class DiscordStore(IStore):
         Parts are read sequentially (the message is a stream) and sent
         with bounded concurrency; the result is in file order. A part is
         read only once a slot is free for it, so at most
-        ``max_concurrent_uploads`` parts are in memory and a source that
-        produces faster than Discord takes (a cache file, a tee'd upload
-        stream) is held back instead of buffered whole.
+        ``max_concurrent_uploads`` parts are in memory. A live stream also
+        limits its per-file backlog so a late client CLOSE doesn't wait
+        for an entire bot pool's worth of bytes.
         """
         await file_msg.open()
         file_name = file_msg.file_name()
         size = file_msg.get_size()
         tasks: List[asyncio.Task[SentFileMessage]] = []
         unstarted = [0]
+        live = size < 0 and file_msg.failover and not file_msg.background
         try:
             index = 0
             remaining = size
             while True:
+                if size < 0 and index >= LIVE_PARTS_IN_FLIGHT:
+                    await tasks[index - LIVE_PARTS_IN_FLIGHT]
                 limit = self._max_part_bytes
                 if size >= 0:
                     limit = min(limit, remaining)
-                await self._upload_slots.acquire()
+                try:
+                    async with asyncio.timeout(LIVE_PART_TIMEOUT_S if live else None):
+                        await self._upload_slots.acquire()
+                except TimeoutError as ex:
+                    raise RpcTimeoutError(
+                        f"Discord store {self.key} has no free upload slot "
+                        f"after {LIVE_PART_TIMEOUT_S:g}s for {file_name}"
+                    ) from ex
                 try:
                     data = await self._read_part(file_msg, limit) if limit > 0 else b""
                 except BaseException:
@@ -378,14 +415,36 @@ class DiscordStore(IStore):
                 tasks.append(
                     asyncio.create_task(
                         self._send_part_with_slot(
-                            data, f"[part{index}]{file_name}", unstarted
+                            data,
+                            f"[part{index}]{file_name}",
+                            unstarted,
+                            live=live,
                         )
                     )
                 )
                 remaining -= len(data)
                 if (size >= 0 and remaining <= 0) or len(data) < self._max_part_bytes:
                     break
-            return list(await asyncio.gather(*tasks))
+            if size < 0:
+                logger.info(
+                    "Discord store %s reached EOF for %s: %d attachments, "
+                    "%d awaiting confirmation",
+                    self.key,
+                    file_name,
+                    index,
+                    sum(not task.done() for task in tasks),
+                )
+            started = time.monotonic()
+            sent = list(await asyncio.gather(*tasks))
+            if size < 0:
+                logger.info(
+                    "Discord store %s confirmed all attachments for %s in %.1fs "
+                    "after EOF",
+                    self.key,
+                    file_name,
+                    time.monotonic() - started,
+                )
+            return sent
         except BaseException:
             for task in tasks:
                 task.cancel()
@@ -410,9 +469,12 @@ class DiscordStore(IStore):
             )
 
         async def guarded() -> AsyncIterator[bytes]:
-            async with self._download_slots:
-                async for chunk in chunks:
-                    yield chunk
+            try:
+                async with self._download_slots:
+                    async for chunk in chunks:
+                        yield chunk
+            finally:
+                await aclose_content(chunks)
 
         return DownloadFileResp(chunks=guarded(), size=size)
 

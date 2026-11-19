@@ -88,11 +88,42 @@ filesystems:
         repo: 'tgdcfs-demo/tgdcfs-demo'
         commit: 'master'
         access_token: hidden
+        # How the tree is stored: 'tree' (default) mirrors it into the
+        # repository's own directory structure, one blob per directory,
+        # written incrementally; 'document' keeps the whole tree in one
+        # JSON file that is rewritten on every push, the same shape the
+        # pinned-message store uses.
+        # layout: 'tree'
+        # Where the document layout keeps the JSON document.
+        # file_path: 'metadata.json'
         # How many directories the startup reads in parallel when the
         # metadata repo is too big for one recursive tree call (default
         # 8). Higher is faster but bursts harder against GitHub's rate
         # limit.
         # tree_fetch_concurrency: 8
+    # Redundant metadata stores: every metadata write goes to the store
+    # above (the primary) and to each of these. A store that is
+    # temporarily unreachable is skipped and re-synced once it is back
+    # (a background task retries every 30 s), and on a restart the tree
+    # is loaded from the first store that answers. Any combination of a
+    # pinned message in a specific store's channel, a GitHub repo and a
+    # GitLab repo is allowed; two pinned stores cannot share one channel.
+    # metadata_mirrors:
+    #   - type: pinned_message
+    #     store: demo-mirror
+    #   - type: gitlab_repo
+    #     gitlab_repo:
+    #       repo: 'tgdcfs-demo/tgdcfs-demo'
+    #       branch: 'master'
+    #       access_token: hidden
+    #       # How the tree is stored: 'tree' (default, the same shape the
+    #       # GitHub repo store uses) or 'document' (one JSON file,
+    #       # rewritten on every push). A repository that still holds the
+    #       # single-document layout of an older release is migrated to
+    #       # the tree layout automatically.
+    #       # layout: 'tree'
+    #       # base_url: 'https://gitlab.example.com'  # self-hosted
+    #       # file_path: 'metadata.json'
 
 tgdcfs:
   users:

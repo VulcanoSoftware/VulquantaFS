@@ -1,4 +1,4 @@
-from .base import TechnicalError
+from .base import RpcTimeoutError, TechnicalError
 from .path import (
     DirectoryIsNotEmpty,
     FileOrDirectoryAlreadyExists,
@@ -10,9 +10,11 @@ from .telegram import FileSizeTooLarge, MessageNotFound
 from .tgdcfs import (
     DuplicatedChannelIdOrName,
     LoginFailed,
+    MetadataBlobTooLarge,
     MetadataNotFound,
     MetadataNotInitialized,
     NoPinnedMessage,
+    NoStoredMetadata,
     PinnedMessageNotSupported,
     TaskCancelled,
     UnDownloadableMessage,
@@ -20,6 +22,7 @@ from .tgdcfs import (
 
 __all__ = [
     "TechnicalError",
+    "RpcTimeoutError",
     "DirectoryIsNotEmpty",
     "FileOrDirectoryAlreadyExists",
     "FileOrDirectoryDoesNotExist",
@@ -27,9 +30,11 @@ __all__ = [
     "InvalidPath",
     "FileSizeTooLarge",
     "MessageNotFound",
+    "MetadataBlobTooLarge",
     "MetadataNotFound",
     "MetadataNotInitialized",
     "NoPinnedMessage",
+    "NoStoredMetadata",
     "UnDownloadableMessage",
     "PinnedMessageNotSupported",
     "TaskCancelled",

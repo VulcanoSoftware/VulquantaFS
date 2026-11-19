@@ -39,6 +39,43 @@ class NoPinnedMessage(BusinessError):
         )
 
 
+class NoStoredMetadata(BusinessError):
+    """A metadata store holds no metadata document yet.
+
+    Raised instead of creating one when a store is only a redundant copy:
+    the replicated layer must not bootstrap an empty tree into a mirror
+    while the primary is briefly unreachable, or it would look empty and
+    win the failover.
+    """
+
+    def __init__(self, store: str = ""):
+        super().__init__(
+            message=f"No metadata document in store {store}".strip(),
+            code=ErrorCode.NO_STORED_METADATA,
+            cause=None,
+        )
+
+
+class MetadataBlobTooLarge(BusinessError):
+    """The metadata document does not fit one message of a pinned store.
+
+    A pinned copy has to be a single message; a store with smaller
+    messages cannot hold it. The replicated layer treats this as a
+    permanent skip for that store (logged once) rather than an error to
+    retry, and un-skips it if a later document fits again.
+    """
+
+    def __init__(self, size: int, store: str, max_part_bytes: int):
+        super().__init__(
+            message=(
+                f"The metadata blob ({size} bytes) does not fit one message "
+                f"of store {store} ({max_part_bytes} bytes)"
+            ),
+            code=ErrorCode.METADATA_BLOB_TOO_LARGE,
+            cause=None,
+        )
+
+
 class PinnedMessageNotSupported(BusinessError):
     def __init__(self):
         super().__init__(

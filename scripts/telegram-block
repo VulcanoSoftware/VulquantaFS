@@ -1,0 +1,38 @@
+#!/bin/bash
+NAME=Telegram; CHAIN=TGBLOCK
+targets() {
+  local r
+  r=$(fetch https://core.telegram.org/resources/cidr.txt | grep -E '^[0-9a-fA-F:.]+/[0-9]+$')
+  [[ -z $r ]] && r="149.154.160.0/20 91.108.4.0/22 91.108.8.0/22 91.108.12.0/22 91.108.16.0/22 91.108.56.0/22 95.161.64.0/20 185.76.151.0/24 2001:b28:f23d::/48 2001:b28:f23f::/48 2001:67c:4e8::/48"
+  printf '%s\n' $r
+  resolve api.telegram.org t.me web.telegram.org core.telegram.org
+}
+MODE=${MODE:-DROP}
+[[ $EUID -eq 0 ]] || { echo "Draai als root (sudo)."; exit 1; }
+resolve() { for d in "$@"; do getent ahosts "$d" | awk '{print $1}'; done | sort -u; }
+fetch() { curl -fsS -m 10 "$1" 2>/dev/null; }
+unblock() {
+  for t in iptables ip6tables; do
+    for h in OUTPUT FORWARD; do while $t -D $h -j $CHAIN 2>/dev/null; do :; done; done
+    $t -F $CHAIN 2>/dev/null; $t -X $CHAIN 2>/dev/null
+  done
+}
+block() {
+  unblock   # eerst vrijgeven, anders kan de IP-lijst niet opgehaald worden
+  mapfile -t T < <(targets | grep -v -e '^$' -e '^::ffff:' | sort -u)
+  [[ ${#T[@]} -gt 0 ]] || { echo "Geen adressen gevonden (DNS/internet al geblokkeerd?)"; exit 1; }
+  for t in iptables ip6tables; do $t -N $CHAIN 2>/dev/null; $t -F $CHAIN; done
+  for a in "${T[@]}"; do
+    if [[ $a == *:* ]]; then ip6tables -A $CHAIN -d "$a" -j "$MODE" 2>/dev/null
+    else iptables -A $CHAIN -d "$a" -j "$MODE" 2>/dev/null; fi
+  done
+  for t in iptables ip6tables; do for h in OUTPUT FORWARD; do
+    $t -C $h -j $CHAIN 2>/dev/null || $t -I $h 1 -j $CHAIN
+  done; done
+  echo "$NAME geblokkeerd ($MODE, ${#T[@]} adressen/ranges)"
+}
+case "$1" in
+  block) block ;;
+  unblock) unblock; echo "$NAME weer bereikbaar" ;;
+  *) echo "gebruik: $0 block|unblock   (MODE=REJECT voor directe fouten i.p.v. timeouts)"; exit 1 ;;
+esac

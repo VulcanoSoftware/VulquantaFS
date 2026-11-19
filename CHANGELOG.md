@@ -18,6 +18,54 @@ the fact on the commits that shipped them.
 
 ### Fixed
 
+- The file data of a replicated file system now heals itself the way the
+  metadata does. With ``sync: tee`` a mirror write that failed (a mirror
+  store being temporarily down, for instance) was detected and the file's
+  path was put on the persistent replication queue, but no worker ever
+  drained the queue for a ``tee`` file system: the copy only came back
+  through a manual backfill. A replication worker now runs for every file
+  system with mirrors, whatever its ``sync`` mode, and ``inline`` writes
+  report their gaps to the queue as well. A store that was unreachable
+  during an upload is caught up automatically once it is back, with the
+  queue's usual backoff, without manual action.
+
+- The primary metadata store is no longer the source of truth by
+  definition. It always was, so a mirror that kept receiving writes
+  while the primary was down (as reported in the logs: metadata was
+  still written to the mirror) lost those writes at the next boot to
+  the primary's older copy -- which was then also synced over the
+  mirror, erasing them there too. Every store is now read at start and
+  dated: git stores by the branch head commit's date, document and
+  pinned-message stores by a revision that every push writes into the
+  metadata document. The most recent tree is served and the older
+  stores are re-synced to it, primary included. Within a short window
+  (~1 minute) the primary keeps the lead, so the blink between two
+  stores' write clocks never flips the source of truth in calm
+  operation.
+
+- The metadata store constructors no longer touch the network. The
+  GitHub stores resolved their repository with a blocking call in
+  `__init__`, on the event loop, while the configuration loaded: with
+  api.github.com unreachable, PyGithub's retry cycle froze the whole
+  server before the replicated metadata layer even existed, and a
+  perfectly healthy GitLab mirror never got the chance to serve. The
+  repositories now resolve lazily on the first API call, which runs on a
+  worker thread; a failure there surfaces as that store's read error, so
+  the layer fails over to the next store and the heal worker catches the
+  unavailable store up once it answers again. The GitHub metadata
+  clients also cap PyGithub's retry cycle at two attempts, and a circuit
+  breaker refuses the store's calls once one of them ran into a dead
+  connection, while a background probe alone waits for the service: one
+  outage costs its connection timeouts once -- at boot, instead of
+  several minutes -- and then no listing, write, stats commit or heal
+  queues behind it again. When the probe finds the service answering
+  again, the breaker closes and the heal worker brings the store back in
+  line within a probe interval.
+- The full metadata tree sync and the GitLab tree mirror no longer send
+  a create element that carries both a sha and a content: the GitHub
+  Git tree API rejects that combination with a 422, which left every
+  sync with new blobs failing forever, and the GitLab mirror dropped
+  the deletion of a stats file through a blob fetch of a null sha.
 - The Docker image names in the config generator's command panel and in
   the getting-started guide follow the repository the site is built from.
   They were hard-coded (and kept pointing at a foreign namespace, because
@@ -35,6 +83,29 @@ the fact on the commits that shipped them.
 
 ### Added
 
+- Repository metadata stores (GitHub and GitLab) now have a `layout`
+  option. `tree` (the default for both) mirrors the directory tree into
+  the repository's own directory structure, one blob per directory,
+  written incrementally -- the shape `github_repo` has always used.
+  `document` keeps the whole tree in one JSON file that is rewritten on
+  every push, the same shape the pinned-message store uses, and is
+  AES-GCM encrypted when at-rest encryption is on. GitLab's tree layout
+  speaks the same engine as the GitHub store (incremental writes, diff
+  sync, per-folder stats files, directory dates) through a REST facade,
+  so both hosts behave identically; a GitLab repository that still holds
+  the single-document layout of an older release is migrated to the tree
+  layout automatically on the first push. The config generator offers
+  the layout for both hosts and reads it back from an existing config.
+- The config generator also gained the `file_path` option for GitHub's
+  document layout, matching the GitLab store. The file path is only shown
+  (and written) for the document layout, where it means something. The
+  generator now checks the metadata stores of a file system the way the
+  loader does -- two pinned-message stores on one store, the same
+  repository twice, a pinned store outside the file system, a missing
+  repository or access token -- and shows the problem inline; the store
+  picker of a pinned-message store only offers the file system's own
+  stores, and renaming a store keeps the pinned-message stores pointing
+  at it.
 - The Docker images are published to GHCR (`ghcr.io/<owner>/tgdcfs` and
   `ghcr.io/<owner>/tgdcfs-fe`) next to Docker Hub, with the same `latest`,
   commit, `preview` and release tags. GHCR publishing uses the workflow's
@@ -77,6 +148,26 @@ the fact on the commits that shipped them.
   directories are now read in parallel instead of one round trip after
   another, and the load logs how many directories it read and how long
   the fallback took.
+- Redundant metadata (RAID-1 for the metadata, like the file stores have
+  for the file bytes). A file system can list extra metadata stores under
+  `metadata_mirrors`: any combination of a pinned message in a specific
+  store's channel (`store: <name>` -- a Telegram pinned message and a
+  Discord pinned message are two separate, individually configurable
+  stores), a `github_repo` and a new `gitlab_repo` type. Every metadata
+  write goes to the primary store and to each mirror; a store that is
+  temporarily unreachable is skipped and marked stale, writes and reads
+  continue with the stores that are up, and a background task (every 30 s,
+  plus once right after start) re-writes the stale stores until they take
+  the tree again. On a restart the tree is loaded from the first store
+  that answers, preferring the primary, so a store that was down still
+  serves its last consistent copy. `gitlab_repo` keeps the whole tree as
+  one document (`metadata.json` by default, AES-256-GCM encrypted when
+  at-rest encryption is on) in a GitLab repository -- gitlab.com or a
+  self-hosted instance via `base_url`. Without `metadata_mirrors` nothing
+  changes: the classic single-store behaviour (including the pinned
+  copies a pinned-message metadata store keeps in the mirror channels)
+  is preserved. The manager API reports the stores that still await
+  healing.
 
 ### Changed
 

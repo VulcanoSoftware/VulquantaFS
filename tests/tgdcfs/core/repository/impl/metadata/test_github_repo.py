@@ -12,7 +12,9 @@ from github.GitTreeElement import GitTreeElement
 
 from tgdcfs.config import GithubRepoConfig
 from tgdcfs.core.model import FileStat, TGFSDirectory, TGFSFileRef, TGFSMetadata
-from tgdcfs.errors import TechnicalError
+from tgdcfs.crypto.path_names import encrypt_path_name
+from tgdcfs.errors import MetadataNotInitialized, TechnicalError
+from tgdcfs.core.repository.impl.metadata.breaker import FailFastRepository
 from tgdcfs.core.repository.impl.metadata.github_repo import (
     GithubRepoMetadataRepository,
 )
@@ -130,11 +132,17 @@ class TestGithubRepoMetadataRepository:
 
         repository = GithubRepoMetadataRepository(mock_github_config)
 
-        mock_github_class.assert_called_once_with("test_token")
-        mock_github_instance.get_repo.assert_called_once_with("owner/test-repo")
+        mock_github_class.assert_called_once()
+        call = mock_github_class.call_args
+        assert call.args == ("test_token",)
+        assert call.kwargs["retry"].total == 1
+        mock_github_instance.get_repo.assert_called_once_with(
+            "owner/test-repo", lazy=True
+        )
         assert repository._ghc.repo_name == "owner/test-repo"
         assert repository._ghc.commit == "main"
-        assert repository._ghc.repo == mock_repo
+        assert isinstance(repository._ghc.repo, FailFastRepository)
+        assert repository._ghc.repo._inner == mock_repo
         assert repository._ghc.gh == mock_github_instance
 
     @patch("tgdcfs.core.repository.impl.metadata.github_repo.Github")
@@ -159,6 +167,51 @@ class TestGithubRepoMetadataRepository:
         assert isinstance(result.dir, GithubDirectory)
         assert result.dir.name == "root"
         assert result.dir.parent is None
+
+    @patch("tgdcfs.core.repository.impl.metadata.github_repo.Github")
+    @pytest.mark.asyncio
+    async def test_get_metadata_dates_the_tree_by_the_branch_head(
+        self, mock_github_class, mock_github_config
+    ):
+        """The replicated layer compares stores by this date."""
+        mock_github_instance = Mock(spec=Github)
+        mock_repo = Mock(spec=Repository)
+        mock_github_instance.get_repo.return_value = mock_repo
+        mock_github_class.return_value = mock_github_instance
+        mock_tree(mock_repo, [])
+
+        committed = datetime.datetime(2026, 6, 1, 12, 0, tzinfo=datetime.timezone.utc)
+        ref = Mock()
+        ref.object.sha = "commitsha"
+        mock_repo.get_git_ref.return_value = ref
+        commit = Mock()
+        commit.committer.date = committed
+        mock_repo.get_git_commit.return_value = commit
+
+        repository = GithubRepoMetadataRepository(mock_github_config)
+        result = await repository.get()
+
+        assert result.revision == committed.timestamp()
+
+    @patch("tgdcfs.core.repository.impl.metadata.github_repo.Github")
+    @pytest.mark.asyncio
+    async def test_get_metadata_survives_an_undatable_branch(
+        self, mock_github_class, mock_github_config
+    ):
+        """A branch without a head (a fresh repository) dates as unknown."""
+        mock_github_instance = Mock(spec=Github)
+        mock_repo = Mock(spec=Repository)
+        mock_github_instance.get_repo.return_value = mock_repo
+        mock_github_class.return_value = mock_github_instance
+        mock_tree(mock_repo, [])
+        mock_repo.get_git_ref.side_effect = GithubException(
+            404, {"message": "Not Found"}, None
+        )
+
+        repository = GithubRepoMetadataRepository(mock_github_config)
+        result = await repository.get()
+
+        assert result.revision is None
 
     @patch("tgdcfs.core.repository.impl.metadata.github_repo.Github")
     def test_build_directory_structure_restores_root_timestamps(
@@ -462,7 +515,9 @@ class TestGithubRepoMetadataRepository:
     def test_build_directory_structure_handles_repo_errors(
         self, mock_logger, mock_github_class, mock_github_config
     ):
-        """Test handling of repository access errors"""
+        """A repo that cannot be read is a failure, not an empty tree:
+        the caller (the replicated metadata layer) fails over to another
+        store instead of silently serving nothing."""
         mock_github_instance = Mock(spec=Github)
         mock_repo = Mock(spec=Repository)
         mock_github_instance.get_repo.return_value = mock_repo
@@ -473,15 +528,33 @@ class TestGithubRepoMetadataRepository:
         mock_repo.get_contents.side_effect = Exception("API rate limit exceeded")
 
         repository = GithubRepoMetadataRepository(mock_github_config)
+        with pytest.raises(TechnicalError, match="API rate limit exceeded"):
+            repository._build_directory_structure()
+
+    @patch("tgdcfs.core.repository.impl.metadata.github_repo.Github")
+    @patch("tgdcfs.core.repository.impl.metadata.github_repo.logger")
+    def test_build_directory_structure_tolerates_an_empty_repo(
+        self, mock_logger, mock_github_class, mock_github_config
+    ):
+        """A fresh repository (no commits, no branch) starts empty."""
+        from github.GithubException import GithubException
+
+        mock_github_instance = Mock(spec=Github)
+        mock_repo = Mock(spec=Repository)
+        mock_github_instance.get_repo.return_value = mock_repo
+        mock_github_class.return_value = mock_github_instance
+
+        mock_repo.get_git_tree.side_effect = GithubException(404, "no tree", None)
+        mock_repo.get_contents.side_effect = GithubException(
+            404, "repository is empty", None
+        )
+
+        repository = GithubRepoMetadataRepository(mock_github_config)
         root_dir = repository._build_directory_structure()
 
-        # Should return empty root directory
         assert root_dir.name == "root"
         assert len(root_dir.files) == 0
         assert len(root_dir.children) == 0
-
-        # Should log error
-        mock_logger.error.assert_called_once()
 
     @patch("tgdcfs.core.repository.impl.metadata.github_repo.Github")
     def test_unreadable_tree_falls_back_to_the_directory_walk(
@@ -1425,3 +1498,252 @@ class TestStatsFiles:
 
         assert ref.edit.call_count == 2
         assert repo.get_git_ref.call_count == 2
+
+
+class TestPushFullSync:
+    """The full-tree sync that turns the repo into a redundant metadata
+    store and heals it after it missed incremental writes."""
+
+    def build_repository(self, mock_github_class, mock_github_config, mock_ghc):
+        mock_github_instance = Mock(spec=Github)
+        mock_github_instance.get_repo.return_value = Mock(spec=Repository)
+        mock_github_class.return_value = mock_github_instance
+        repository = GithubRepoMetadataRepository(mock_github_config)
+        repository._ghc = mock_ghc
+        return repository
+
+    def plain_tree(self) -> TGFSMetadata:
+        root = TGFSDirectory.root_dir()
+        docs = root.create_dir("docs")
+        docs.files.append(TGFSFileRef(message_id=42, name="readme", location=docs))
+        return TGFSMetadata(root)
+
+    def sync_tree(self, repo, paths, truncated=False):
+        tree = mock_tree(repo, paths, truncated=truncated)
+        for e in tree.tree:
+            e.sha = e.path + "-sha"
+            e.mode = "100644"
+        return tree
+
+    @patch("tgdcfs.core.repository.impl.metadata.github_repo.Github")
+    @pytest.mark.asyncio
+    async def test_push_full_commits_the_missing_blobs(
+        self, mock_github_class, mock_github_config, mock_ghc
+    ):
+        repository = self.build_repository(
+            mock_github_class, mock_github_config, mock_ghc
+        )
+        repository.metadata = self.plain_tree()
+        self.sync_tree(mock_ghc.repo, [])
+
+        ref = Mock()
+        ref.object.sha = "commitsha"
+        base_commit = Mock()
+        base_commit.tree.sha = "basetreesha"
+        new_commit = Mock()
+        new_commit.sha = "newcommitsha"
+        mock_ghc.repo.get_git_ref.return_value = ref
+        mock_ghc.repo.get_git_commit.return_value = base_commit
+        mock_ghc.repo.create_git_tree.return_value = Mock()
+        mock_ghc.repo.create_git_commit.return_value = new_commit
+
+        await repository.push_full()
+
+        elements = mock_ghc.repo.create_git_tree.call_args[0][0]
+        created = {
+            e._InputGitTreeElement__path
+            for e in elements
+            if e._InputGitTreeElement__content == ""
+        }
+        assert created == {"docs/readme.42"}
+        # A create must carry content only: an element with a sha (even a
+        # null one) alongside content is rejected by GitHub with a 422.
+        assert all(
+            "sha" not in e._identity for e in elements if "content" in e._identity
+        )
+        # The kept blobs are re-listed with their original sha and mode.
+        kept = {
+            e._InputGitTreeElement__path: e._InputGitTreeElement__sha
+            for e in elements
+            if e._InputGitTreeElement__content != ""
+        }
+        assert kept == {}
+        mock_ghc.repo.create_git_commit.assert_called_once()
+        ref.edit.assert_called_once_with("newcommitsha")
+
+    @patch("tgdcfs.core.repository.impl.metadata.github_repo.Github")
+    @pytest.mark.asyncio
+    async def test_push_full_deletes_stale_file_refs_but_keeps_foreign_files(
+        self, mock_github_class, mock_github_config, mock_ghc
+    ):
+        repository = self.build_repository(
+            mock_github_class, mock_github_config, mock_ghc
+        )
+        repository.metadata = self.plain_tree()
+        self.sync_tree(
+            mock_ghc.repo,
+            [
+                "docs/oldfile.7",
+                "docs/.gitkeep",
+                "docs/.tgdcfsstats.json",
+                "README.md",
+            ],
+        )
+
+        ref = Mock()
+        ref.object.sha = "commitsha"
+        base_commit = Mock()
+        base_commit.tree.sha = "basetreesha"
+        new_commit = Mock()
+        new_commit.sha = "newcommitsha"
+        mock_ghc.repo.get_git_ref.return_value = ref
+        mock_ghc.repo.get_git_commit.return_value = base_commit
+        mock_ghc.repo.create_git_tree.return_value = Mock()
+        mock_ghc.repo.create_git_commit.return_value = new_commit
+
+        await repository.push_full()
+
+        elements = mock_ghc.repo.create_git_tree.call_args[0][0]
+        paths = [e._InputGitTreeElement__path for e in elements]
+        # Created: the file ref of the tree. Kept: the stats file and the
+        # README. Deleted: the stale ref and the now-unneeded gitkeep (a
+        # directory with a blob beneath it no longer carries one).
+        assert "docs/readme.42" in paths
+        assert "docs/.gitkeep" not in paths
+        assert "docs/.tgdcfsstats.json" in paths
+        assert "README.md" in paths
+        assert "docs/oldfile.7" not in paths
+        kept = {
+            e._InputGitTreeElement__path: e._InputGitTreeElement__sha
+            for e in elements
+            if e._InputGitTreeElement__content != ""
+        }
+        assert kept == {
+            "docs/.tgdcfsstats.json": "docs/.tgdcfsstats.json-sha",
+            "README.md": "README.md-sha",
+        }
+
+    @patch("tgdcfs.core.repository.impl.metadata.github_repo.Github")
+    @pytest.mark.asyncio
+    async def test_push_full_is_a_noop_when_the_repo_is_in_sync(
+        self, mock_github_class, mock_github_config, mock_ghc
+    ):
+        repository = self.build_repository(
+            mock_github_class, mock_github_config, mock_ghc
+        )
+        repository.metadata = self.plain_tree()
+        self.sync_tree(mock_ghc.repo, ["docs/readme.42"])
+
+        ref = Mock()
+        ref.object.sha = "commitsha"
+        base_commit = Mock()
+        base_commit.tree.sha = "basetreesha"
+        mock_ghc.repo.get_git_ref.return_value = ref
+        mock_ghc.repo.get_git_commit.return_value = base_commit
+
+        await repository.push_full()
+
+        mock_ghc.repo.create_git_tree.assert_not_called()
+        mock_ghc.repo.create_git_commit.assert_not_called()
+        ref.edit.assert_not_called()
+
+    @patch("tgdcfs.core.repository.impl.metadata.github_repo.Github")
+    @pytest.mark.asyncio
+    async def test_push_full_refuses_a_truncated_tree(
+        self, mock_github_class, mock_github_config, mock_ghc
+    ):
+        repository = self.build_repository(
+            mock_github_class, mock_github_config, mock_ghc
+        )
+        repository.metadata = self.plain_tree()
+        self.sync_tree(mock_ghc.repo, ["docs/readme.42"], truncated=True)
+
+        ref = Mock()
+        ref.object.sha = "commitsha"
+        base_commit = Mock()
+        base_commit.tree.sha = "basetreesha"
+        mock_ghc.repo.get_git_ref.return_value = ref
+        mock_ghc.repo.get_git_commit.return_value = base_commit
+
+        with pytest.raises(TechnicalError, match="truncated"):
+            await repository.push_full()
+
+        mock_ghc.repo.create_git_commit.assert_not_called()
+
+    @patch("tgdcfs.core.repository.impl.metadata.github_repo.Github")
+    @pytest.mark.asyncio
+    async def test_push_full_creates_the_branch_on_a_fresh_repo(
+        self, mock_github_class, mock_github_config, mock_ghc
+    ):
+        repository = self.build_repository(
+            mock_github_class, mock_github_config, mock_ghc
+        )
+        repository.metadata = self.plain_tree()
+        self.sync_tree(mock_ghc.repo, [])
+        mock_ghc.repo.get_git_ref.side_effect = GithubException(
+            404, {"message": "Not Found"}, None
+        )
+        new_commit = Mock()
+        new_commit.sha = "firstsha"
+        mock_ghc.repo.create_git_tree.return_value = Mock()
+        mock_ghc.repo.create_git_commit.return_value = new_commit
+
+        await repository.push_full()
+
+        elements = mock_ghc.repo.create_git_tree.call_args[0][0]
+        assert {e._InputGitTreeElement__path for e in elements} == {"docs/readme.42"}
+        assert all(
+            "sha" not in e._identity for e in elements if "content" in e._identity
+        )
+        # An initial commit has no parent.
+        assert mock_ghc.repo.create_git_commit.call_args[0][2] == []
+        mock_ghc.repo.create_git_ref.assert_called_once_with(
+            "refs/heads/main", "firstsha"
+        )
+
+    @patch("tgdcfs.core.repository.impl.metadata.github_repo.Github")
+    @pytest.mark.asyncio
+    async def test_push_full_encodes_the_names_of_a_plain_tree(
+        self, mock_github_class, mock_github_config, mock_ghc
+    ):
+        name_key = b"k" * 32
+        repository = GithubRepoMetadataRepository(mock_github_config, name_key=name_key)
+        repository._ghc = mock_ghc
+        repository._ghc.name_key = name_key
+        repository.metadata = self.plain_tree()
+        self.sync_tree(mock_ghc.repo, [])
+
+        ref = Mock()
+        ref.object.sha = "commitsha"
+        base_commit = Mock()
+        base_commit.tree.sha = "basetreesha"
+        new_commit = Mock()
+        new_commit.sha = "newcommitsha"
+        mock_ghc.repo.get_git_ref.return_value = ref
+        mock_ghc.repo.get_git_commit.return_value = base_commit
+        mock_ghc.repo.create_git_tree.return_value = Mock()
+        mock_ghc.repo.create_git_commit.return_value = new_commit
+
+        await repository.push_full()
+
+        elements = mock_ghc.repo.create_git_tree.call_args[0][0]
+        created = {
+            e._InputGitTreeElement__path
+            for e in elements
+            if e._InputGitTreeElement__content == ""
+        }
+        docs_name = encrypt_path_name(name_key, "docs")
+        readme_name = encrypt_path_name(name_key, "readme")
+        assert created == {f"{docs_name}/{readme_name}.42"}
+
+    @patch("tgdcfs.core.repository.impl.metadata.github_repo.Github")
+    @pytest.mark.asyncio
+    async def test_push_full_without_a_tree_raises(
+        self, mock_github_class, mock_github_config, mock_ghc
+    ):
+        repository = self.build_repository(
+            mock_github_class, mock_github_config, mock_ghc
+        )
+
+        with pytest.raises(MetadataNotInitialized):
+            await repository.push_full()

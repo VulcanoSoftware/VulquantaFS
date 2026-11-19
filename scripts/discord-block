@@ -1,0 +1,34 @@
+#!/bin/bash
+NAME=Discord; CHAIN=DCBLOCK
+targets() {
+  resolve discord.com discordapp.com gateway.discord.gg cdn.discordapp.com media.discordapp.net discord.gg discord.media dis.gd status.discord.com
+}
+MODE=${MODE:-DROP}
+[[ $EUID -eq 0 ]] || { echo "Draai als root (sudo)."; exit 1; }
+resolve() { for d in "$@"; do getent ahosts "$d" | awk '{print $1}'; done | sort -u; }
+fetch() { curl -fsS -m 10 "$1" 2>/dev/null; }
+unblock() {
+  for t in iptables ip6tables; do
+    for h in OUTPUT FORWARD; do while $t -D $h -j $CHAIN 2>/dev/null; do :; done; done
+    $t -F $CHAIN 2>/dev/null; $t -X $CHAIN 2>/dev/null
+  done
+}
+block() {
+  unblock   # eerst vrijgeven, anders kan de IP-lijst niet opgehaald worden
+  mapfile -t T < <(targets | grep -v -e '^$' -e '^::ffff:' | sort -u)
+  [[ ${#T[@]} -gt 0 ]] || { echo "Geen adressen gevonden (DNS/internet al geblokkeerd?)"; exit 1; }
+  for t in iptables ip6tables; do $t -N $CHAIN 2>/dev/null; $t -F $CHAIN; done
+  for a in "${T[@]}"; do
+    if [[ $a == *:* ]]; then ip6tables -A $CHAIN -d "$a" -j "$MODE" 2>/dev/null
+    else iptables -A $CHAIN -d "$a" -j "$MODE" 2>/dev/null; fi
+  done
+  for t in iptables ip6tables; do for h in OUTPUT FORWARD; do
+    $t -C $h -j $CHAIN 2>/dev/null || $t -I $h 1 -j $CHAIN
+  done; done
+  echo "$NAME geblokkeerd ($MODE, ${#T[@]} adressen/ranges)"
+}
+case "$1" in
+  block) block ;;
+  unblock) unblock; echo "$NAME weer bereikbaar" ;;
+  *) echo "gebruik: $0 block|unblock   (MODE=REJECT voor directe fouten i.p.v. timeouts)"; exit 1 ;;
+esac

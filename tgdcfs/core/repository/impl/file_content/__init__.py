@@ -1,16 +1,24 @@
+import asyncio
 import logging
 from dataclasses import dataclass
 from typing import AsyncIterator, Dict, Generator, Iterable, List, Optional, Sequence
 
 from tgdcfs.backends.base import IStore
 from tgdcfs.core.local_cache import LocalCache, StagedFileMessage, version_cache_for
-from tgdcfs.core.mirror import MirrorGroup
+from tgdcfs.core.mirror import MirrorGroup, MirrorStore
 from tgdcfs.core.model import TGFSFileVersion
-from tgdcfs.core.multisource import MultiSourceRead, StoreView, read_slots
+from tgdcfs.core.multisource import (
+    PIECE_FAILOVER_TIMEOUT_S,
+    MultiSourceRead,
+    StoreView,
+    read_slots,
+)
 from tgdcfs.core.repository.interface import IFileContentRepository
+from tgdcfs.core.tee import TeeUpload
 from tgdcfs.errors import TechnicalError
 from tgdcfs.reqres import (
     FileContent,
+    Replica,
     SentFileMessage,
     UploadableFileMessage,
     aclose_content,
@@ -18,6 +26,11 @@ from tgdcfs.reqres import (
 from tgdcfs.utils.prefetching_chain import prefetching_chain
 
 logger = logging.getLogger(__name__)
+
+# Live streams report EOF only at CLOSE. Keep the bytes between the client
+# and the store uploaders small, so CLOSE does not inherit a full batch of
+# re-uploads after the last WRITE has already been acknowledged.
+LIVE_TEE_BUFFER_BYTES = 1024 * 1024
 
 # How many parts of one file are fetched at a time. Each part may itself
 # be split across bots, so this multiplies with the per-message
@@ -101,6 +114,31 @@ class StoreFileContentRepository(IFileContentRepository):
         return self._cache
 
     async def save(self, file_msg: UploadableFileMessage) -> List[SentFileMessage]:
+        group = self._mirror_group
+        if self._tee_mirroring and group is not None:
+            capacity = self._tee_buffer
+            if file_msg.get_size() < 0:
+                capacity = min(capacity, LIVE_TEE_BUFFER_BYTES)
+            tee = group.tee(file_msg, capacity)
+            if tee is not None:
+                return await self._save_tee(group, tee, file_msg.file_name(), capacity)
+
+        # Write failover: a primary the circuit breaker marks dead is
+        # skipped before the first byte is read -- a consumed upload stream
+        # cannot be replayed after a failed attempt, so the acting store
+        # must be decided up front. The write lands there as the version's
+        # own content; everything else it misses (the primary's copy, the
+        # other mirrors) the replication queue brings back later.
+        candidates = (
+            self._mirror_group.acting_candidates()
+            if self._mirror_group is not None
+            and self._mirror_group.primary_dead()
+            and self._mirror_group.acting_candidates()
+            else []
+        )
+        if candidates:
+            return await self._save_acting(candidates, file_msg)
+
         # Stage the bytes on disk while they stream to the primary, so the
         # mirrors read the version from here instead of from the primary.
         # Not with ``sync: tee``: the mirrors that re-upload take the bytes
@@ -122,22 +160,16 @@ class StoreFileContentRepository(IFileContentRepository):
                 self._cache.pin(version_id)
                 file_msg = StagedFileMessage.wrap(file_msg, writer)
 
-        # Split the stream for the mirrors that would otherwise download
-        # it from the primary again (``sync: tee``): their uploads run
-        # while the primary's does, fed by the reads it takes.
-        tee = None
-        if self._tee_mirroring and self._mirror_group is not None:
-            tee = self._mirror_group.tee(file_msg, self._tee_buffer)
-            if tee is not None:
-                file_msg = tee.message
-
         try:
             res = await self._store.upload(file_msg)
         except BaseException:
-            if tee is not None:
-                await tee.abort()
             if writer is not None:
                 await writer.abort()
+            # An exhausted stream rules out failing over inside this call:
+            # mark the primary dead so the caller's retry -- or the next
+            # write -- goes straight to an acting store.
+            if self._mirror_group is not None:
+                self._mirror_group.mark_primary_dead()
             raise
         if writer is not None:
             await writer.close()
@@ -145,26 +177,14 @@ class StoreFileContentRepository(IFileContentRepository):
         # Replicate the freshly uploaded parts into the mirror stores. The
         # mapping travels back to the caller inside the SentFileMessage
         # objects and ends up in TGFSFileVersion.mirrors / .replicas.
-        if self._mirror_group and res and (self._inline_mirroring or tee):
-            only_stores = None
-            if tee is not None:
-                # The tee'd mirrors finish on their own; the rest are the
-                # server-side copies, which are cheap enough to make inline.
-                res[0].replicas.update(
-                    self._mirror_group.collect_tee(await tee.collect())
-                )
-                only_stores = [
-                    key
-                    for key in self._mirror_group.store_keys
-                    if key not in tee.store_keys
-                ]
+        if self._mirror_group and res and self._inline_mirroring:
             copies = await self._mirror_group.mirror_parts(
                 [m.message_id for m in res],
                 [m.size for m in res],
-                only_stores=only_stores,
                 cache=version_cache_for(
                     self._cache, self._cache_scope, version_id, sum(m.size for m in res)
                 ),
+                name=file_msg.file_name(),
             )
             for store_key, mirror_ids in copies.mirrors.items():
                 for sent, mirror_id in zip(res, mirror_ids):
@@ -175,6 +195,116 @@ class StoreFileContentRepository(IFileContentRepository):
             if self._cache is not None and version_id:
                 self._cache.release(version_id)
         return res
+
+    async def _save_tee(
+        self, group: MirrorGroup, tee: TeeUpload, name: str, capacity: int
+    ) -> List[SentFileMessage]:
+        async def primary(msg: UploadableFileMessage) -> List[SentFileMessage]:
+            try:
+                return await self._store.upload(msg)
+            except Exception as ex:
+                group.mark_primary_dead()
+                logger.warning(
+                    "Primary store %s failed during upload of %s: %s",
+                    self._store.key,
+                    name,
+                    ex,
+                )
+                raise
+
+        result = await tee.run(
+            self._store.key,
+            None if group.primary_dead() else primary,
+            capacity,
+        )
+        total = result.size
+        mirrors = {
+            key: (
+                TechnicalError(f"Store {key} did not upload the complete stream")
+                if isinstance(copy, Replica)
+                and (
+                    total is None
+                    or not copy.message_ids
+                    or len(copy.message_ids) != len(copy.part_sizes)
+                    or copy.size != total
+                )
+                else copy
+            )
+            for key, copy in result.mirrors.items()
+        }
+        sent = result.primary
+        if (
+            isinstance(sent, list)
+            and total is not None
+            and sum(m.size for m in sent) == total
+        ):
+            if sent:
+                sent[0].replicas.update(group.collect_tee(mirrors))
+                copies = await group.mirror_parts(
+                    [m.message_id for m in sent],
+                    [m.size for m in sent],
+                    only_stores=[key for key in group.store_keys if key not in mirrors],
+                    name=name,
+                )
+                for key, ids in copies.mirrors.items():
+                    for part, message_id in zip(sent, ids):
+                        part.mirrors[key] = message_id
+                sent[0].replicas.update(copies.replicas)
+            return sent
+
+        complete = {
+            key: copy for key, copy in mirrors.items() if isinstance(copy, Replica)
+        }
+        if complete:
+            key = next(iter(complete))
+            copy = complete.pop(key)
+            # The rest of the descriptor write must also skip the failed
+            # primary, even when the transfer outlasted the breaker window.
+            group.mark_primary_dead()
+            logger.warning("Upload of %s completed on acting store %s", name, key)
+            sent = [
+                SentFileMessage(message_id=mid, size=size, store=key)
+                for mid, size in zip(copy.message_ids, copy.part_sizes)
+            ]
+            if sent:
+                sent[0].replicas.update(complete)
+            return sent
+        if isinstance(sent, Exception):
+            raise sent
+        if sent is None and (error := next(iter(mirrors.values()), None)) is not None:
+            if isinstance(error, Exception):
+                raise error
+        raise TechnicalError("No data store uploaded the complete stream")
+
+    async def _save_acting(
+        self,
+        candidates: List[MirrorStore],
+        file_msg: UploadableFileMessage,
+    ) -> List[SentFileMessage]:
+        """Upload through an acting store because the primary is dead.
+
+        No staging and no tee: the staged copy had a reader only when the
+        primary and its inline mirrors consumed the upload, and the tee
+        splits the stream for mirrors of the primary, not of the acting
+        store. An acting write therefore fills just one store -- the one
+        that owns the version -- and leaves the rest to the replication
+        queue, which copies the version into every store it is missing
+        from, the primary included, once those can be written again.
+        """
+        last: Optional[Exception] = None
+        for ch in candidates:
+            try:
+                res = await ch.store.upload(file_msg)
+                for sent in res:
+                    sent.store = ch.key
+                return res
+            except Exception as ex:
+                last = ex
+                logger.warning(
+                    f"Acting store {ch.key} also refused the upload of "
+                    f"{file_msg.file_name()}: {ex}"
+                )
+        raise last or TechnicalError("No store accepted the upload")
 
     async def stage(
         self, file_msg: UploadableFileMessage, version_id: str
@@ -314,11 +444,24 @@ class StoreFileContentRepository(IFileContentRepository):
         primary_key = self._store.key
 
         if fv.message_ids and len(fv.part_sizes) == len(fv.message_ids):
+            # The store that owns ``message_ids``: the primary, or -- when
+            # a failed-over write named a mirror as its owner -- that
+            # mirror. A recorded store that is not configured any more is
+            # not an owner; the mirrored layouts below serve the read.
+            owner = (
+                self._store
+                if fv.owned_by(primary_key) or fv.store is None
+                else (
+                    self._mirror_group.store_for(fv.store)
+                    if self._mirror_group is not None
+                    else None
+                )
+            )
             candidates: List[List[tuple[IStore, int]]] = []
             for i, mid in enumerate(fv.message_ids):
                 sources: List[tuple[IStore, int]] = []
-                if fv.owned_by(primary_key) and mid > 0:
-                    sources.append((self._store, mid))
+                if owner is not None and mid > 0:
+                    sources.append((owner, mid))
                 if group:
                     for key, ids in fv.mirrors.items():
                         store = group.store_for(key)
@@ -371,6 +514,8 @@ class StoreFileContentRepository(IFileContentRepository):
         part_idx: int,
         begin: int,
         end: int,
+        stalled: set[str],
+        has_other_layout: bool,
     ) -> AsyncIterator[bytes]:
         """Stream one part, failing over to the next candidate on error.
 
@@ -380,20 +525,37 @@ class StoreFileContentRepository(IFileContentRepository):
         sources = layout.candidates[part_idx]
         served = 0
         last_ex: Optional[Exception] = None
-        for store, mid in sources:
+        for idx, (store, mid) in enumerate(sources):
+            if store.key in stalled:
+                continue
+            can_fail_over = has_other_layout or any(
+                other.key not in stalled for other, _ in sources[idx + 1 :]
+            )
+            deadline = PIECE_FAILOVER_TIMEOUT_S if can_fail_over else None
             try:
-                resp = await store.download_file(mid, begin + served, end)
-                async for chunk in resp.chunks:
-                    yield chunk
-                    served += len(chunk)
+                async with asyncio.timeout(deadline):
+                    resp = await store.download_file(mid, begin + served, end)
+                try:
+                    while True:
+                        async with asyncio.timeout(deadline):
+                            chunk = await anext(resp.chunks, None)
+                        if chunk is None:
+                            break
+                        yield chunk
+                        served += len(chunk)
+                finally:
+                    await aclose_content(resp.chunks)
                 return
             except Exception as ex:
+                if isinstance(ex, TimeoutError) and can_fail_over:
+                    stalled.add(store.key)
                 last_ex = ex
                 if store is self._store and self._mirror_group:
                     self._mirror_group.mark_primary_dead()
                 logger.warning(
                     f"Downloading part {part_idx} (message {mid}) of layout "
-                    f"'{layout.label}' from store {store.key} failed: {ex}"
+                    f"'{layout.label}' from store {store.key} failed: "
+                    f"{str(ex) or type(ex).__name__}"
                 )
         if last_ex:
             raise last_ex
@@ -402,10 +564,18 @@ class StoreFileContentRepository(IFileContentRepository):
         )
 
     def _stream_layout(
-        self, layout: Layout, version_id: str, begin: int, end: int
+        self,
+        layout: Layout,
+        version_id: str,
+        begin: int,
+        end: int,
+        stalled: set[str],
+        has_other_layout: bool,
     ) -> FileContent:
         parts = [
-            self._download_part(layout, part_idx, part_begin, part_end)
+            self._download_part(
+                layout, part_idx, part_begin, part_end, stalled, has_other_layout
+            )
             for part_idx, _, part_begin, part_end in self._map_range(
                 [mid for sources in layout.candidates for _, mid in sources[:1]],
                 layout.part_sizes,
@@ -536,11 +706,20 @@ class StoreFileContentRepository(IFileContentRepository):
         async def stream() -> AsyncIterator[bytes]:
             served = 0
             last_ex: Optional[Exception] = None
-            for layout in layouts:
+            stalled: set[str] = set()
+            for i, layout in enumerate(layouts):
+                if begin + served > last:
+                    return
+                content = self._stream_layout(
+                    layout,
+                    version_id,
+                    begin + served,
+                    end,
+                    stalled,
+                    i + 1 < len(layouts),
+                )
                 try:
-                    async for chunk in self._stream_layout(
-                        layout, version_id, begin + served, end
-                    ):
+                    async for chunk in content:
                         yield chunk
                         served += len(chunk)
                     return
@@ -550,6 +729,8 @@ class StoreFileContentRepository(IFileContentRepository):
                         f"Layout '{layout.label}' of {name}@{version_id} failed after "
                         f"{served} bytes: {ex}; trying the next one"
                     )
+                finally:
+                    await aclose_content(content)
             if last_ex:
                 raise last_ex
 

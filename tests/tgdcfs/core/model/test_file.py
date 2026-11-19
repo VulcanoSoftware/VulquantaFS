@@ -1,18 +1,19 @@
-import pytest
 import datetime
 import json
 from unittest.mock import Mock, patch
 
+import pytest
+
 from tgdcfs.core.model.file import (
-    TGFSFileVersion,
-    TGFSFileDesc,
     EMPTY_FILE_MESSAGE,
     INVALID_FILE_SIZE,
     INVALID_VERSION_ID,
+    TGFSFileDesc,
+    TGFSFileVersion,
 )
+from tgdcfs.errors import InvalidName
 from tgdcfs.reqres import SentFileMessage
 from tgdcfs.utils.time import FIRST_DAY_OF_EPOCH, ts
-from tgdcfs.errors import InvalidName
 
 
 class TestTGFSFileVersion:
@@ -445,7 +446,7 @@ class TestTGFSFileDesc:
 
         result = file_desc.add_version_from_sent_file_message(msg)
 
-        mock_from_sent.assert_called_once_with(msg, version_id=None)
+        mock_from_sent.assert_called_once_with(msg, version_id=None, store=None)
         assert result == mock_version
 
     def test_update_version(self):

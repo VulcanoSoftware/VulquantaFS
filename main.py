@@ -25,6 +25,7 @@ from tgdcfs.config import Config, StoreConfig, get_config
 from tgdcfs.core import Client, Clients
 from tgdcfs.core.client import StoreFactory
 from tgdcfs.core.local_cache import CacheSweeper, LocalCache
+from tgdcfs.core.metadata_healing import MetadataHealWorker
 from tgdcfs.core.replication import ReplicationQueue, ReplicationWorker
 from tgdcfs.utils.message_cache import set_message_cache_size
 
@@ -93,19 +94,35 @@ def start_cache_sweeper(
 def start_replication_workers(
     clients: Clients, config: Config, replication: ReplicationQueue
 ) -> List[ReplicationWorker]:
-    """One background worker per file system with ``sync: background``."""
+    """One background worker per replicated file system.
+
+    For ``sync: background`` it fills every mirror; for ``inline`` and
+    ``tee`` writes it closes the gaps a failed mirror write left behind,
+    so a store that was temporarily down is caught up without manual
+    action. It also drains the bytes a ``write_ack: cache`` write left
+    on the local disk.
+    """
     workers: List[ReplicationWorker] = []
     for filesystem in config.filesystems.values():
         client = clients.get(filesystem.name)
         if client is None:
             continue
-        background = filesystem.sync == "background" and filesystem.mirrors
-        if not background and filesystem.write_ack != "cache":
+        if not filesystem.mirrors and filesystem.write_ack != "cache":
             continue
         worker = ReplicationWorker(client, replication)
         worker.start()
         workers.append(worker)
     return workers
+
+
+def start_metadata_heal_worker(clients: Clients) -> MetadataHealWorker:
+    """The periodic re-sync of the metadata stores that missed a write.
+
+    Cheap for file systems whose metadata is not replicated (the heal is
+    a no-op there), so one worker serves them all."""
+    worker = MetadataHealWorker(clients)
+    worker.start()
+    return worker
 
 
 async def run_server(app, host: str, port: int, name: str):
@@ -134,6 +151,7 @@ async def main():
     cache = create_cache(config)
     clients = await create_clients(config, replication, cache)
     workers = start_replication_workers(clients, config, replication)
+    heal_worker = start_metadata_heal_worker(clients)
 
     app = create_app(clients, config, replication=replication, cache=cache)
     sweeper = start_cache_sweeper(cache, replication)
@@ -153,10 +171,14 @@ async def main():
     finally:
         for worker in workers:
             await worker.stop()
+        await heal_worker.stop()
         # Size and dates read by listings since the last write
-        # (``listing.stat_in_metadata``).
+        # (``listing.stat_in_metadata``), and the metadata stores' own
+        # resources (the GitLab HTTP session).
         for client in clients.values():
             await client.file_api.stats.close()
+            if client.metadata_api is not None:
+                await client.metadata_api.close()
         if sweeper is not None:
             await sweeper.stop()
         if sftp_acceptor:

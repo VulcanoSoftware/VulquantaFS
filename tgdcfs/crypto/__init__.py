@@ -30,14 +30,22 @@ it explicitly when needed:
 from tgdcfs.crypto.cipher import ChunkedAESGCM
 from tgdcfs.crypto.header import FileHeader
 from tgdcfs.crypto.kdf import derive_file_key, derive_master_key
+from tgdcfs.crypto.metadata_blob import (
+    decrypt_metadata_blob,
+    derive_metadata_blob_key,
+    encrypt_metadata_blob,
+)
 from tgdcfs.crypto.names import decrypt_name, derive_name_key, encrypt_name
 
 __all__ = [
     "ChunkedAESGCM",
     "FileHeader",
+    "decrypt_metadata_blob",
     "decrypt_name",
     "derive_file_key",
     "derive_master_key",
+    "derive_metadata_blob_key",
     "derive_name_key",
+    "encrypt_metadata_blob",
     "encrypt_name",
 ]

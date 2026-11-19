@@ -50,7 +50,7 @@ the primary channel:
 |---|---|---|
 | File content (document part messages) | channel messages | forward to mirror channel |
 | File descriptor (JSON text message, `TGMsgFDRepository`) | channel text message | send the same JSON as a *fresh* text message to the mirror (a forwarded text message cannot be edited later; FDs get edited on every new version) |
-| Directory metadata | pinned message in channel **or** GitHub repo | pinned-message mode: maintain a pinned copy in the mirror channel too; GitHub mode: already off-Telegram, nothing to do |
+| Directory metadata | pinned message in channel **or** GitHub repo **or** GitLab repo | by default: pinned-message mode maintains a pinned copy in every mirror channel, GitHub/GitLab mode is already off-Telegram. Explicit `metadata_mirrors` (see "Redundant metadata" below) turns the metadata itself into a RAID-1 set: one primary plus any combination of a Telegram pinned message, a Discord pinned message, a GitHub repo and a GitLab repo |
 
 Recommendation: for users who care about ban-resilience, document that
 `github_repo` metadata is the safer choice — the directory tree then
@@ -345,6 +345,42 @@ must learn the new `redundancy` block:
   commented-out `redundancy` block showing the shape.
 - **Manager UI**: the backfill task's surface (start button, progress,
   verification result) documented alongside the existing task UI docs.
+
+## Redundant metadata
+
+The file layers above get their redundancy from the mirror channels. The
+metadata layer has its own, independent redundancy now: a file system
+can list extra metadata stores under `metadata_mirrors`, and every
+metadata write goes to all of them.
+
+- A `pinned_message` metadata store names the store whose channel holds
+  the pinned document (`store: <name>`). A pinned message in the
+  Telegram channel and one in the Discord channel are therefore two
+  separate, individually configurable stores.
+- `github_repo` and `gitlab_repo` keep the tree off the channels
+  entirely, and both offer the same two layouts (`layout:`):
+  - `tree` (the default for both) mirrors the tree into the repository's
+    own directory structure, one blob per directory, written
+    incrementally -- the shape `github_repo` has always used. The GitLab
+    store speaks the PyGithub engine through a REST facade
+    (`gitlab_tree.py`), so both behave identically.
+  - `document` keeps the whole tree as one JSON file (`metadata.json`,
+    AES-GCM encrypted when at-rest encryption is on) that is rewritten
+    on every push -- the same shape the pinned-message store uses, a
+    drop-in redundant copy next to any other metadata store.
+  - A GitLab repository that still holds the single-document layout of
+    an older release is migrated automatically: the tree layout reads
+    the document until the first push has mirrored the tree, then
+    removes it.
+- A store that is temporarily unreachable is skipped: writes and reads
+  continue with the stores that are up. The layer marks the store
+  *stale* and a background task (every 30 s) re-writes it until it takes
+  the tree again, so a store that comes back is healed without user
+  action. On a restart the tree is loaded from the first store that
+  answers, preferring the primary.
+- Without `metadata_mirrors` nothing changes: the classic single-store
+  behaviour (including the pinned copies a pinned-message metadata store
+  keeps in the mirror channels) is preserved.
 
 ## Failure modes considered
 

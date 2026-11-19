@@ -34,6 +34,10 @@ class SentFileMessage(Message):
     # Copies of the whole version in stores that re-partitioned it, keyed
     # by store key. Carried by the first part's message only.
     replicas: Dict[str, "Replica"] = field(default_factory=dict)
+    # The store the parts of this upload belong to. ``None`` for a
+    # write that went to the configured primary; the write failover of a
+    # primary that was marked dead names the acting store here.
+    store: Optional[str] = None
 
 
 @dataclass
@@ -205,6 +209,11 @@ class UploadableFileMessage(FileMessage):
     # before the bytes move so the content repository can stage them in
     # the local cache under the same id the metadata will carry.
     version_id: Optional[str] = field(default=None, kw_only=True)
+    # A restore has no client waiting for its final upload acknowledgement.
+    background: bool = field(default=False, kw_only=True)
+    # This live upload shares its stream with other stores. A stalled
+    # backend should get out of the way rather than retry in the foreground.
+    failover: bool = field(default=False, kw_only=True)
 
     def _get_size(self) -> int:
         return 0
