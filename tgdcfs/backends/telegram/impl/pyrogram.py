@@ -99,8 +99,11 @@ class PyrogramAPI(ITDLibClient):
         cache = channel_cache(req.chat).id
         if message_id_to_fetch := cache.find_nonexistent(req.message_ids):
             if not (
-                fetched_messages := await self._client.get_messages(
-                    chat_id=req.chat, message_ids=message_id_to_fetch
+                fetched_messages := await self._bounded(
+                    "get_messages",
+                    self._client.get_messages(
+                        chat_id=req.chat, message_ids=message_id_to_fetch
+                    ),
                 )
             ):
                 raise TechnicalError(
@@ -116,16 +119,22 @@ class PyrogramAPI(ITDLibClient):
         return GetMessagesResp(cache.gets(req.message_ids))
 
     async def send_text(self, req: SendTextReq) -> SendMessageResp:
-        message = await self._client.send_message(chat_id=req.chat, text=req.text)
+        message = await self._bounded(
+            "send_text",
+            self._client.send_message(chat_id=req.chat, text=req.text),
+        )
         return SendMessageResp(message_id=message.id)
 
     async def edit_message_text(self, req: EditMessageTextReq) -> SendMessageResp:
         channel_cache(req.chat).id[req.message_id] = None
         chunk_cache().invalidate(req.chat, req.message_id)
-        message = await self._client.edit_message_text(
-            chat_id=req.chat,
-            message_id=req.message_id,
-            text=req.text,
+        message = await self._bounded(
+            "edit_message_text",
+            self._client.edit_message_text(
+                chat_id=req.chat,
+                message_id=req.message_id,
+                text=req.text,
+            ),
         )
         return SendMessageResp(message_id=message.id)
 
@@ -133,21 +142,24 @@ class PyrogramAPI(ITDLibClient):
         channel_cache(req.chat).id[req.message_id] = None
         chunk_cache().invalidate(req.chat, req.message_id)
 
-        updates: rt.Updates = await self._client.invoke(
-            rf.messages.EditMessage(
-                peer=await self._client.resolve_peer(req.chat),  # type: ignore
-                id=req.message_id,
-                media=rt.InputMediaUploadedDocument(  # type: ignore
-                    file=rt.InputFile(  # type: ignore
-                        id=req.file.id,
-                        parts=req.file.parts,
-                        name=req.file.name,
-                        md5_checksum="",
+        updates: rt.Updates = await self._bounded(
+            "edit_message_media",
+            self._client.invoke(
+                rf.messages.EditMessage(
+                    peer=await self._client.resolve_peer(req.chat),  # type: ignore
+                    id=req.message_id,
+                    media=rt.InputMediaUploadedDocument(  # type: ignore
+                        file=rt.InputFile(  # type: ignore
+                            id=req.file.id,
+                            parts=req.file.parts,
+                            name=req.file.name,
+                            md5_checksum="",
+                        ),
+                        mime_type="application/octet-stream",
+                        attributes=[],
                     ),
-                    mime_type="application/octet-stream",
-                    attributes=[],
-                ),
-            )
+                )
+            ),
         )
 
         update = assert_update(updates, rt.UpdateEditChannelMessage)
@@ -161,7 +173,13 @@ class PyrogramAPI(ITDLibClient):
                 chat_id=req.chat, query=req.search
             ):
                 res: List[t.Message] = []
-                async for message in messages:
+                while True:
+                    try:
+                        message = await self._bounded(
+                            "search_messages", messages.__anext__()
+                        )
+                    except StopAsyncIteration:
+                        break
                     if not message:
                         continue
                     res.append(message)
@@ -174,77 +192,100 @@ class PyrogramAPI(ITDLibClient):
         if pinned_messages := self._client.search_messages(
             chat_id=req.chat, filter=e.MessagesFilter.PINNED
         ):
-            async for message in pinned_messages:
+            while True:
+                try:
+                    message = await self._bounded(
+                        "get_pinned_messages", pinned_messages.__anext__()
+                    )
+                except StopAsyncIteration:
+                    break
                 return GetMessagesRespNoNone(
                     list(exclude_none(self._transform_messages([message])))
                 )
         return []
 
     async def pin_message(self, req: PinMessageReq) -> None:
-        await self._client.pin_chat_message(
-            chat_id=req.chat,
-            message_id=req.message_id,
-            disable_notification=True,
+        await self._bounded(
+            "pin_message",
+            self._client.pin_chat_message(
+                chat_id=req.chat,
+                message_id=req.message_id,
+                disable_notification=True,
+            ),
         )
 
     async def save_big_file_part(self, req: SaveBigFilePartReq) -> SaveFilePartResp:
-        success = await self._client.invoke(
-            rf.upload.SaveBigFilePart(
-                file_id=req.file_id,
-                file_part=req.file_part,
-                bytes=req.bytes,
-                file_total_parts=req.file_total_parts,
-            )
+        success = await self._bounded(
+            "save_big_file_part",
+            self._client.invoke(
+                rf.upload.SaveBigFilePart(
+                    file_id=req.file_id,
+                    file_part=req.file_part,
+                    bytes=req.bytes,
+                    file_total_parts=req.file_total_parts,
+                )
+            ),
         )
         return SaveFilePartResp(success=success)
 
     async def save_file_part(self, req: SaveFilePartReq) -> SaveFilePartResp:
-        success = await self._client.invoke(
-            rf.upload.SaveFilePart(
-                file_id=req.file_id,
-                file_part=req.file_part,
-                bytes=req.bytes,
-            )
+        success = await self._bounded(
+            "save_file_part",
+            self._client.invoke(
+                rf.upload.SaveFilePart(
+                    file_id=req.file_id,
+                    file_part=req.file_part,
+                    bytes=req.bytes,
+                )
+            ),
         )
         return SaveFilePartResp(success=success)
 
     async def send_big_file(self, req: SendFileReq) -> SendMessageResp:
-        updates: rt.Updates = await self._client.invoke(
-            rf.messages.SendMedia(
-                peer=await self._client.resolve_peer(req.chat),  # type: ignore
-                media=rt.InputMediaUploadedDocument(  # type: ignore
-                    file=rt.InputFileBig(  # type: ignore
-                        id=req.file.id,
-                        parts=req.file.parts,
-                        name=req.file.name,
+        updates: rt.Updates = await self._bounded(
+            "send_big_file",
+            self._client.invoke(
+                rf.messages.SendMedia(
+                    peer=await self._client.resolve_peer(req.chat),  # type: ignore
+                    media=rt.InputMediaUploadedDocument(  # type: ignore
+                        file=rt.InputFileBig(  # type: ignore
+                            id=req.file.id,
+                            parts=req.file.parts,
+                            name=req.file.name,
+                        ),
+                        mime_type="application/octet-stream",
+                        attributes=[rt.DocumentAttributeFilename(file_name=req.file.name)],  # type: ignore
                     ),
-                    mime_type="application/octet-stream",
-                    attributes=[rt.DocumentAttributeFilename(file_name=req.file.name)],  # type: ignore
-                ),
-                message=req.caption,
-                random_id=req.file.id,
-            )
+                    message=req.caption,
+                    random_id=req.file.id,
+                )
+            ),
         )
         update = assert_update(updates, rt.UpdateMessageID)
         return SendMessageResp(message_id=update.id)
 
     async def send_small_file(self, req: SendFileReq) -> SendMessageResp:
-        updates: rt.Updates = await self._client.invoke(
-            rf.messages.SendMedia(
-                peer=await self._client.resolve_peer(req.chat),  # type: ignore
-                media=rt.InputMediaUploadedDocument(  # type: ignore
-                    file=rt.InputFile(  # type: ignore
-                        id=req.file.id,
-                        parts=req.file.parts,
-                        name=req.file.name,
-                        md5_checksum="",
+        updates: rt.Updates = await self._bounded(
+            "send_small_file",
+            self._client.invoke(
+                rf.messages.SendMedia(
+                    peer=await self._client.resolve_peer(req.chat),  # type: ignore
+                    media=rt.InputMediaUploadedDocument(  # type: ignore
+                        file=rt.InputFile(  # type: ignore
+                            id=req.file.id,
+                            parts=req.file.parts,
+                            name=req.file.name,
+                            md5_checksum="",
+                        ),
+                        mime_type="application/octet-stream",
+                        attributes=[
+                            rt.DocumentAttributeFilename(file_name=req.file.name)
+                        ],  # type: ignore
                     ),
-                    mime_type="application/octet-stream",
-                    attributes=[rt.DocumentAttributeFilename(file_name=req.file.name)],  # type: ignore
-                ),
-                message=req.caption,
-                random_id=req.file.id,
-            )
+                    message=req.caption,
+                    random_id=req.file.id,
+                )
+            ),
         )
         update = assert_update(updates, rt.UpdateMessageID)
         return SendMessageResp(message_id=update.id)
@@ -267,8 +308,9 @@ class PyrogramAPI(ITDLibClient):
 
     async def download_file(self, req: DownloadFileReq) -> DownloadFileResp:
         if not (
-            message := await self._client.get_messages(
-                chat_id=req.chat, message_ids=req.message_id
+            message := await self._bounded(
+                f"download of message {req.message_id}",
+                self._client.get_messages(chat_id=req.chat, message_ids=req.message_id),
             )
         ) or not isinstance(message, t.Message):
             raise TechnicalError(
@@ -295,7 +337,14 @@ class PyrogramAPI(ITDLibClient):
                 file_id=file_id.FileId.decode(message.document.file_id),
                 offset=req.begin // GET_FILE_CHUNK_SIZE,
             ):
-                async for chunk in res:
+                while True:
+                    try:
+                        chunk = await self._bounded(
+                            f"download of message {req.message_id}",
+                            res.__anext__(),
+                        )
+                    except StopAsyncIteration:
+                        break
                     if skip:
                         if len(chunk) <= skip:
                             skip -= len(chunk)

@@ -1,6 +1,9 @@
+import asyncio
 import os
 import tempfile
+import time
 from typing import AsyncIterator
+from unittest.mock import Mock
 
 import pytest
 
@@ -11,7 +14,8 @@ from tgdcfs.backends.telegram.uploader import (
     FileUploader,
     WorkersConfig,
 )
-from tgdcfs.errors import TechnicalError
+from tgdcfs.config import TransferConfig
+from tgdcfs.errors import RpcTimeoutError, TechnicalError
 from tgdcfs.reqres import (
     FileMessageFromBuffer,
     FileMessageFromPath,
@@ -302,6 +306,16 @@ class TestUploaderFromStream:
         assert uploaded_size == total_size
         assert uploader.get_uploaded_file().name == "stream_test.txt"
         mock_client.save_file_part.assert_called()
+
+    @pytest.mark.asyncio
+    async def test_known_size_stream_cannot_upload_a_truncated_chunk(self, mock_client):
+        file_msg = FileMessageFromStream.new(
+            stream=self.create_test_stream([b"only 12 byte"]), size=16, name="partial"
+        )
+        uploader = FileUploader(client=mock_client, file_msg=file_msg)
+        with pytest.raises(TechnicalError, match="read 12 of 16 bytes"):
+            await uploader.upload()
+        mock_client.save_file_part.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_stream_default_name(self, mock_client):
@@ -631,3 +645,401 @@ class TestStreamedUpload:
 
         with pytest.raises(TechnicalError):
             await uploader.upload()
+
+
+class TestPartTimeout:
+    """A silent part upload must not burn the SFTP client's patience.
+
+    The part uploads pace the SFTP write acknowledgements: while one
+    hangs, nothing is answered, and a client that sees no activity for
+    its inactivity timeout (FileZilla: 20 s) drops the session and the
+    transfer looks stalled. The part bound turns the silence into an
+    error long before that, and without the retry budget of a flaky
+    network: a store that never answered at all is not going to start
+    answering mid-retry, so a timeout travels straight to the write's
+    failover instead.
+    """
+
+    PART = 512 * 1024
+
+    @staticmethod
+    def _config(mocker, **transfer):
+        cfg = Mock()
+        cfg.tgdcfs.transfer = TransferConfig.from_dict(transfer)
+        mocker.patch("tgdcfs.backends.telegram.uploader.get_config", return_value=cfg)
+        mocker.patch("tgdcfs.backends.telegram.interface.get_config", return_value=cfg)
+
+    @staticmethod
+    def _stream(size: int):
+        async def stream():
+            left = size
+            while left > 0:
+                chunk = b"x" * min(left, TestPartTimeout.PART)
+                left -= len(chunk)
+                yield chunk
+
+        return stream()
+
+    @staticmethod
+    def _hanging(mocker):
+        async def hang(req):
+            await asyncio.sleep(60)
+
+        return mocker.AsyncMock(side_effect=hang)
+
+    @pytest.mark.asyncio
+    async def test_a_silent_part_upload_raises_within_the_part_bound(self, mocker):
+        self._config(mocker, upload_part_timeout_s=1)
+        client = mocker.AsyncMock(spec=ITDLibClient)
+        client.save_big_file_part = self._hanging(mocker)
+
+        uploader = FileUploader(
+            client=client,
+            file_msg=FileMessageFromStream.new(
+                stream=self._stream(2 * self.PART), size=-1
+            ),
+        )
+
+        start = time.monotonic()
+        with pytest.raises(RpcTimeoutError):
+            await uploader.upload()
+        assert time.monotonic() - start < 5
+        # Eight workers, four parts: every part was tried exactly once,
+        # none of them was re-fed to the dead connection five times over.
+        assert client.save_big_file_part.await_count <= 4
+
+    @pytest.mark.asyncio
+    async def test_a_part_nobody_answered_is_retried_while_others_come_back(
+        self, mocker
+    ):
+        """One dropped response is not a dead store.
+
+        The workers share one connection, so a part whose response never
+        arrives looks exactly like a store that went away -- but the parts
+        that keep coming back say it did not. Failing the upload there
+        discards a transfer the client cannot resume, one dropped response
+        into a 1 GB file; the retry budget is what that case is for. Only a
+        store that answers nothing at all gives up inside the bound.
+        """
+        self._config(mocker, upload_part_timeout_s=1, upload_workers_big=2)
+        client = mocker.AsyncMock(spec=ITDLibClient)
+        saved: list[int] = []
+        hung: list[int] = []
+
+        async def save_big_file_part(req):
+            if req.file_part == 2 and not hung:
+                hung.append(req.file_part)
+                await asyncio.sleep(60)  # the response that never comes
+            await asyncio.sleep(0.05)  # slow enough to outlast the bound
+            saved.append(req.file_part)
+            return SaveFilePartResp(success=True)
+
+        client.save_big_file_part = save_big_file_part
+        parts = 64
+
+        uploader = FileUploader(
+            client=client,
+            file_msg=FileMessageFromStream.new(
+                stream=self._stream(parts * self.PART), size=-1
+            ),
+        )
+
+        assert (
+            await asyncio.wait_for(uploader.upload(), timeout=20) == parts * self.PART
+        )
+        # The unanswered part was sent again and landed once, and nothing
+        # else was disturbed by its retry.
+        assert hung == [2]
+        assert sorted(saved) == list(range(parts))
+        assert uploader.get_uploaded_file().parts == parts
+
+    @pytest.mark.asyncio
+    async def test_a_retry_does_not_restart_the_store_silence_budget(self, mocker):
+        self._config(mocker, upload_part_timeout_s=1, upload_workers_big=3)
+        client = mocker.AsyncMock(spec=ITDLibClient)
+        first_started = asyncio.Event()
+        retried = asyncio.Event()
+        attempts: dict[int, int] = {}
+
+        async def save_big_file_part(req):
+            part = req.file_part
+            attempts[part] = attempts.get(part, 0) + 1
+            if part == 2:
+                # This last answer arrives after the other RPCs started, so
+                # their first timeouts don't yet use up the silence budget.
+                await first_started.wait()
+                await asyncio.sleep(0.8)
+                return SaveFilePartResp(success=True)
+            if part == 0:
+                first_started.set()
+            if attempts[part] == 2:
+                retried.set()
+            await asyncio.Event().wait()
+
+        client.save_big_file_part = save_big_file_part
+
+        async def source():
+            for _ in range(4):
+                yield b"x" * self.PART
+            # A client held back by the tee may stop sending data. No new
+            # parts arrive to start a fresh RPC after the last answer.
+            await asyncio.Event().wait()
+
+        uploader = FileUploader(client, FileMessageFromStream.new(source()))
+        with pytest.raises(RpcTimeoutError, match="of its last response"):
+            await asyncio.wait_for(uploader.upload(), timeout=2.3)
+        assert retried.is_set()
+
+    @pytest.mark.asyncio
+    async def test_the_retry_budget_survives_for_errors_that_can_recover(
+        self, no_backoff, mocker
+    ):
+        self._config(mocker, upload_part_timeout_s=1)
+
+        class TelegramFloodWaitError(Exception):
+            seconds = 30
+
+        client = mocker.AsyncMock(spec=ITDLibClient)
+        client.save_big_file_part = mocker.AsyncMock(
+            side_effect=TelegramFloodWaitError("flood")
+        )
+
+        uploader = FileUploader(
+            client=client,
+            file_msg=FileMessageFromStream.new(stream=self._stream(self.PART), size=-1),
+        )
+
+        with pytest.raises(TelegramFloodWaitError):
+            await uploader.upload()
+        assert client.save_big_file_part.await_count == MAX_PART_ATTEMPTS
+
+    @pytest.mark.asyncio
+    async def test_a_zero_part_bound_leaves_the_call_unbounded(self, mocker):
+        self._config(mocker, upload_part_timeout_s=0)
+        client = mocker.AsyncMock(spec=ITDLibClient)
+        client.save_big_file_part = self._hanging(mocker)
+
+        uploader = FileUploader(
+            client=client,
+            file_msg=FileMessageFromStream.new(stream=self._stream(self.PART), size=-1),
+        )
+
+        task = asyncio.create_task(uploader.upload())
+        await asyncio.sleep(0.3)
+        assert not task.done()
+        assert client.save_big_file_part.await_count >= 1
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+
+class TestStreamedUploadFailurePropagation:
+    """A dead worker must end a streamed upload the client is still feeding.
+
+    The part bound kills every worker about fifteen seconds after the
+    store went silent, but the main loop is not looking at them: it sits
+    in ``_read`` for the next chunk, and a stopped client sends nothing
+    anymore. Its reads therefore never return, the workers' exceptions
+    stay unretrieved, and ``save()``'s failover path -- aborting the tee,
+    marking the primary dead -- is never reached, so the retries pool up
+    behind the stuck upload. The wait in ``_read`` must break on the
+    worker failure and surface it as the upload's error.
+    """
+
+    PART = 512 * 1024
+
+    @staticmethod
+    def _config(mocker, **transfer):
+        cfg = Mock()
+        cfg.tgdcfs.transfer = TransferConfig.from_dict(transfer)
+        mocker.patch("tgdcfs.backends.telegram.uploader.get_config", return_value=cfg)
+        mocker.patch("tgdcfs.backends.telegram.interface.get_config", return_value=cfg)
+
+    @staticmethod
+    def _hanging(mocker):
+        async def hang(req):
+            await asyncio.sleep(60)
+
+        return mocker.AsyncMock(side_effect=hang)
+
+    @staticmethod
+    def _stream(size: int):
+        async def stream():
+            left = size
+            while left > 0:
+                chunk = b"x" * min(left, TestStreamedUploadFailurePropagation.PART)
+                left -= len(chunk)
+                yield chunk
+
+        return stream()
+
+    @pytest.mark.asyncio
+    async def test_a_worker_timeout_ends_a_stream_that_falls_silent(self, mocker):
+        self._config(mocker, upload_part_timeout_s=1)
+        client = mocker.AsyncMock(spec=ITDLibClient)
+        client.save_big_file_part = self._hanging(mocker)
+
+        async def silent_after_two_chunks():
+            for _ in range(2):
+                yield b"x" * self.PART
+            await asyncio.sleep(60)
+
+        uploader = FileUploader(
+            client=client,
+            file_msg=FileMessageFromStream.new(
+                stream=silent_after_two_chunks(), size=-1
+            ),
+        )
+
+        start = time.monotonic()
+        with pytest.raises(RpcTimeoutError):
+            await asyncio.wait_for(uploader.upload(), timeout=10)
+        assert time.monotonic() - start < 5
+
+    @pytest.mark.asyncio
+    async def test_an_ended_stream_still_raises_the_worker_error(self, mocker):
+        self._config(mocker, upload_part_timeout_s=1)
+        client = mocker.AsyncMock(spec=ITDLibClient)
+        client.save_big_file_part = self._hanging(mocker)
+
+        uploader = FileUploader(
+            client=client,
+            file_msg=FileMessageFromStream.new(
+                stream=self._stream(2 * self.PART), size=-1
+            ),
+        )
+
+        start = time.monotonic()
+        with pytest.raises(RpcTimeoutError):
+            await asyncio.wait_for(uploader.upload(), timeout=10)
+        assert time.monotonic() - start < 5
+
+    @pytest.mark.asyncio
+    async def test_a_dead_worker_ends_the_upload_while_one_lives_behind(self, mocker):
+        """The cleanup must not wait for the queue when a worker died.
+
+        The workers hold one queued chunk each; the main loop only exits
+        when the first failure lands, and the queue behind it is full of
+        chunks the dead workers will never take. The old cleanup fed
+        end-of-stream sentinels into that full queue and hung there for
+        as long as it took every worker to exhaust its retries -- with a
+        silent store, forever: nobody drains the queue anymore. The
+        exception stayed unretrieved and ``save()``'s failover path was
+        never reached, so a retry against a mirror could never start.
+        """
+        self._config(mocker, upload_part_timeout_s=10, upload_workers_big=2)
+        client = mocker.AsyncMock(spec=ITDLibClient)
+
+        calls = 0
+
+        async def save_big_file_part(req):
+            nonlocal calls
+            calls += 1
+            # One part gives up within a second; the other is still inside
+            # its own attempt when that failure lands.
+            await asyncio.sleep(1 if calls == 1 else 2)
+            raise RpcTimeoutError("Telegram did not answer the part")
+
+        client.save_big_file_part = save_big_file_part
+
+        async def silent_after_six_chunks():
+            for _ in range(6):
+                yield b"x" * self.PART
+            await asyncio.sleep(60)
+
+        uploader = FileUploader(
+            client=client,
+            file_msg=FileMessageFromStream.new(
+                stream=silent_after_six_chunks(), size=-1
+            ),
+        )
+
+        start = time.monotonic()
+        # Whichever side notices first -- the cleanup gathering the dead
+        # worker, or the feed bailing out on a queue nobody drains -- the
+        # upload fails with the worker's own error, never with a bail-out
+        # message that hides the store's.
+        with pytest.raises(RpcTimeoutError):
+            await asyncio.wait_for(uploader.upload(), timeout=10)
+        assert time.monotonic() - start < 5
+
+    @pytest.mark.asyncio
+    async def test_a_healthy_upload_survives_the_failure_watcher(self, mocker):
+        self._config(mocker, upload_part_timeout_s=1)
+        client = mocker.AsyncMock(spec=ITDLibClient)
+        client.save_big_file_part = mocker.AsyncMock(
+            return_value=SaveFilePartResp(success=True)
+        )
+
+        uploader = FileUploader(
+            client=client,
+            file_msg=FileMessageFromStream.new(
+                stream=self._stream(3 * self.PART + 10), size=-1
+            ),
+        )
+
+        assert await uploader.upload() == 3 * self.PART + 10
+        assert client.save_big_file_part.await_count == 4
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("at_eof", [False, True], ids=["disconnect", "eof"])
+    async def test_reaps_workers_without_draining_a_full_queue(self, mocker, at_eof):
+        self._config(mocker, upload_part_timeout_s=0, upload_workers_big=2)
+        client = mocker.AsyncMock(spec=ITDLibClient)
+        started = [asyncio.Event(), asyncio.Event()]
+        reached_boundary = asyncio.Event()
+        fail = asyncio.Event()
+        hanging_worker_stopped = asyncio.Event()
+
+        async def save_big_file_part(req):
+            part = req.file_part
+            started[part].set()
+            if at_eof and part == 0:
+                await fail.wait()
+                raise RpcTimeoutError("worker lost at EOF")
+            try:
+                await asyncio.Event().wait()
+            finally:
+                if part == 1:
+                    hanging_worker_stopped.set()
+
+        async def source():
+            for _ in range(5):
+                yield b"x" * self.PART
+            reached_boundary.set()
+            if not at_eof:
+                # The next read can reach this event with both workers
+                # busy, two parts queued and one part held back.
+                await asyncio.Event().wait()
+
+        client.save_big_file_part = save_big_file_part
+        uploader = FileUploader(
+            client, FileMessageFromStream.new(source(), name="full-queue")
+        )
+        upload = asyncio.create_task(uploader.upload())
+        try:
+            await asyncio.wait_for(reached_boundary.wait(), 2)
+            await asyncio.wait_for(asyncio.gather(*(e.wait() for e in started)), 2)
+            if at_eof:
+                # Let the reader observe EOF and try to drain the workers
+                # before the first worker fails with the queue still full.
+                await asyncio.sleep(0.05)
+                fail.set()
+                with pytest.raises(RpcTimeoutError, match="worker lost at EOF"):
+                    await asyncio.wait_for(asyncio.shield(upload), 1)
+            else:
+                upload.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await asyncio.wait_for(asyncio.shield(upload), 1)
+            assert hanging_worker_stopped.is_set()
+        finally:
+            if not upload.done():
+                upload.cancel()
+            workers = [
+                task
+                for task in asyncio.all_tasks()
+                if task.get_name() == "streamed-upload-full-queue"
+            ]
+            for worker in workers:
+                worker.cancel()
+            await asyncio.gather(upload, *workers, return_exceptions=True)

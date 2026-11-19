@@ -28,6 +28,7 @@ from tgdcfs.errors import (
     MessageNotFound,
     NoPinnedMessage,
     PinnedMessageNotSupported,
+    RpcTimeoutError,
     TechnicalError,
 )
 from tgdcfs.reqres import (
@@ -59,7 +60,7 @@ from tgdcfs.utils.others import exclude_none
 from tgdcfs.utils.prefetching_chain import prefetching_chain
 
 from .broker import MessageBroker
-from .interface import TDLibApi
+from .interface import TDLibApi, bounded_part
 from .uploader import FileUploader
 
 logger = logging.getLogger(__name__)
@@ -87,9 +88,13 @@ MAX_TEXT_CHARS = 4096
 OVERFLOW_PREFIX = "TGDCFS_OVERFLOW:"
 OVERFLOW_FILENAME = "overflow.json"
 
-# A failed send is retried forever, this far apart: the bytes are
-# already on Telegram's servers, only the message is missing.
+# A failed send is retried a bounded number of times, this far apart:
+# the bytes are already on Telegram's servers, only the message is
+# missing. Bounded, because an unbounded loop of a send that never
+# succeeds (a Telegram that went away mid-upload) would keep the write
+# hanging instead of letting its failover break in.
 SEND_RETRY_INTERVAL = 5  # seconds
+MAX_SEND_ATTEMPTS = 5
 
 # Telegram's messages.deleteMessages caps each request at 100 message ids.
 DELETE_BATCH_SIZE = 100
@@ -395,26 +400,61 @@ class TelegramStore(MessageBroker, IStore):
             api = self.tdlib.next_bot
 
         uploader = FileUploader(api, file_msg)
+        # Bot identity is not needed to upload. Looking it up here would
+        # add a network call before the bounded part requests even start.
         logger.info(
             f"Uploading file {file_msg.name} of size {file_msg.size} bytes to "
-            f"channel {self.private_file_channel} using {(await api.get_me()).name}."
+            f"channel {self.private_file_channel}."
         )
         return uploader, await uploader.upload()
 
     async def _send_uploaded(
-        self, uploader: FileUploader, size: int, name: Optional[str]
+        self,
+        uploader: FileUploader,
+        size: int,
+        name: Optional[str],
+        *,
+        background: bool = False,
     ) -> SentFileMessage:
         """Turn an uploaded part into a channel message, retrying until it is."""
-        while True:
+        last: Optional[Exception] = None
+        logger.info(
+            "Telegram upload of %s: publishing the %d-byte message",
+            name,
+            size,
+        )
+        for attempt in range(1, MAX_SEND_ATTEMPTS + 1):
             try:
-                message = await uploader.send(self.private_file_channel)
+                send = uploader.send(self.private_file_channel)
+                # A large message can take longer to publish than an
+                # individual upload chunk. Recovery has no SFTP client
+                # waiting for CLOSE, so let the transport's RPC timeout
+                # apply rather than aborting after the short failover bound.
+                message = await (
+                    send if background else bounded_part(f"the send of {name}", send)
+                )
+                if background:
+                    logger.info(
+                        "Telegram published %s as message %d in channel %s",
+                        name,
+                        message.message_id,
+                        self.private_file_channel,
+                    )
                 return SentFileMessage(message_id=message.message_id, size=size)
+            except RpcTimeoutError:
+                raise
             except Exception as ex:
+                last = ex
                 logger.error(
                     f"Exception occurred when sending file {name}: {ex}. "
-                    f"Waiting {SEND_RETRY_INTERVAL} seconds before retrying."
+                    f"Waiting {SEND_RETRY_INTERVAL} seconds before retrying "
+                    f"(attempt {attempt}/{MAX_SEND_ATTEMPTS})."
                 )
                 await asyncio.sleep(SEND_RETRY_INTERVAL)
+        raise TechnicalError(
+            f"Could not send the message of file {name} after "
+            f"{MAX_SEND_ATTEMPTS} attempts: {last}"
+        ) from last
 
     @property
     def read_slots(self) -> int:
@@ -495,7 +535,12 @@ class TelegramStore(MessageBroker, IStore):
                 )
                 sends.append(
                     asyncio.create_task(
-                        self._send_uploaded(uploader, uploaded, file_msg.name)
+                        self._send_uploaded(
+                            uploader,
+                            uploaded,
+                            file_msg.name,
+                            background=file_msg.background,
+                        )
                     )
                 )
                 file_msg.next_part(part)
@@ -577,23 +622,34 @@ class TelegramStore(MessageBroker, IStore):
         uploader = FileUploader(self.tdlib.next_bot, file_msg)
         await uploader.upload()
 
-        while True:
+        last: Optional[Exception] = None
+        for attempt in range(1, MAX_SEND_ATTEMPTS + 1):
             try:
-                message = await uploader.client.edit_message_media(
-                    EditMessageMediaReq(
-                        chat=self.private_file_channel,
-                        message_id=message_id,
-                        file=uploader.get_uploaded_file(),
-                    )
+                message = await bounded_part(
+                    f"the edit of the document of message {message_id}",
+                    uploader.client.edit_message_media(
+                        EditMessageMediaReq(
+                            chat=self.private_file_channel,
+                            message_id=message_id,
+                            file=uploader.get_uploaded_file(),
+                        )
+                    ),
                 )
                 return message.message_id
+            except RpcTimeoutError:
+                raise
             except Exception as ex:
+                last = ex
                 logger.error(
                     f"Exception occurred when editing document of message "
                     f"{message_id}: {ex}. Waiting {SEND_RETRY_INTERVAL} seconds "
-                    f"before retrying."
+                    f"before retrying (attempt {attempt}/{MAX_SEND_ATTEMPTS})."
                 )
                 await asyncio.sleep(SEND_RETRY_INTERVAL)
+        raise TechnicalError(
+            f"Could not edit the document of message {message_id} after "
+            f"{MAX_SEND_ATTEMPTS} attempts: {last}"
+        ) from last
 
     async def delete_messages(
         self, message_ids: Iterable[int], force: bool = False

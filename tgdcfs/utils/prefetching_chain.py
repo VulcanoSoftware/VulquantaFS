@@ -36,6 +36,13 @@ async def _pump(source: AsyncIterable[bytes], queue: "asyncio.Queue") -> None:
             await queue.put(chunk)
     except Exception as ex:
         error = ex
+    finally:
+        if (aclose := getattr(source, "aclose", None)) is not None:
+            try:
+                await aclose()
+            except Exception as ex:
+                if error is None:
+                    error = ex
     await queue.put(_End(error))
 
 

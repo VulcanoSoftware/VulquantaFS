@@ -85,9 +85,10 @@ class TestMessages:
         channel.send.assert_awaited_once_with("hi")
 
     async def test_send_file(self, api, channel):
-        channel.send.return_value = make_message(12)
+        channel.send.return_value = make_message(12, attachments=[make_attachment(4)])
         sent = await api.send_file(CHANNEL, b"data", "f.bin", caption="cap")
         assert sent.message_id == 12
+        assert sent.document is not None and sent.document.size == 4
         kwargs = channel.send.call_args.kwargs
         assert kwargs["content"] == "cap"
         assert isinstance(kwargs["file"], discord.File)

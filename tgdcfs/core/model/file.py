@@ -435,7 +435,9 @@ class TGFSFileDesc:
     def add_version_from_sent_file_message(
         self, *msg: SentFileMessage, version_id: Optional[str] = None
     ):
-        version = TGFSFileVersion.from_sent_file_message(*msg, version_id=version_id)
+        version = TGFSFileVersion.from_sent_file_message(
+            *msg, version_id=version_id, store=msg[0].store if msg else None
+        )
         self.add_version(version)
         return self.versions[self.latest_version_id]
 

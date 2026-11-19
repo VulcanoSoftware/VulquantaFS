@@ -108,6 +108,7 @@ class Client:
                 stores=mirror_stores,
                 mode=filesystem.mode,
                 strict=filesystem.strict,
+                tee=filesystem.sync == "tee",
             )
 
         # ``sync: tee``: the mirrors that re-upload are fed from the upload

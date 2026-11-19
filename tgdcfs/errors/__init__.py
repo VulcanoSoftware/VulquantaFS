@@ -1,4 +1,4 @@
-from .base import TechnicalError
+from .base import RpcTimeoutError, TechnicalError
 from .path import (
     DirectoryIsNotEmpty,
     FileOrDirectoryAlreadyExists,
@@ -22,6 +22,7 @@ from .tgdcfs import (
 
 __all__ = [
     "TechnicalError",
+    "RpcTimeoutError",
     "DirectoryIsNotEmpty",
     "FileOrDirectoryAlreadyExists",
     "FileOrDirectoryDoesNotExist",

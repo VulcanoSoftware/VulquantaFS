@@ -44,8 +44,14 @@ Configured per file system under `filesystems.<fs>.sync`:
 - Reupload tasks are added to the persistent background queue (`replication_queue.json`) and processed asynchronously by one background worker per file system, with a retry backoff after failures.
 
 ### 3. `tee`
-- Bytes read from the incoming client stream are duplicated in memory to bounded branch buffers (`tee_buffer_mb`, default 64 MB).
+- Bytes read from the incoming client stream are duplicated in memory to bounded branch buffers (`tee_buffer_mb`, default 64 MiB). Uploads with no declared size, such as SFTP, cap each branch buffer at 1 MiB. The SFTP close still requires a complete stored copy.
 - Uploads to primary and reuploading mirrors run concurrently in parallel during the client PUT request. No local disk cache required.
+
+### Automatic write failover
+
+With `sync: tee` and a reuploading mirror (for example, Discord mirroring Telegram), a primary failure drops only that store from the active upload. The mirror already has the start of the file and receives the rest from the same SFTP or WebDAV request. After a mirror stores all bytes, it owns the version and the replication queue backfills the primary when it recovers. The client does not need to resend the file.
+
+This requires at least one streaming mirror to remain writable. `inline`, `background`, and `tee` with only server-side-copy mirrors do not have another complete stream to use if the primary fails mid-upload; a fresh request can use the acting store while the primary is marked down.
 
 ---
 

@@ -302,6 +302,8 @@ class TestTransferConfig:
         assert config.transfer.connection_pool_size == 1
         assert config.transfer.chunk_cache_mb == 0
         assert config.transfer.upload_parts_in_flight == 1
+        assert config.transfer.rpc_timeout_s == 120
+        assert config.transfer.upload_part_timeout_s == 15
 
     def test_overrides(self):
         config = TransferConfig.from_dict(
@@ -343,6 +345,14 @@ class TestTransferConfig:
 
     def test_a_disabled_cache_is_allowed(self):
         assert TransferConfig.from_dict({"chunk_cache_mb": 0}).chunk_cache_mb == 0
+
+    def test_a_disabled_part_bound_is_allowed(self):
+        config = TransferConfig.from_dict({"upload_part_timeout_s": 0})
+        assert config.upload_part_timeout_s == 0
+
+    def test_rejects_a_negative_part_bound(self):
+        with pytest.raises(ValueError, match="upload_part_timeout_s"):
+            TransferConfig.from_dict({"upload_part_timeout_s": -1})
 
 
 class TestGithubRepoConfig:

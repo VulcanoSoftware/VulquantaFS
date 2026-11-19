@@ -117,7 +117,8 @@ class FakeBot(DiscordBotAPI):
 
     async def send_file(self, channel_id, data, name, caption=""):
         self._maybe_fail("send_file")
-        return SentMessage(self._add(text=caption, data=data, name=name))
+        mid = self._add(text=caption, data=data, name=name)
+        return SentMessage(mid, document=self._resp(mid).document)
 
     async def edit_text(self, channel_id, message_id, text):
         self._maybe_fail("edit_text")
@@ -394,6 +395,15 @@ class TestUpload:
             "[part3]f.bin",
         ]
 
+    async def test_new_attachments_need_no_metadata_refetch(self, store, bot):
+        sent = await store.upload(FileMessageFromBuffer.new(buffer=b"x" * 23, name="f"))
+        # A batch lookup immediately after the upload would hit the same
+        # rate-limited bot route as the live Discord -> Telegram recovery.
+        bot.fail_next["get_messages"] = [RateLimited()] * 3
+        found = await store.get_messages([part.message_id for part in sent])
+        assert found == [bot._resp(part.message_id) for part in sent]
+        assert "get_messages" not in bot.calls
+
     async def test_exact_multiple(self, store, bot):
         data = b"0123456789" * 2
         sent = await store.upload(FileMessageFromBuffer.new(buffer=data, name="f"))
@@ -449,6 +459,47 @@ class TestUpload:
         sent = await upload
         assert [s.size for s in sent] == [10] * 6
         assert len(reads) == 6
+
+    async def test_live_upload_fails_over_when_a_background_send_holds_the_slot(
+        self, bot, mocker
+    ):
+        mocker.patch(
+            "tgdcfs.backends.discord.store.LIVE_PART_TIMEOUT_S", 0.05, create=True
+        )
+        real = bot.send_file
+        entered = asyncio.Event()
+        resume = asyncio.Event()
+        store = DiscordStore(
+            [bot], CHANNEL, max_part_bytes=10, max_concurrent_uploads=1
+        )
+
+        async def send(channel_id, data, name, caption=""):
+            if name.endswith("background"):
+                entered.set()
+                await resume.wait()
+            return await real(channel_id, data, name, caption)
+
+        mocker.patch.object(bot, "send_file", side_effect=send)
+
+        async def source():
+            yield b"new part"
+
+        background = asyncio.create_task(
+            store.upload(FileMessageFromBuffer.new(b"old part", "background"))
+        )
+        try:
+            await asyncio.wait_for(entered.wait(), 1)
+            mirrored = FileMessageFromStream.new(source(), name="live")
+            mirrored.failover = True
+            with pytest.raises(TechnicalError, match="no free upload slot"):
+                await asyncio.wait_for(store.upload(mirrored), 1)
+            assert not background.done()
+        finally:
+            resume.set()
+            sent = await asyncio.wait_for(background, 1)
+        assert len(sent) == 1
+        retried = await store.upload(FileMessageFromStream.new(source(), name="live"))
+        assert len(retried) == 1
 
     async def test_transient_failures_are_retried(self, store, bot):
         bot.fail_next["send_file"] = [RateLimited(), RateLimited()]

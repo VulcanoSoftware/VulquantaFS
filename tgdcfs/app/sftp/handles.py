@@ -5,7 +5,7 @@ import os
 import shutil
 import tempfile
 import time
-from typing import AsyncIterator, List, Optional
+from typing import AsyncIterator, Awaitable, Callable, List, Optional
 
 from tgdcfs.core import Ops
 from tgdcfs.errors import TechnicalError
@@ -17,6 +17,16 @@ MIB = 1024 * 1024
 
 class NoSpaceInBufferDir(TechnicalError):
     """The disk behind ``upload_buffer_dir`` cannot take the staged bytes."""
+
+
+class HandleClosedError(TechnicalError, ValueError):
+    """A request reached a handle that was already closed or aborted.
+
+    Pipelined clients have dozens of writes in flight when an upload is
+    cut short; every one of them lands here. It is an expected outcome,
+    not a server fault, so the SFTP layer answers it without a traceback.
+    (``ValueError`` as well, which is what this used to raise.)
+    """
 
 
 SEEK_DATA = getattr(os, "SEEK_DATA", 3)
@@ -186,12 +196,14 @@ class WriteHandle(Handle):
         buffer_max_bytes: int,
         buffer_dir: Optional[str] = None,
         max_gap_bytes: int = DEFAULT_MAX_AHEAD_GAP_BYTES,
+        wait_disconnected: Optional[Callable[[], Awaitable[None]]] = None,
     ):
         self._ops = ops
         self._path = path
         self._buffer_max_bytes = buffer_max_bytes
         self._buffer_dir = buffer_dir
         self._max_gap_bytes = max_gap_bytes
+        self._wait_disconnected = wait_disconnected
 
         self._queue: Optional[asyncio.Queue[Optional[bytes]]] = None
         self._task: Optional[asyncio.Task] = None
@@ -225,51 +237,77 @@ class WriteHandle(Handle):
         return self._size
 
     async def write(self, offset: int, data: bytes) -> None:
-        async with self._lock:
-            if self._closed:
-                raise ValueError("write on a closed handle")
-            self._raise_if_failed()
-            if not data:
-                return
-            if offset < self._pos:
-                raise TechnicalError(
-                    f"Write at offset {offset} of {self._path} lands behind bytes "
-                    f"that were already streamed"
-                )
-            if offset > self._pos or self._overlaps_staged(offset, len(data)):
-                try:
-                    await self._stage(offset, data)
-                except NoSpaceInBufferDir:
-                    # The staging disk is full: leaving the upload running
-                    # would let a later close() commit a truncated file.
-                    await self._abort_locked()
-                    raise
-            else:
-                self._dirty = True
-                await self._enqueue(data)
-                self._advance(offset + len(data))
-            # A staged write may have filled the gap at the position.
-            await self._drain()
+        try:
+            async with self._lock:
+                if self._closed:
+                    raise HandleClosedError("write on a closed handle")
+                self._raise_if_failed()
+                if not data:
+                    return
+                if offset < self._pos:
+                    raise TechnicalError(
+                        f"Write at offset {offset} of {self._path} lands behind bytes "
+                        f"that were already streamed"
+                    )
+                if offset > self._pos or self._overlaps_staged(offset, len(data)):
+                    try:
+                        await self._stage(offset, data)
+                    except NoSpaceInBufferDir:
+                        # The staging disk is full: leaving the upload running
+                        # would let a later close() commit a truncated file.
+                        await self._abort_locked()
+                        raise
+                else:
+                    self._dirty = True
+                    await self._enqueue(data)
+                    self._advance(offset + len(data))
+                # A staged write may have filled the gap at the position.
+                await self._drain()
+        except asyncio.CancelledError:
+            # The request was torn down by the transport (session teardown,
+            # loop shutdown): the upload task keeps running on its own and
+            # holds the stores' write slots until it ends, so drop it with
+            # the handle. ``_cancel_task`` instead of ``_abort_locked``:
+            # the lock is already released here and a concurrent close may
+            # rely on this task still being awaitable.
+            await self._cancel_task()
+            raise
 
     async def close(self) -> None:
         """Finish the upload as a new version of the file."""
-        async with self._lock:
-            if self._closed:
-                return
-            self._closed = True
-            try:
-                if not self._dirty:
-                    if self._task is not None:
-                        await asyncio.gather(self._task, return_exceptions=True)
+        try:
+            async with self._lock:
+                if self._closed:
                     return
-                await self._flush_staged()
-                self._raise_if_failed()
-                _, task = self._ensure_task()
-                await self._enqueue(None)
-                await task
-                self._raise_if_failed()
-            finally:
-                await self._close_staging()
+                self._closed = True
+                try:
+                    if not self._dirty:
+                        if self._task is not None:
+                            await asyncio.gather(self._task, return_exceptions=True)
+                        return
+                    logger.info(
+                        "SFTP CLOSE received for %s: %d bytes, %d queued, "
+                        "%d staged ranges",
+                        self._path,
+                        self._size,
+                        self._queued_bytes,
+                        len(self._staged),
+                    )
+                    await self._flush_staged()
+                    self._raise_if_failed()
+                    _, task = self._ensure_task()
+                    await self._enqueue(None)
+                    await task
+                    self._raise_if_failed()
+                finally:
+                    await self._close_staging()
+        except asyncio.CancelledError:
+            # The close itself was torn down (session teardown, loop
+            # shutdown): the task cannot commit a version nobody waits
+            # for, but ``_abort_locked`` would return early because the
+            # close already set ``_closed``. Cancel it directly.
+            await self._cancel_task()
+            raise
 
     async def abort(self) -> None:
         """Drop the upload without touching the stored file."""
@@ -281,6 +319,10 @@ class WriteHandle(Handle):
         if self._closed:
             return
         self._closed = True
+        await self._cancel_task()
+
+    async def _cancel_task(self) -> None:
+        """Stop the upload task, waiting for it to unwind."""
         if self._task is not None:
             self._task.cancel()
             await asyncio.gather(self._task, return_exceptions=True)
@@ -442,13 +484,21 @@ class WriteHandle(Handle):
             )
 
         sent = 0
+        saw_eof = False
         started = time.monotonic()
 
         async def stream() -> AsyncIterator[bytes]:
-            nonlocal sent
+            nonlocal sent, saw_eof
             while True:
                 chunk = await queue.get()
                 if chunk is None:
+                    saw_eof = True
+                    logger.info(
+                        "SFTP upload of %s reached EOF after %d bytes; "
+                        "waiting for store and metadata confirmation",
+                        self._path,
+                        sent,
+                    )
                     return
                 sent += len(chunk)
                 self._queued_bytes -= len(chunk)
@@ -458,7 +508,16 @@ class WriteHandle(Handle):
 
         logger.info("Streaming upload of %s started", self._path)
         try:
-            await self._ops.upload_from_stream(stream(), -1, self._path)
+            await self._upload_until_disconnect(stream())
+        except HandleClosedError as ex:
+            self._error = ex
+            logger.info(
+                "Aborting SFTP upload of %s after %d bytes (EOF=%s): %s",
+                self._path,
+                sent,
+                saw_eof,
+                ex,
+            )
         except Exception as ex:
             self._error = ex
             logger.error(
@@ -481,6 +540,32 @@ class WriteHandle(Handle):
         finally:
             async with cond:
                 cond.notify_all()
+
+    async def _upload_until_disconnect(self, stream: AsyncIterator[bytes]) -> None:
+        if self._wait_disconnected is None:
+            await self._ops.upload_from_stream(stream, -1, self._path)
+            return
+
+        # AsyncSSH runs requests serially. If a write is waiting on a full
+        # queue (or CLOSE is waiting on the backend), AsyncSSH cannot get
+        # to its normal handle cleanup even when the channel is gone.
+        upload = asyncio.create_task(
+            self._ops.upload_from_stream(stream, -1, self._path)
+        )
+        disconnected = asyncio.ensure_future(self._wait_disconnected())
+        try:
+            done, _ = await asyncio.wait(
+                {upload, disconnected}, return_when=asyncio.FIRST_COMPLETED
+            )
+            if upload in done:
+                upload.result()
+            else:
+                disconnected.result()
+                raise HandleClosedError("SFTP channel closed during upload")
+        finally:
+            for task in (upload, disconnected):
+                task.cancel()
+            await asyncio.gather(upload, disconnected, return_exceptions=True)
 
     def _raise_if_failed(self) -> None:
         if self._error is not None:

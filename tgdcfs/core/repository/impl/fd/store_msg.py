@@ -1,9 +1,11 @@
+import asyncio
 import json
 import logging
 from itertools import chain
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Awaitable, Callable, Dict, List, Optional, Tuple
 
 from tgdcfs.backends.base import IStore
+from tgdcfs.config import get_config
 from tgdcfs.core.mirror import MirrorGroup
 from tgdcfs.core.model import TGFSFileDesc, TGFSFileRef, TGFSFileVersion
 from tgdcfs.core.model.file import INVALID_FILE_SIZE
@@ -11,9 +13,35 @@ from tgdcfs.core.repository.interface import (
     FDRepositoryResp,
     IFDRepository,
 )
-from tgdcfs.errors import MessageNotFound
+from tgdcfs.errors import MessageNotFound, RpcTimeoutError, TechnicalError
+from tgdcfs.reqres import MessageResp
 
 logger = logging.getLogger(__name__)
+
+
+def _bounded_read(what: str, action: Awaitable) -> Awaitable:
+    """Bound one store read by ``transfer.upload_part_timeout_s``
+
+    The same bound that keeps a silent part upload from freezing an
+    SFTP client's write acknowledgements keeps a silent store read
+    from freezing the write's own preparation: ``rpc_timeout_s`` is
+    minutes, and a client whose read never comes back abandons the
+    transfer long before the timeout converts the hang into an error
+    the failover can act on. ``0`` keeps reads unbounded.
+    """
+    timeout = get_config().tgdcfs.transfer.upload_part_timeout_s
+    if not timeout:
+        return action
+
+    async def run():
+        try:
+            return await asyncio.wait_for(action, float(timeout))
+        except asyncio.TimeoutError as ex:
+            raise RpcTimeoutError(
+                f"A store did not answer {what} within {timeout}s"
+            ) from ex
+
+    return run()
 
 
 class StoreFDRepository(IFDRepository):
@@ -63,56 +91,106 @@ class StoreFDRepository(IFDRepository):
     ) -> FDRepositoryResp:
         self._stamp(fd)
 
+        # A primary the circuit breaker marks dead is skipped outright:
+        # the old behaviour (a failing edit_message_text retried against a
+        # store that is down) only burns time before the write fails. The
+        # acting store writes the descriptor and owns it in its place; the
+        # backfill returns both to the primary once it is back.
+        group = self._mirror_group
+        candidates = group.acting_candidates() if group is not None else []
+        if not (group and candidates and group.primary_dead()):
+            try:
+                return await self._save_into(self._message_api, fd, fr, self.key)
+            except Exception as ex:
+                if not candidates:
+                    raise
+                logger.warning(
+                    f"Could not write the file descriptor of {fd.name} to the "
+                    f"primary store ({ex}); an acting store takes the write"
+                )
+        last: Optional[Exception] = None
+        for ch in candidates:
+            try:
+                return await self._save_into(ch.store, fd, fr, ch.key, skip=ch.key)
+            except Exception as ex:
+                last = ex
+                logger.warning(
+                    f"Could not write the file descriptor of {fd.name} to the "
+                    f"acting store {ch.key}: {ex}"
+                )
+        raise last or TechnicalError(f"No store accepted the descriptor of {fd.name}")
+
+    async def _save_into(
+        self,
+        store: IStore,
+        fd: TGFSFileDesc,
+        fr: Optional[TGFSFileRef],
+        key: str,
+        skip: Optional[str] = None,
+    ) -> FDRepositoryResp:
         # If file_content referer is None, create a new file_content descriptor message.
         if fr is None:
             return FDRepositoryResp(
-                message_id=await self._message_api.send_text(fd.to_json()),
+                message_id=await store.send_text(fd.to_json()),
                 fd=fd,
-                mirrors=await self._mirror_fd(fd, existing=None),
-                store=self.key,
+                mirrors=await self._mirror_fd(fd, existing=None, skip=skip),
+                store=key,
             )
 
         # A descriptor that lives in a former primary (the mirror was
         # promoted) must not be edited by id here -- the id names some
         # other message in this store. Send a fresh copy and keep the old
-        # one as that store's mirror entry.
-        if not fr.owned_by(self.key):
+        # one as that store's mirror entry. Not the primary's own entry,
+        # though: a failed-over save edits the acting store while the
+        # primary is down, and its ``mirrors`` entry there is the stale
+        # descriptor it already holds. Recording it would let a later
+        # read relocate the whole ref to that stale copy.
+        if not fr.owned_by(key):
             existing = dict(fr.mirrors)
-            if fr.store:
-                existing.setdefault(fr.store, fr.message_id)
+            if fr.store and fr.store != self.key:
+                existing[fr.store] = fr.message_id
+            if skip is not None:
+                # The acting store's own entry is superseded: its fresh
+                # copy becomes the owned descriptor message.
+                existing.pop(skip, None)
             return FDRepositoryResp(
-                message_id=await self._message_api.send_text(fd.to_json()),
+                message_id=await store.send_text(fd.to_json()),
                 fd=fd,
-                mirrors=await self._mirror_fd(fd, existing=existing),
-                store=self.key,
+                mirrors=await self._mirror_fd(fd, existing=existing, skip=skip),
+                store=key,
             )
 
         # If file_content referer is provided, try to update the existing file_content descriptor.
         # But if the message is not found (probably got deleted manually), a new file_content descriptor will be created.
         try:
             return FDRepositoryResp(
-                message_id=await self._message_api.edit_message_text(
+                message_id=await store.edit_message_text(
                     message_id=fr.message_id, message=fd.to_json()
                 ),
                 fd=fd,
-                mirrors=await self._mirror_fd(fd, existing=fr.mirrors),
-                store=self.key,
+                mirrors=await self._mirror_fd(fd, existing=fr.mirrors, skip=skip),
+                store=key,
             )
         except MessageNotFound:
-            return await self.save(fd)
+            return await self._save_into(store, fd, None, key, skip=skip)
 
     async def _mirror_fd(
-        self, fd: TGFSFileDesc, existing: Optional[Dict[str, int]]
+        self,
+        fd: TGFSFileDesc,
+        existing: Optional[Dict[str, int]],
+        skip: Optional[str] = None,
     ) -> Dict[str, int]:
         """Keep a copy of the FD text message in every mirror store.
 
         Descriptors are sent as fresh text messages (not forwarded)
         because they are edited on every new version and a forwarded
-        message cannot be edited in the target channel.
+        message cannot be edited in the target channel. With ``skip`` the
+        store that holds the descriptor itself is left out: the write
+        failover made it the descriptor's own home.
         """
         if not self._mirror_group:
             return dict(existing or {})
-        return await self._mirror_group.mirror_fd(fd.to_json(), existing)
+        return await self._mirror_group.mirror_fd(fd.to_json(), existing, skip=skip)
 
     async def _lookup_mirror_parts(
         self, missing: List[Tuple[str, int]]
@@ -132,7 +210,10 @@ class StoreFDRepository(IFDRepository):
             if (api := self._mirror_group.store_for(store_key)) is None:
                 continue
             try:
-                messages = await api.get_messages(mids)
+                messages = await _bounded_read(
+                    f"the mirror part lookup for messages {mids} in {store_key}",
+                    api.get_messages(mids),
+                )
             except Exception as ex:
                 logger.warning(
                     f"Could not check mirror store {store_key} for "
@@ -155,7 +236,10 @@ class StoreFDRepository(IFDRepository):
             if store is None or not replica.message_ids:
                 continue
             try:
-                messages = await store.get_messages(replica.message_ids)
+                messages = await _bounded_read(
+                    f"the replica lookup for version {version.id} in {store_key}",
+                    store.get_messages(replica.message_ids),
+                )
             except Exception as ex:
                 logger.warning(
                     f"Could not check replica in store {store_key} for "
@@ -167,6 +251,51 @@ class StoreFDRepository(IFDRepository):
             replica.part_sizes = [m.document.size for m in messages]  # type: ignore[union-attr]
             complete = True
         return complete
+
+    async def _acting_map(
+        self, versions: List[TGFSFileVersion]
+    ) -> Tuple[Dict[Tuple[str, int], MessageResp], set[str]]:
+        """Look up the parts of acting-owned versions in their stores.
+
+        A version a failed-over write owns lives in a live mirror; its
+        ids are checked there instead of against a primary that never
+        saw the parts (and is likely down). A store that cannot answer
+        simply contributes nothing, like a mirror below.
+        """
+        if self._mirror_group is None:
+            return {}, set()
+        by_store: Dict[str, List[int]] = {}
+        for version in versions:
+            if version.owned_by(self.key):
+                continue
+            if (
+                version.store is None
+                or version.store not in self._mirror_group.store_keys
+            ):
+                continue
+            by_store.setdefault(version.store, []).extend(
+                mid for mid in version.message_ids if mid > 0
+            )
+        res: Dict[Tuple[str, int], MessageResp] = {}
+        unavailable: set[str] = set()
+        for store_key, ids in by_store.items():
+            api = self._mirror_group.store_for(store_key)
+            if api is None:
+                continue
+            try:
+                found = await _bounded_read(
+                    f"the part lookup in the acting store {store_key}",
+                    api.get_messages(ids),
+                )
+            except Exception as ex:
+                unavailable.add(store_key)
+                logger.warning(
+                    f"Could not check the acting store {store_key} for the "
+                    f"parts it owns: {ex}"
+                )
+                continue
+            res.update({(store_key, m.message_id): m for m in found if m})
+        return res, unavailable
 
     async def _validate_fv(
         self, fd: TGFSFileDesc, include_all_versions: bool
@@ -204,19 +333,34 @@ class StoreFDRepository(IFDRepository):
             fd.complete = False
 
         message_map = {msg.message_id: msg for msg in file_messages if msg}
+        acting_map, unavailable = await self._acting_map(versions)
 
         has_valid_version = False
 
         for i, version in enumerate(versions):
             owned = version.owned_by(self.key)
+            acting = (
+                not owned
+                and self._mirror_group is not None
+                and version.store is not None
+                and version.store in self._mirror_group.store_keys
+            )
+            # Each version's ids are checked against the store that owns
+            # them: the primary, or the acting store a failed-over write
+            # went to. Anything else reads the mirrors.
             version.part_sizes = []
             primary_layout_ok = True
             for j, message_id in enumerate(version.message_ids):
-                if (
-                    owned
-                    and (file_message := message_map.get(message_id, None))
-                    and file_message.document
-                ):
+                file_message = (
+                    message_map.get(message_id)
+                    if owned
+                    else (
+                        acting_map.get((version.store, message_id))
+                        if acting and version.store is not None
+                        else None
+                    )
+                )
+                if file_message and file_message.document:
                     version.part_sizes.append(file_message.document.size)
                     continue
 
@@ -229,11 +373,12 @@ class StoreFDRepository(IFDRepository):
                 ]
                 mirror_sizes = await self._lookup_mirror_parts(mirror_candidates)
                 if mirror_sizes:
-                    logger.warning(
-                        f"File message {message_id} for part {j + 1} of "
-                        f"{fd.name}@{version.id} not found in the primary "
-                        f"store, serving from mirror"
-                    )
+                    if not acting or (version.store, message_id) not in mirror_sizes:
+                        logger.warning(
+                            f"File message {message_id} for part {j + 1} of "
+                            f"{fd.name}@{version.id} not found in the owning "
+                            f"store, serving from mirror"
+                        )
                     version.part_sizes.append(next(iter(mirror_sizes.values())))
                     continue
 
@@ -253,6 +398,8 @@ class StoreFDRepository(IFDRepository):
                     version.part_sizes = []
                     version._size = INVALID_FILE_SIZE
                 else:
+                    if version.store in unavailable:
+                        fd.complete = False
                     logger.warning(
                         f"File messages of {fd.name}@{version.id} not found in any store"
                     )
@@ -298,9 +445,43 @@ class StoreFDRepository(IFDRepository):
     async def _get_fd_text(self, fr: TGFSFileRef) -> Optional[str]:
         """Read the FD JSON, falling back to mirror copies if needed."""
         message = None
+        acting = (
+            self._mirror_group.store_for(fr.store)
+            if self._mirror_group is not None
+            and fr.store is not None
+            and fr.store in self._mirror_group.store_keys
+            else None
+        )
+        if acting is not None:
+            # The acting store of a failed-over write owns the current
+            # descriptor copy under ``message_id``; ``mirrors`` there may
+            # hold a stale leftover from before the outage.
+            try:
+                message = (
+                    await _bounded_read(
+                        f"the read of file descriptor {fr.message_id} for {fr.name}",
+                        acting.get_messages([fr.message_id]),
+                    )
+                )[0]
+            except Exception as ex:
+                logger.warning(
+                    f"Could not read file descriptor {fr.message_id} for "
+                    f"{fr.name} from the acting store {fr.store}: {ex}"
+                )
+            if message and message.text:
+                return message.text
+            message = None
+        skip_primary = (
+            self._mirror_group is not None and self._mirror_group.primary_dead()
+        )
         try:
-            if fr.owned_by(self.key):
-                message = (await self._message_api.get_messages([fr.message_id]))[0]
+            if acting is None and fr.owned_by(self.key) and not skip_primary:
+                message = (
+                    await _bounded_read(
+                        f"the read of file descriptor {fr.message_id} for {fr.name}",
+                        self._message_api.get_messages([fr.message_id]),
+                    )
+                )[0]
         except Exception as ex:
             logger.warning(
                 f"Could not read file descriptor {fr.message_id} for "
@@ -320,7 +501,13 @@ class StoreFDRepository(IFDRepository):
             if (api := self._mirror_group.store_for(store_key)) is None:
                 continue
             try:
-                mirror_message = (await api.get_messages([mirror_mid]))[0]
+                mirror_message = (
+                    await _bounded_read(
+                        f"the read of file descriptor mirror {mirror_mid} in "
+                        f"{store_key} for {fr.name}",
+                        api.get_messages([mirror_mid]),
+                    )
+                )[0]
             except Exception as ex:
                 logger.warning(
                     f"Could not read FD mirror {mirror_mid} in store "
