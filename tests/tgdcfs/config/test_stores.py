@@ -101,6 +101,25 @@ class TestFilesystemConfig:
         assert fs.metadata.github_repo is not None
         assert fs.metadata.github_repo.repo == "o/r"
 
+    def test_github_metadata_squash_history(self):
+        fs = FilesystemConfig.from_dict(
+            "media",
+            {
+                "primary": "tg-main",
+                "metadata": {
+                    "type": "github_repo",
+                    "github_repo": {
+                        "repo": "o/r",
+                        "commit": "master",
+                        "access_token": "t",
+                        "squash_history_max_commits": 250,
+                    },
+                },
+            },
+        )
+        assert fs.metadata.github_repo is not None
+        assert fs.metadata.github_repo.squash_history_max_commits == 250
+
     def test_primary_required(self):
         with pytest.raises(ValueError, match="primary"):
             FilesystemConfig.from_dict("media", {})
@@ -760,6 +779,34 @@ class TestGitlabRepoConfig:
                     "branch": "main",
                     "access_token": "t",
                     "blob_fetch_concurrency": concurrency,
+                }
+            )
+
+    def test_squash_history_defaults_to_disabled(self):
+        config = GitlabRepoConfig.from_dict(
+            {"repo": "group/project", "branch": "main", "access_token": "t"}
+        )
+        assert config.squash_history_max_commits == 0
+
+    def test_squash_history_is_read_from_the_block(self):
+        config = GitlabRepoConfig.from_dict(
+            {
+                "repo": "group/project",
+                "branch": "main",
+                "access_token": "t",
+                "squash_history_max_commits": "500",
+            }
+        )
+        assert config.squash_history_max_commits == 500
+
+    def test_a_negative_squash_history_is_rejected(self):
+        with pytest.raises(ValueError, match="squash_history_max_commits"):
+            GitlabRepoConfig.from_dict(
+                {
+                    "repo": "group/project",
+                    "branch": "main",
+                    "access_token": "t",
+                    "squash_history_max_commits": -1,
                 }
             )
 

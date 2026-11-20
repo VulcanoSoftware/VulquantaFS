@@ -68,6 +68,11 @@ GITALY_DEADLINE_MARKERS = ("Stream removed", "Deadline Exceeded")
 # kills the operation on its own deadline.
 GITLAB_COMMIT_ACTION_LIMIT = 500
 
+# How deep a history squash pages for its anchor (the oldest commit it
+# can force the branch onto): 1000 pages of PER_PAGE. Reaching the cap
+# still shortens the history; the next compaction reads on from there.
+MAX_HISTORY_PAGES = 1000
+
 
 def _is_gitaly_deadline(data: dict) -> bool:
     text = str(data)
@@ -680,6 +685,119 @@ class GitlabRepository:
         tree.sha = sha
         return _Commit(sha)
 
+    def commit_history(self, ref: str, max_items: int) -> List[str]:
+        """The shas of the first ``max_items`` commits of ``ref``'s
+        history, newest first.
+
+        Paged, so a metadata branch that grows one commit per push can
+        still be swept to its root -- the listing a stats commit uses is
+        capped far below that.
+        """
+        shas: List[str] = []
+        page = 1
+        while len(shas) < max_items:
+            response = self._request(
+                "GET",
+                "/repository/commits",
+                params={"ref_name": ref, "page": page, "per_page": PER_PAGE},
+            )
+            batch = self._json(response)
+            if not isinstance(batch, list):
+                break
+            shas.extend(str(item["id"]) for item in batch)
+            next_page = response.headers.get("X-Next-Page", "").strip()
+            if not next_page or len(batch) < PER_PAGE or page >= MAX_HISTORY_PAGES:
+                break
+            page = int(next_page)
+        return shas[:max_items]
+
+    def compact_history(self, message: str, max_commits: int) -> int:
+        """Bound the branch's history to ``max_commits`` commits.
+
+        GitLab's commits API cannot create a parentless commit, so the
+        branch is force-committed onto its oldest ancestor instead, with
+        actions that replay its whole current state; the repointing
+        orphans everything older, which GitLab's housekeeping collects.
+        Returns how many commits the history carried when it was over
+        the bound, 0 when the history was within it. The anchor is the
+        oldest commit the page cap lets the read reach: usually the
+        history's root, otherwise the next compaction shortens from
+        there.
+        """
+        if not max_commits:
+            return 0
+        try:
+            beyond_bound = self.commit_history(self._branch, max_commits + 1)
+            if len(beyond_bound) <= max_commits:
+                return 0
+            # The anchor has to sit below every commit that stays, so the
+            # full history pages; the branch of an incremental metadata
+            # store holds one commit per write, and only its root ends
+            # the chain.
+            history = self.commit_history(
+                self._branch, MAX_HISTORY_PAGES * PER_PAGE
+            )
+        except GithubException as ex:
+            if ex.status == 404:
+                self._branch_missing = True
+                return 0
+            raise
+        if len(history) == MAX_HISTORY_PAGES * PER_PAGE:
+            logger.warning(
+                f"History of {self.full_name}@{self._branch} exceeds the "
+                "compaction read cap; bounding it incrementally"
+            )
+        if len(history) < 2:
+            return 0
+        anchor = history[-1]
+        if anchor == history[0]:
+            return 0
+        current_tree = self.get_git_tree(self._branch, recursive=True)
+        if current_tree.truncated:
+            logger.warning(
+                f"Tree of {self.full_name}@{self._branch} came back "
+                "truncated; the metadata history cannot be squashed safely"
+            )
+            return 0
+        current = {e.path: e.sha for e in current_tree.tree if e.type == "blob"}
+        anchor_tree = self.get_git_tree(anchor, recursive=True)
+        past = {e.path: e.sha for e in anchor_tree.tree if e.type == "blob"}
+        # GitLab commits by content: every blob the anchor's tree does not
+        # hold travels with its action, so they are fetched alongside the
+        # diff, concurrently like the sync does it.
+        needed = {sha for path, sha in current.items() if past.get(path) != sha}
+        contents = self._fetch_blobs(needed)
+        actions: List[dict] = [
+            {"action": "delete", "file_path": path}
+            for path in sorted(set(past) - set(current))
+        ]
+        actions += [
+            {
+                "action": "update" if path in past else "create",
+                "file_path": path,
+                "content": contents[sha],
+                "encoding": "base64",
+            }
+            for path, sha in sorted(current.items())
+            if past.get(path) != sha
+        ]
+        if not actions:
+            chunks: List[List[dict]] = [[]]
+        else:
+            chunks = [
+                actions[i : i + GITLAB_COMMIT_ACTION_LIMIT]
+                for i in range(0, len(actions), GITLAB_COMMIT_ACTION_LIMIT)
+            ]
+        total = len(chunks)
+        for number, chunk in enumerate(chunks, start=1):
+            self._post_commit(
+                message if total == 1 else f"{message} ({number}/{total})",
+                chunk,
+                force=number == 1,
+                start_sha=anchor if number == 1 else None,
+            )
+        return len(history)
+
     def _noop_commit(self) -> str:
         """The head an empty commit leaves the branch at: the current one,
         with a missing branch pointed at the project's default branch so
@@ -711,12 +829,21 @@ class GitlabRepository:
         self._branch_missing = False
         return head
 
-    def _post_commit(self, message: str, actions: List[dict]) -> str:
+    def _post_commit(
+        self,
+        message: str,
+        actions: List[dict],
+        force: bool = False,
+        start_sha: Optional[str] = None,
+    ) -> str:
         body: Dict[str, Any] = {
             "branch": self._branch,
             "commit_message": message,
             "actions": actions,
         }
+        if force:
+            body["force"] = True
+            body["start_sha"] = start_sha
         if self._branch_missing:
             # The branch does not exist yet; the commits API only creates
             # it when told where to start from.
@@ -829,6 +956,7 @@ class GitlabTreeRepoMetadataRepository(GithubRepoMetadataRepository):
             repo=config.repo,
             commit=config.branch,
             access_token=config.access_token,
+            squash_history_max_commits=config.squash_history_max_commits,
         )
         # The facade implements the subset of PyGithub's Repository the
         # engine uses; the cast records that duck-typed contract.
@@ -876,6 +1004,20 @@ class GitlabTreeRepoMetadataRepository(GithubRepoMetadataRepository):
     async def push_full(self) -> None:
         await super().push_full()
         await self._remove_document()
+
+    def _compact_history(self) -> None:
+        """The GitLab form of the history squash: the facade force-commits
+        the branch's current state onto its oldest ancestor, since the
+        commits API cannot create a parentless commit."""
+        limit = self._ghc.squash_history_max_commits
+        squashed = cast(Any, self._ghc.repo).compact_history(
+            "Compact metadata history", limit
+        )
+        if squashed:
+            logger.info(
+                f"Compacted the metadata history of {self._ghc.repo_name}@"
+                f"{self._ghc.commit}: squashed {squashed} commits"
+            )
 
     @staticmethod
     def _tree_is_empty(metadata: TGFSMetadata) -> bool:

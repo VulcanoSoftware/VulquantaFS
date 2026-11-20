@@ -139,9 +139,19 @@ class MetaDataApi:
     # -- metadata redundancy -------------------------------------------------
 
     async def heal(self) -> None:
-        """Re-write the metadata stores that missed a write; a no-op while
-        every store is up to date."""
+        """Re-write the metadata stores that missed a write, then run the
+        stores' configured maintenance (e.g. commit-history compaction)
+        next to it.
+
+        The heal worker calls this on a fixed interval, with one store or
+        with several; a store that is up to date and has no maintenance
+        configured costs a pass that does nothing.
+        """
         await self.__metadata_repo.heal()
+        try:
+            await self.__metadata_repo.maintain()
+        except Exception as ex:
+            logger.warning(f"Metadata maintenance failed: {ex}")
 
     def stale_stores(self) -> List[str]:
         return self.__metadata_repo.stale_stores()

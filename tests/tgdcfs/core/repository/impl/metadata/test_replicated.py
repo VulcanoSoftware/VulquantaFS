@@ -41,6 +41,7 @@ class FakeMetadataRepo(IMetaDataRepository):
         push_error: Exception | None = None,
         push_full_error: Exception | None = None,
         push_writes_stats: bool = False,
+        maintain_error: Exception | None = None,
     ):
         super().__init__()
         self.name = name
@@ -50,8 +51,10 @@ class FakeMetadataRepo(IMetaDataRepository):
         self.push_error = push_error
         self.push_full_error = push_full_error
         self.push_writes_stats = push_writes_stats
+        self.maintain_error = maintain_error
         self.push_calls = 0
         self.push_full_calls = 0
+        self.maintain_calls = 0
         self.load_stats_calls = 0
         self.save_stats_calls = 0
         self.stats_stored_calls = 0
@@ -74,6 +77,11 @@ class FakeMetadataRepo(IMetaDataRepository):
         if self.push_full_error is not None:
             raise self.push_full_error
         self.stored = self.metadata
+
+    async def maintain(self) -> None:
+        self.maintain_calls += 1
+        if self.maintain_error is not None:
+            raise self.maintain_error
 
     async def load_stats(self, directory: TGFSDirectory) -> bool:
         self.load_stats_calls += 1
@@ -412,7 +420,9 @@ class TestHeal:
 
         assert mirror.push_full_calls == 0
 
-    async def test_heal_keeps_the_stale_mark_when_the_store_is_still_down(self):
+    async def test_heal_keeps_the_stale_mark_when_the_store_is_still_down(
+        self,
+    ):
         primary = FakeMetadataRepo("primary")
         mirror = FakeMetadataRepo("mirror", push_full_error=TechnicalError("down"))
         layer = replicated(primary, mirror)
@@ -423,6 +433,30 @@ class TestHeal:
 
         assert layer.stale_stores() == ["mirror"]
         assert mirror.stored is None
+
+    async def test_heal_maintains_the_healthy_stores_only(self):
+        primary = FakeMetadataRepo("primary")
+        stale = FakeMetadataRepo("stale", push_full_error=TechnicalError("down"))
+        layer = replicated(primary, stale)
+        layer.metadata = tree("a")
+        await layer.push()
+        assert layer.stale_stores() == ["stale"]
+
+        await layer.heal()
+
+        assert primary.maintain_calls == 1
+        assert stale.maintain_calls == 0
+
+    async def test_a_failing_maintenance_does_not_fail_the_heal(self):
+        primary = FakeMetadataRepo(
+            "primary", maintain_error=TechnicalError("compaction refused")
+        )
+        layer = replicated(primary)
+        layer.metadata = tree("a")
+
+        await layer.heal()
+
+        assert layer.stale_stores() == []
 
 
 class TestMetadataPropagation:

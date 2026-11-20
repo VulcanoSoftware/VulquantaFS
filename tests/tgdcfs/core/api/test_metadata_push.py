@@ -22,12 +22,19 @@ class CountingRepo(IMetaDataRepository):
     def __init__(self):
         super().__init__()
         self.pushes = 0
+        self.maintains = 0
         self.fail: Exception | None = None
+        self.maintain_fail: Exception | None = None
 
     async def push(self) -> None:
         self.pushes += 1
         if self.fail is not None:
             raise self.fail
+
+    async def maintain(self) -> None:
+        self.maintains += 1
+        if self.maintain_fail is not None:
+            raise self.maintain_fail
 
     async def get(self):
         raise NoStoredMetadata("fake")
@@ -118,3 +125,22 @@ async def test_close_flushes_a_push_still_in_its_window():
 
     assert repo.pushes == 1
     await asyncio.wait_for(waiter, 2)
+
+
+async def test_heal_runs_the_repository_maintenance():
+    repo = CountingRepo()
+    api = MetaDataApi(repo)
+
+    await api.heal()
+
+    assert repo.maintains == 1
+
+
+async def test_heal_logs_a_failing_maintenance_and_returns():
+    repo = CountingRepo()
+    repo.maintain_fail = TechnicalError("compaction refused")
+    api = MetaDataApi(repo)
+
+    await api.heal()
+
+    assert repo.pushes == 0

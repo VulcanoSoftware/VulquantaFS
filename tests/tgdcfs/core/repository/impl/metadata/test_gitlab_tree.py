@@ -106,8 +106,19 @@ class FakeGitlab:
 
     # -- git model ------------------------------------------------------------
 
-    def commit(self, branch: str, message: str, actions: List[dict]) -> str:
-        files = dict(self.branch_files.get(branch, {}))
+    def commit(
+        self,
+        branch: str,
+        message: str,
+        actions: List[dict],
+        start_files: Optional[Dict[str, str]] = None,
+        parent: Optional[str] = None,
+    ) -> str:
+        files = (
+            dict(self.branch_files.get(branch, {}))
+            if start_files is None
+            else dict(start_files)
+        )
         changed = []
         for action in actions:
             path = action["file_path"]
@@ -139,6 +150,7 @@ class FakeGitlab:
             "committed_date": f"2024-06-{len(self.commits) % 28 + 1:02d}" "T00:00:00Z",
             "changed": changed,
             "files": files,
+            "parent": parent if parent is not None else self.branch_heads.get(branch),
         }
         self.branch_files[branch] = files
         self.branch_heads[branch] = sha
@@ -215,7 +227,18 @@ class FakeGitlab:
                 branch = body["branch"]
                 if branch not in self.branch_heads:
                     raise _Conflict("Invalid branch name")
-                sha = self.commit(branch, body["commit_message"], body["actions"])
+                if body.get("force"):
+                    # A force commit replaces the branch's history with a
+                    # commit whose base is start_sha.
+                    sha = self.commit(
+                        branch,
+                        body["commit_message"],
+                        body["actions"],
+                        start_files=self._files_for(body["start_sha"]),
+                        parent=body.get("start_sha"),
+                    )
+                else:
+                    sha = self.commit(branch, body["commit_message"], body["actions"])
                 return 200, self.commits[sha]
             return 200, self._commit_history(params)
         if rest.startswith("repository/commits/"):
@@ -288,11 +311,12 @@ class FakeGitlab:
         return ordered
 
     def _reachable(self, head: str) -> set:
-        # The fake appends commits in creation order; a branch head at index
-        # i means every commit up to i on the same file lineage. Approximate
-        # reachability by commit insertion order up to the head.
-        shas = list(self.commits)
-        return set(shas[: shas.index(head) + 1])
+        reached: set = set()
+        sha: Optional[str] = head
+        while sha is not None and sha not in reached:
+            reached.add(sha)
+            sha = self.commits[sha].get("parent")
+        return reached
 
     def _compare(self, params) -> dict:
         old, new = self._files_for(params["from"]), self._files_for(params["to"])
@@ -1156,3 +1180,73 @@ class TestChunkedCommits:
         assert all(len(body["actions"]) <= 4 for body in posts)
         for i in range(10):
             assert gitlab.file_content("main", f"f{i}.{i}") is not None
+
+
+class TestHistoryCompaction:
+    """GitLab keeps every deleted blob alive for as long as a commit
+    references it, so the branch's history has to be bounded before its
+    storage use is. The commits API cannot create a parentless commit, so
+    the squash is a force commit of the branch's whole current state onto
+    its oldest ancestor."""
+
+    def a_used_branch(self, fake: FakeGitlab) -> None:
+        fake.commit("main", "seed", [])
+        for i in range(5):
+            fake.commit(
+                "main",
+                f"add {i}",
+                [
+                    {
+                        "action": "create",
+                        "file_path": f"docs/f{i}.{i}",
+                        "content": "",
+                        "encoding": "text",
+                    }
+                ],
+            )
+        fake.commit(
+            "main",
+            "remove one",
+            [{"action": "delete", "file_path": "docs/f1.1"}],
+        )
+
+    async def test_a_grown_history_is_force_committed_onto_its_root(
+        self, monkeypatch
+    ):
+        fake = FakeGitlab(seed={})
+        self.a_used_branch(fake)
+        facade = _routed(monkeypatch, fake)
+        root = facade.commit_history("main", 100)[-1]
+        assert fake.file_content("main", "docs/f1.1") is None
+        assert len(fake.commits) == 7
+
+        squashed = facade.compact_history("Compact metadata history", 3)
+
+        assert squashed == 7
+        # The branch state survived the rewrite unchanged.
+        assert fake.file_content("main", "docs/f1.1") is None
+        assert fake.file_content("main", "docs/f3.3") == ""
+        assert fake.file_content("main", "docs/.gitkeep") is None
+        # The history carries the anchor's lineage plus one commit.
+        assert len(facade.commit_history("main", 100)) == 2
+        forced = [
+            body
+            for body in commit_posts(fake)
+            if body.get("force") and body.get("start_sha") == root
+        ]
+        assert len(forced) == 1
+        # The replay only carries what changed since the anchor: the files
+        # the pushes added. The removed file predates the anchor, so the
+        # anchor's tree never referenced it and no delete is needed.
+        assert len(forced[0]["actions"]) == 4
+        assert fake.branch_files["main"] == dict(
+            fake.commits[fake._resolve_ref("main")]["files"]
+        )
+
+    async def test_a_history_within_bound_is_left_alone(self, monkeypatch):
+        fake = FakeGitlab(seed={})
+        fake.commit("main", "seed", [])
+        facade = _routed(monkeypatch, fake)
+
+        assert facade.compact_history("Compact metadata history", 100) == 0
+        assert not commit_posts(fake)

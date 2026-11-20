@@ -192,6 +192,13 @@ class GithubRepoConfig:
     commit: str
     access_token: str
     tree_fetch_concurrency: int = DEFAULT_TREE_FETCH_CONCURRENCY
+    # Squash the branch's commit history once it grew past this many
+    # commits (0 keeps every commit, the default). Git backends hold
+    # deleted blobs for as long as a commit references them, so an
+    # unbounded history grows the repository's storage use forever; the
+    # squash rewrites the branch into one commit that carries its whole
+    # current state. ``0`` disables the maintenance entirely.
+    squash_history_max_commits: int = 0
     # How the metadata tree is stored in the repo: mirrored into the
     # repo's own directory structure (one blob per directory, written
     # incrementally) or as one JSON document that is rewritten on every
@@ -213,6 +220,12 @@ class GithubRepoConfig:
                 "metadata.github_repo.tree_fetch_concurrency must be "
                 f"positive, got {concurrency}"
             )
+        squash = int(data.get("squash_history_max_commits", 0))
+        if squash < 0:
+            raise ValueError(
+                "metadata.github_repo.squash_history_max_commits cannot "
+                f"be negative, got {squash}"
+            )
         file_path = str(data.get("file_path") or cls.DEFAULT_FILE_PATH).strip("/")
         if not file_path or file_path.endswith("/"):
             raise ValueError(
@@ -223,6 +236,7 @@ class GithubRepoConfig:
             commit=data["commit"],
             access_token=data["access_token"],
             tree_fetch_concurrency=concurrency,
+            squash_history_max_commits=squash,
             layout=_parse_metadata_layout(
                 "metadata.github_repo.layout", data.get("layout")
             ),
@@ -356,6 +370,12 @@ class GitlabRepoConfig:
     DEFAULT_BLOB_FETCH_CONCURRENCY = 8
 
     blob_fetch_concurrency: int = DEFAULT_BLOB_FETCH_CONCURRENCY
+    # Like ``github_repo``: squash the branch's commit history once it
+    # grew past this many commits (0 keeps every commit, the default).
+    # GitLab's commits API cannot create a parentless commit, so the
+    # squash replays the branch's whole current state as one commit
+    # forced onto its oldest ancestor instead.
+    squash_history_max_commits: int = 0
 
     @classmethod
     def from_dict(cls, data: dict) -> Self:
@@ -366,6 +386,12 @@ class GitlabRepoConfig:
             raise ValueError(
                 "metadata.gitlab_repo.blob_fetch_concurrency must be "
                 f"positive, got {concurrency}"
+            )
+        squash = int(data.get("squash_history_max_commits", 0))
+        if squash < 0:
+            raise ValueError(
+                "metadata.gitlab_repo.squash_history_max_commits cannot "
+                f"be negative, got {squash}"
             )
         if not (repo := data.get("repo")):
             raise ValueError("metadata.gitlab_repo.repo is required")
@@ -390,6 +416,7 @@ class GitlabRepoConfig:
             base_url=base_url,
             file_path=file_path,
             blob_fetch_concurrency=concurrency,
+            squash_history_max_commits=squash,
             layout=_parse_metadata_layout(
                 "metadata.gitlab_repo.layout", data.get("layout")
             ),

@@ -320,13 +320,25 @@ class ReplicatedMetadataRepository(IMetaDataRepository):
 
         Called periodically by the heal worker and safe to call any time;
         a store that is up to date costs nothing, and one that just came
-        back is brought in line with the current tree.
+        back is brought in line with the current tree. The stores that
+        are healthy afterwards get their maintenance pass (history
+        compaction and the like), so the heal worker covers single-store
+        and replicated file systems alike.
         """
         if not self.metadata:
             return
         for store in self._stores:
             if store.key in self._stale or store.key in self._skipped:
                 await self._write(store, full=True)
+        for store in self._stores:
+            if store.key in self._stale or store.key in self._skipped:
+                continue
+            try:
+                await store.repo.maintain()
+            except Exception as ex:
+                logger.warning(
+                    f"Maintaining metadata store {store.key} failed: {ex}"
+                )
 
     def stale_stores(self) -> List[str]:
         return sorted(self._stale | set(self._skipped))
