@@ -952,13 +952,14 @@ export default function ConfigGenerator() {
     <div className="dcfs-page">
       <Container
         maxWidth={mounted && settings.fullWidth ? false : "lg"}
-        sx={{ py: 6 }}
+        sx={{ py: { xs: 3, md: 6 } }}
       >
         <Typography
           variant="h3"
           component="h1"
           gutterBottom
           align="center"
+          sx={{ fontSize: { xs: "1.8rem", sm: "3rem" } }}
           className="dcfs-gradient-text"
         >
           TGDCFS Config Generator
@@ -2102,7 +2103,7 @@ export default function ConfigGenerator() {
             className="dcfs-glass"
             sx={{
               p: 3,
-              position: "sticky",
+              position: { xs: "static", lg: "sticky" },
               top: 24,
               // Taller than the viewport, the panel scrolls on its own so
               // the Docker command below the YAML stays reachable.
