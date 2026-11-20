@@ -21,6 +21,29 @@ export type SyncMode = "inline" | "background" | "tee";
 // When a write is answered: once the primary store has it, or once the
 // local cache has it and a worker moves it into the stores (write-back).
 export type WriteAck = "primary" | "cache";
+// How a mutation reaches the metadata stores: coalesced merges the push
+// requests of a burst (a folder deleted file by file) into one store
+// write per window; inline hands every push straight to the stores.
+export type MetadataPushMode = "coalesced" | "inline";
+
+// How metadata mutations reach the metadata stores.
+export interface MetadataPushConfig {
+  mode: MetadataPushMode;
+  // coalesced only: pushes that arrive within this many milliseconds
+  // share one store write. 0 pushes at once, still merging concurrents.
+  window_ms: number;
+  // Write the primary and the mirrors at the same time instead of one
+  // store after another: the write lasts as long as the slowest store.
+  parallel_stores: boolean;
+}
+
+// The loader's defaults; a value equal to its default is left out of the
+// YAML so the server's default keeps applying.
+export const METADATA_PUSH_DEFAULTS: MetadataPushConfig = {
+  mode: "coalesced",
+  window_ms: 300,
+  parallel_stores: true,
+};
 
 // One metadata store: the primary one or an entry of metadata_mirrors.
 // Every field is kept on the form so switching the type never loses what
@@ -41,6 +64,9 @@ export interface MetadataEntry {
     // layout uses it to find (and remove) a document left by an older
     // release or by the document layout.
     file_path: string;
+    // Tree layout only: compact the commit history once it grows past
+    // this many commits; 0 keeps it forever.
+    squash_history_max_commits: number;
   };
   gitlab_repo: {
     repo: string;
@@ -49,6 +75,12 @@ export interface MetadataEntry {
     base_url: string;
     file_path: string;
     layout: MetadataLayout;
+    // Tree layout only: how many blobs a full-tree sync reads in
+    // parallel; more is faster but bursts harder against the rate limit.
+    blob_fetch_concurrency: number;
+    // Tree layout only: compact the commit history once it grows past
+    // this many commits; 0 keeps it forever.
+    squash_history_max_commits: number;
   };
 }
 
@@ -57,6 +89,7 @@ export interface MetadataEntry {
 export const GITLAB_DEFAULTS = {
   base_url: "https://gitlab.com",
   file_path: "metadata.json",
+  blob_fetch_concurrency: 8,
 };
 
 export const newMetadataEntry = (): MetadataEntry => ({
@@ -68,6 +101,7 @@ export const newMetadataEntry = (): MetadataEntry => ({
     access_token: "",
     layout: "tree",
     file_path: GITLAB_DEFAULTS.file_path,
+    squash_history_max_commits: 0,
   },
   gitlab_repo: {
     repo: "",
@@ -76,6 +110,8 @@ export const newMetadataEntry = (): MetadataEntry => ({
     base_url: GITLAB_DEFAULTS.base_url,
     file_path: GITLAB_DEFAULTS.file_path,
     layout: "tree",
+    blob_fetch_concurrency: GITLAB_DEFAULTS.blob_fetch_concurrency,
+    squash_history_max_commits: 0,
   },
 });
 
@@ -97,6 +133,9 @@ export interface FilesystemConfig {
   // tree, and a read fails over to the next one when a store fails.
   metadata: MetadataEntry;
   metadata_mirrors: MetadataEntry[];
+  // How mutations reach those stores: coalesced (default), inline, and
+  // whether the stores are written in parallel.
+  metadata_push: MetadataPushConfig;
 }
 
 export interface DiscordConfig {
@@ -237,6 +276,7 @@ export const newFilesystem = (
   allow_shared_store: false,
   metadata: newMetadataEntry(),
   metadata_mirrors: [],
+  metadata_push: { ...METADATA_PUSH_DEFAULTS },
 });
 
 // The form as it opens: one Telegram store, one file system on it, and

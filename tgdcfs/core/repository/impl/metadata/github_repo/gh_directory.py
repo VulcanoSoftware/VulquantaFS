@@ -4,7 +4,7 @@ import logging
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
-from typing import Callable, Optional, TypeVar
+from typing import Callable, Optional, Set, TypeVar
 
 import requests
 from github import Github, InputGitTreeElement
@@ -32,6 +32,16 @@ PUT_RETRY_DELAY = 1.5
 # reference is given up on.
 DEFERRED_PUT_ATTEMPTS = 10
 DEFERRED_PUT_RETRY_DELAY = 5
+
+# Deleting a file reference used to wait on two API calls on the writer
+# thread (read the blob's sha, commit its deletion), so a 20k-file folder
+# deleted over SFTP took hours. ``delete_file_ref_async`` only registers
+# the blob paths instead, and the blobs leave in one tree-rewrite commit
+# once the batch is full or the oldest registration has waited this long
+# (``GithubRepoMetadataRepository.push``).
+DROP_FLUSH_BATCH = 100
+DROP_FLUSH_INTERVAL = 5.0
+DROP_COMMIT_ATTEMPTS = 3
 
 
 def _is_transient(ex: Exception) -> bool:
@@ -70,6 +80,19 @@ class GithubConfig:
     # How many directories the truncated-tree fallback reads in parallel
     # (one request per directory; see ``_walk_tree``).
     tree_fetch_concurrency: int = 8
+    # Squash the branch's commit history once it grows past this many
+    # commits (0 keeps it); read by ``maintain`` from the store config.
+    squash_history_max_commits: int = 0
+    # File-reference blob paths removed from the in-memory tree but not
+    # yet from the repo, plus the monotonic time the oldest was
+    # registered. ``delete_file_ref_async`` registers, ``push`` flushes
+    # batches into one commit; touch them on the event loop only.
+    pending_drops: Set[str] = field(
+        default_factory=set,
+        compare=False,
+        repr=False,
+    )
+    pending_drops_since: float = 0.0
     # PyGithub is synchronous: a write sleeps through GitHub's rate limits
     # and retries for as long as it takes, and on the event loop that froze
     # every other request (uploads timed out in FileZilla after 20 s of
@@ -503,8 +526,24 @@ class GithubDirectory(TGFSDirectory):
         # cannot re-create this blob after the drop (its in-tree check
         # only helps if the removal happened before that check).
         async with self._ghc.lock:
-            await self._ghc.write(self._drop_file_ref, fr)
+            paths = self._drop_candidate_paths(fr)
+            if paths:
+                self._ghc.pending_drops.update(paths)
+                if not self._ghc.pending_drops_since:
+                    self._ghc.pending_drops_since = time.monotonic()
             super().delete_file_ref(fr)
+
+    def _drop_candidate_paths(self, fr: TGFSFileRef) -> Set[str]:
+        """The repo paths where ``fr``'s blob may live: the same
+        candidates ``_drop_file_ref`` deletes, encrypted first."""
+        candidates = []
+        if self._ghc.name_key is not None:
+            candidates.append(self._file_ref_storage_name(fr.name, fr.message_id))
+        candidates.append(f"{fr.name}.{fr.message_id}")
+        return {
+            self.join_path(self._github_path, segment)
+            for segment in dict.fromkeys(candidates)
+        }
 
     def _drop_file_ref(self, fr: TGFSFileRef) -> None:
         """Remove the file reference blob from the repo. Blocking; a blob

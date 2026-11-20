@@ -1,6 +1,7 @@
 import base64
 import datetime
 import json
+import time
 
 import pytest
 from unittest.mock import Mock, MagicMock, patch
@@ -1747,3 +1748,263 @@ class TestPushFullSync:
 
         with pytest.raises(MetadataNotInitialized):
             await repository.push_full()
+
+
+class TestBatchedDeletions:
+    """File-reference deletions leave the repo in one commit instead of
+    two API calls per deleted file."""
+
+    def build_repository(self, mock_github_class, mock_github_config, mock_ghc):
+        mock_github_instance = Mock(spec=Github)
+        mock_github_instance.get_repo.return_value = Mock(spec=Repository)
+        mock_github_class.return_value = mock_github_instance
+        repository = GithubRepoMetadataRepository(mock_github_config)
+        repository._ghc = mock_ghc
+        return repository
+
+    def _wire_commit(self, mock_ghc):
+        ref = Mock()
+        ref.object.sha = "commitsha"
+        base_commit = Mock()
+        base_commit.tree.sha = "basetreesha"
+        new_commit = Mock()
+        new_commit.sha = "newcommitsha"
+        mock_ghc.repo.get_git_ref.return_value = ref
+        mock_ghc.repo.get_git_commit.return_value = base_commit
+        mock_ghc.repo.create_git_tree.return_value = Mock()
+        mock_ghc.repo.create_git_commit.return_value = new_commit
+        return ref
+
+    @patch("tgdcfs.core.repository.impl.metadata.github_repo.Github")
+    @pytest.mark.asyncio
+    async def test_push_commits_the_queued_deletions_in_one_commit(
+        self, mock_github_class, mock_github_config, mock_ghc
+    ):
+        repository = self.build_repository(
+            mock_github_class, mock_github_config, mock_ghc
+        )
+        ref = self._wire_commit(mock_ghc)
+        mock_ghc.pending_drops.update(
+            {"dir/b.8", "dir/a.7", "missing.9"}
+        )
+        mock_ghc.pending_drops_since = time.monotonic() - 10
+
+        await repository.push()
+
+        mock_ghc.repo.delete_file.assert_not_called()
+        mock_ghc.repo.get_contents.assert_not_called()
+        elements = mock_ghc.repo.create_git_tree.call_args[0][0]
+        deleted = {e._identity["path"] for e in elements}
+        assert deleted == {"dir/a.7", "dir/b.8", "missing.9"}
+        # A delete is an element with a null sha over the base tree.
+        assert all(e._identity["sha"] is None for e in elements)
+        kwargs = mock_ghc.repo.create_git_tree.call_args.kwargs
+        assert kwargs["base_tree"] is mock_ghc.repo.get_git_commit.return_value.tree
+        mock_ghc.repo.create_git_commit.assert_called_once_with(
+            "Delete 3 file reference(s)",
+            mock_ghc.repo.create_git_tree.return_value,
+            [mock_ghc.repo.get_git_commit.return_value],
+        )
+        ref.edit.assert_called_once_with("newcommitsha")
+        assert not mock_ghc.pending_drops
+
+    @patch("tgdcfs.core.repository.impl.metadata.github_repo.Github")
+    @pytest.mark.asyncio
+    async def test_a_small_fresh_batch_waits_for_the_next_push(
+        self, mock_github_class, mock_github_config, mock_ghc
+    ):
+        repository = self.build_repository(
+            mock_github_class, mock_github_config, mock_ghc
+        )
+        mock_ghc.pending_drops.update({"f.7", "g.8"})
+        mock_ghc.pending_drops_since = time.monotonic()
+
+        await repository.push()
+
+        mock_ghc.repo.get_git_ref.assert_not_called()
+        assert mock_ghc.pending_drops == {"f.7", "g.8"}
+
+    @patch("tgdcfs.core.repository.impl.metadata.github_repo.Github")
+    @pytest.mark.asyncio
+    async def test_a_failed_flush_requeues_the_drops(
+        self, mock_github_class, mock_github_config, mock_ghc
+    ):
+        repository = self.build_repository(
+            mock_github_class, mock_github_config, mock_ghc
+        )
+        self._wire_commit(mock_ghc)
+        mock_ghc.repo.create_git_commit.side_effect = Exception("GitHub down")
+        mock_ghc.pending_drops.update({"f.7"})
+        mock_ghc.pending_drops_since = time.monotonic() - 10
+
+        await repository.push()
+
+        assert mock_ghc.pending_drops == {"f.7"}
+        assert mock_ghc.pending_drops_since > 0
+
+    @patch("tgdcfs.core.repository.impl.metadata.github_repo.Github")
+    @pytest.mark.asyncio
+    async def test_a_missing_branch_ends_the_queue(
+        self, mock_github_class, mock_github_config, mock_ghc
+    ):
+        repository = self.build_repository(
+            mock_github_class, mock_github_config, mock_ghc
+        )
+        self._wire_commit(mock_ghc)
+        mock_ghc.repo.get_git_ref.side_effect = GithubException(404, {}, {})
+        mock_ghc.pending_drops.update({"f.7"})
+        mock_ghc.pending_drops_since = time.monotonic() - 10
+
+        await repository.push()
+
+        assert not mock_ghc.pending_drops
+
+    @patch("tgdcfs.core.repository.impl.metadata.github_repo.Github")
+    @pytest.mark.asyncio
+    async def test_push_full_writes_the_pending_deletions_out(
+        self, mock_github_class, mock_github_config, mock_ghc
+    ):
+        """A full sync covers the queued deletions through its own diff."""
+        repository = self.build_repository(
+            mock_github_class, mock_github_config, mock_ghc
+        )
+        root = TGFSDirectory.root_dir()
+        docs = root.create_dir("docs")
+        docs.files.append(TGFSFileRef(message_id=42, name="readme", location=docs))
+        repository.metadata = TGFSMetadata(root)
+        # The repo still holds the file ref the tree dropped while
+        # replication was healing.
+        repository.metadata.dir.find_dirs()[0].files.clear()
+        mock_ghc.pending_drops.update({"docs/readme.42"})
+        mock_ghc.pending_drops_since = time.monotonic() - 10
+
+        tree = Mock()
+        tree.tree = [
+            Mock(path="docs/readme.42", type="blob", sha="old", mode="100644")
+        ]
+        tree.truncated = False
+        mock_ghc.repo.get_git_tree.return_value = tree
+        ref = Mock()
+        ref.object.sha = "commitsha"
+        base_commit = Mock()
+        base_commit.tree.sha = "basetreesha"
+        new_commit = Mock()
+        new_commit.sha = "newcommitsha"
+        mock_ghc.repo.get_git_ref.return_value = ref
+        mock_ghc.repo.get_git_commit.return_value = base_commit
+        mock_ghc.repo.create_git_tree.return_value = Mock()
+        mock_ghc.repo.create_git_commit.return_value = new_commit
+
+        await repository.push_full()
+
+        # The sync's own diff is what deleted the blob; the queue is empty.
+        assert not mock_ghc.pending_drops
+        ref.edit.assert_called_once_with("newcommitsha")
+
+
+class TestHistoryMaintenance:
+    """``maintain`` squashes the branch's history when it grew past the
+    configured number of commits; ``0`` turns the maintenance off."""
+
+    def build_repository(self, mock_github_class, mock_github_config, mock_ghc):
+        mock_github_instance = Mock(spec=Github)
+        mock_github_instance.get_repo.return_value = Mock(spec=Repository)
+        mock_github_class.return_value = mock_github_instance
+        repository = GithubRepoMetadataRepository(mock_github_config)
+        repository._ghc = mock_ghc
+        return repository
+
+    def _wire_commit(self, mock_ghc, commit_sha="newcommitsha"):
+        ref = Mock()
+        ref.object.sha = "commitsha"
+        base_commit = Mock()
+        base_commit.tree.sha = "basetreesha"
+        new_commit = Mock()
+        new_commit.sha = commit_sha
+        mock_ghc.repo.get_git_ref.return_value = ref
+        mock_ghc.repo.get_git_commit.return_value = base_commit
+        mock_ghc.repo.create_git_tree.return_value = Mock()
+        mock_ghc.repo.create_git_commit.return_value = new_commit
+        return ref
+
+    @patch("tgdcfs.core.repository.impl.metadata.github_repo.Github")
+    @pytest.mark.asyncio
+    async def test_an_unconfigured_store_maintains_nothing(
+        self, mock_github_class, mock_github_config, mock_ghc
+    ):
+        repository = self.build_repository(
+            mock_github_class, mock_github_config, mock_ghc
+        )
+
+        await repository.maintain()
+
+        mock_ghc.repo.get_commits.assert_not_called()
+
+    @patch("tgdcfs.core.repository.impl.metadata.github_repo.Github")
+    @pytest.mark.asyncio
+    async def test_a_short_history_is_left_alone(
+        self, mock_github_class, mock_github_config, mock_ghc
+    ):
+        mock_ghc.squash_history_max_commits = 3
+        repository = self.build_repository(
+            mock_github_class, mock_github_config, mock_ghc
+        )
+        mock_ghc.repo.get_commits.return_value = [Mock(), Mock()]
+
+        await repository.maintain()
+
+        mock_ghc.repo.get_git_ref.assert_not_called()
+
+    @patch("tgdcfs.core.repository.impl.metadata.github_repo.Github")
+    @pytest.mark.asyncio
+    async def test_a_grown_history_is_squashed_into_an_orphan_commit(
+        self, mock_github_class, mock_github_config, mock_ghc
+    ):
+        mock_ghc.squash_history_max_commits = 3
+        repository = self.build_repository(
+            mock_github_class, mock_github_config, mock_ghc
+        )
+        mock_ghc.repo.get_commits.return_value = [
+            Mock() for _ in range(4)
+        ]  # one past the bound
+        ref = self._wire_commit(mock_ghc)
+        mock_ghc.repo.get_git_tree.return_value = Mock(
+            tree=[
+                Mock(path="dir/f.1", type="blob", sha="sha1", mode="100644"),
+                Mock(path="dir", type="tree", sha="treesha", mode="040000"),
+            ],
+            truncated=False,
+        )
+
+        await repository.maintain()
+
+        elements = mock_ghc.repo.create_git_tree.call_args[0][0]
+        assert [(e._identity["path"], e._identity["sha"]) for e in elements] == [
+            ("dir/f.1", "sha1")
+        ]
+        # The parentless commit leaves the old history with no ref, so
+        # the backend's garbage collection can reclaim the deleted blobs.
+        mock_ghc.repo.create_git_commit.assert_called_once_with(
+            "Compact metadata history (4 commits squashed)",
+            mock_ghc.repo.create_git_tree.return_value,
+            [],
+        )
+        ref.edit.assert_called_once_with("newcommitsha", force=True)
+
+    @patch("tgdcfs.core.repository.impl.metadata.github_repo.Github")
+    @pytest.mark.asyncio
+    async def test_a_truncated_tree_refuses_to_squash(
+        self, mock_github_class, mock_github_config, mock_ghc
+    ):
+        mock_ghc.squash_history_max_commits = 3
+        repository = self.build_repository(
+            mock_github_class, mock_github_config, mock_ghc
+        )
+        mock_ghc.repo.get_commits.return_value = [Mock() for _ in range(4)]
+        ref = self._wire_commit(mock_ghc)
+        mock_ghc.repo.get_git_tree.return_value = Mock(tree=[], truncated=True)
+
+        with pytest.raises(TechnicalError):
+            await repository.maintain()
+
+        mock_ghc.repo.create_git_commit.assert_not_called()

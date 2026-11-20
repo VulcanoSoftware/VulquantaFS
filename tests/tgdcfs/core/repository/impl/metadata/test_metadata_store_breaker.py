@@ -148,6 +148,65 @@ class TestStoreCircuitBreaker:
     def test_the_default_cooldown_is_the_module_constant(self, make_breaker):
         assert make_breaker(probe=Probe())._cooldown == PROBE_COOLDOWN_SECONDS
 
+    def test_consecutive_trips_double_the_cooldown_up_to_the_cap(self):
+        breaker = StoreCircuitBreaker(probe=Probe(), cooldown=30.0)
+        breaker.stop()
+        with breaker._lock:
+            assert breaker._escalated_cooldown_locked() == 30.0
+            breaker._trips_in_a_row = 2
+            assert breaker._escalated_cooldown_locked() == 60.0
+            breaker._trips_in_a_row = 3
+            assert breaker._escalated_cooldown_locked() == 120.0
+            breaker._trips_in_a_row = 99
+            assert breaker._escalated_cooldown_locked() == 30.0 * 16
+
+    def test_every_trip_in_a_row_reopens_with_a_longer_cooldown(self, make_breaker):
+        probe = Probe()
+        breaker = make_breaker(probe=probe, cooldown=0.05)
+        sink = Sunk(CONNECT_TIMEOUT)
+
+        with pytest.raises(requests.exceptions.ConnectTimeout):
+            breaker.call(sink)
+        assert breaker._trips_in_a_row == 1
+        deadline = time.monotonic() + 5
+        while breaker._open and time.monotonic() < deadline:
+            time.sleep(0.005)
+        assert probe.calls == 1
+
+        # The probe answered, the breaker closed -- and the very next real
+        # call deadlines again. That second trip in a row must hold the
+        # calls for twice the cooldown, not once more the first interval.
+        with pytest.raises(requests.exceptions.ConnectTimeout):
+            breaker.call(sink)
+        assert breaker._trips_in_a_row == 2
+        start = time.monotonic()
+        time.sleep(0.075)
+        assert breaker._open, "the second trip must outlast one cooldown"
+        deadline = time.monotonic() + 5
+        while breaker._open and time.monotonic() < deadline:
+            time.sleep(0.005)
+        assert not breaker._open
+        assert time.monotonic() - start >= 2 * 0.05 - 0.01
+
+    def test_a_call_the_service_answers_resets_the_escalation(self, make_breaker):
+        breaker = make_breaker(probe=Probe(), cooldown=0.05)
+        sink = Sunk(CONNECT_TIMEOUT)
+        for _ in range(2):
+            with pytest.raises(requests.exceptions.ConnectTimeout):
+                breaker.call(sink)
+            deadline = time.monotonic() + 5
+            while breaker._open and time.monotonic() < deadline:
+                time.sleep(0.005)
+        assert breaker._trips_in_a_row == 2
+
+        assert breaker.call(Probe()) is None
+        assert breaker._trips_in_a_row == 0
+
+        # And the next trip therefore starts over at the base cooldown.
+        with pytest.raises(requests.exceptions.ConnectTimeout):
+            breaker.call(sink)
+        assert breaker._trips_in_a_row == 1
+
 
 class TestFailFastRepository:
     def test_a_property_fetch_hits_the_breaker(self, make_breaker):

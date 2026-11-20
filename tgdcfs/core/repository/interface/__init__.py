@@ -139,6 +139,17 @@ class IMetaDataRepository(metaclass=ABCMeta):
         """
         return
 
+    async def maintain(self) -> None:
+        """Run the store's periodic housekeeping (commit-history compaction,
+        deferred write flushes) once.
+
+        Configured per store (e.g. ``squash_history_max_commits``); a store
+        with no maintenance configured does nothing. Called next to
+        :meth:`heal` by the heal worker, so it also runs on a store
+        without mirrors.
+        """
+        return
+
     def stale_stores(self) -> List[str]:
         """Keys of the stores that missed a write and await healing."""
         return []

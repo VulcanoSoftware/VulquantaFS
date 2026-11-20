@@ -192,6 +192,13 @@ class GithubRepoConfig:
     commit: str
     access_token: str
     tree_fetch_concurrency: int = DEFAULT_TREE_FETCH_CONCURRENCY
+    # Squash the branch's commit history once it grew past this many
+    # commits (0 keeps every commit, the default). Git backends hold
+    # deleted blobs for as long as a commit references them, so an
+    # unbounded history grows the repository's storage use forever; the
+    # squash rewrites the branch into one commit that carries its whole
+    # current state. ``0`` disables the maintenance entirely.
+    squash_history_max_commits: int = 0
     # How the metadata tree is stored in the repo: mirrored into the
     # repo's own directory structure (one blob per directory, written
     # incrementally) or as one JSON document that is rewritten on every
@@ -213,6 +220,12 @@ class GithubRepoConfig:
                 "metadata.github_repo.tree_fetch_concurrency must be "
                 f"positive, got {concurrency}"
             )
+        squash = int(data.get("squash_history_max_commits", 0))
+        if squash < 0:
+            raise ValueError(
+                "metadata.github_repo.squash_history_max_commits cannot "
+                f"be negative, got {squash}"
+            )
         file_path = str(data.get("file_path") or cls.DEFAULT_FILE_PATH).strip("/")
         if not file_path or file_path.endswith("/"):
             raise ValueError(
@@ -223,6 +236,7 @@ class GithubRepoConfig:
             commit=data["commit"],
             access_token=data["access_token"],
             tree_fetch_concurrency=concurrency,
+            squash_history_max_commits=squash,
             layout=_parse_metadata_layout(
                 "metadata.github_repo.layout", data.get("layout")
             ),
@@ -347,9 +361,38 @@ class GitlabRepoConfig:
 
     DEFAULT_BASE_URL = "https://gitlab.com"
     DEFAULT_FILE_PATH = "metadata.json"
+    # How many blobs a full-tree sync reads in parallel before it builds
+    # the commit actions. The diff needs the content of every blob the
+    # branch does not hold yet; one round trip per blob would turn a big
+    # catch-up sync into a chain of them. More is faster but bursts
+    # harder against the API's rate limit, like github_repo's
+    # tree_fetch_concurrency.
+    DEFAULT_BLOB_FETCH_CONCURRENCY = 8
+
+    blob_fetch_concurrency: int = DEFAULT_BLOB_FETCH_CONCURRENCY
+    # Like ``github_repo``: squash the branch's commit history once it
+    # grew past this many commits (0 keeps every commit, the default).
+    # GitLab's commits API cannot create a parentless commit, so the
+    # squash replays the branch's whole current state as one commit
+    # forced onto its oldest ancestor instead.
+    squash_history_max_commits: int = 0
 
     @classmethod
     def from_dict(cls, data: dict) -> Self:
+        concurrency = int(
+            data.get("blob_fetch_concurrency", cls.DEFAULT_BLOB_FETCH_CONCURRENCY)
+        )
+        if concurrency <= 0:
+            raise ValueError(
+                "metadata.gitlab_repo.blob_fetch_concurrency must be "
+                f"positive, got {concurrency}"
+            )
+        squash = int(data.get("squash_history_max_commits", 0))
+        if squash < 0:
+            raise ValueError(
+                "metadata.gitlab_repo.squash_history_max_commits cannot "
+                f"be negative, got {squash}"
+            )
         if not (repo := data.get("repo")):
             raise ValueError("metadata.gitlab_repo.repo is required")
         if not (branch := data.get("branch")):
@@ -372,6 +415,8 @@ class GitlabRepoConfig:
             access_token=str(access_token),
             base_url=base_url,
             file_path=file_path,
+            blob_fetch_concurrency=concurrency,
+            squash_history_max_commits=squash,
             layout=_parse_metadata_layout(
                 "metadata.gitlab_repo.layout", data.get("layout")
             ),
@@ -1117,6 +1162,76 @@ SyncMode = Literal["inline", "background", "tee"]
 # When a write is acknowledged: once the primary store has it (today's
 # behaviour) or once the local cache has it (write-back, section 4.12).
 WriteAck = Literal["primary", "cache"]
+# How a mutation reaches the metadata stores: ``coalesced`` merges the
+# pushes of mutations that arrive within a window into one write (a bulk
+# delete still pays one mirror sync instead of one per file), ``inline``
+# hands every push straight to the stores.
+MetadataPushMode = Literal["coalesced", "inline"]
+
+
+@dataclass
+class MetadataPushConfig:
+    """How metadata mutations reach the metadata stores.
+
+    A file operation pushes the metadata tree once it is done. A bulk
+    operation (a folder delete over SFTP, where the protocol names one
+    file at a time) thus pushes once per file, and each push re-syncs the
+    whole tree to a mirror -- the cost that makes deleting a big folder
+    crawl. ``mode: coalesced`` waits ``window_ms`` before it writes and
+    collapses the pushes that arrived meanwhile into one attempt; the
+    waiting callers are released when the write covering them is done.
+    A push failure is logged, as with a background write, instead of
+    failing an operation whose local changes are already real.
+
+    ``parallel_stores`` writes the tree to the primary and the mirrors at
+    the same time instead of one store after another: the write lasts as
+    long as the slowest store instead of the sum of all of them.
+    """
+
+    DEFAULT_MODE: MetadataPushMode = "coalesced"
+    # 300 ms: long enough to catch the overlapping pushes of a client
+    # deleting with parallel connections, short enough that a single
+    # cooked operation barely notices.
+    DEFAULT_WINDOW_MS = 300
+    DEFAULT_PARALLEL_STORES = True
+
+    mode: MetadataPushMode = DEFAULT_MODE
+    # In milliseconds on the wire (the unit the YAML speaks), seconds at
+    # runtime.
+    window_ms: int = DEFAULT_WINDOW_MS
+    parallel_stores: bool = DEFAULT_PARALLEL_STORES
+
+    @property
+    def window_seconds(self) -> float:
+        return self.window_ms / 1000.0
+
+    @classmethod
+    def from_dict(cls, name: str, data: dict) -> "MetadataPushConfig":
+        mode = str(data.get("mode", cls.DEFAULT_MODE))
+        if mode not in ("coalesced", "inline"):
+            raise ValueError(
+                f"filesystems.{name}.metadata_push: unknown mode '{mode}', "
+                f"available options: coalesced, inline"
+            )
+        try:
+            window_ms = int(data.get("window_ms", cls.DEFAULT_WINDOW_MS))
+        except (TypeError, ValueError):
+            raise ValueError(
+                f"filesystems.{name}.metadata_push: window_ms must be a "
+                f"number of milliseconds, got {data.get('window_ms')!r}"
+            ) from None
+        if window_ms < 0 or window_ms > 60000:
+            raise ValueError(
+                f"filesystems.{name}.metadata_push: window_ms must be "
+                f"between 0 and 60000, got {window_ms}"
+            )
+        return cls(
+            mode=mode,  # type: ignore[arg-type]
+            window_ms=window_ms,
+            parallel_stores=bool(
+                data.get("parallel_stores", cls.DEFAULT_PARALLEL_STORES)
+            ),
+        )
 
 
 @dataclass
@@ -1162,6 +1277,8 @@ class FilesystemConfig:
     # a worker moves them into the primary and the mirrors afterwards.
     # Requires the cache and is refused with ``strict``.
     write_ack: WriteAck = "primary"
+    # How metadata mutations reach the stores (see :class:`MetadataPushConfig`).
+    metadata_push: MetadataPushConfig = field(default_factory=MetadataPushConfig)
     # Spread the pieces of one download over every store that holds the
     # version (design plan 4.11); ``read_sources`` limits the stores that
     # take part (store names, a subset of primary and mirrors).
@@ -1231,6 +1348,12 @@ class FilesystemConfig:
             if mirror.type == MetadataType.PINNED_MESSAGE and not mirror.store:
                 mirror.store = str(primary)
         _validate_metadata_stores(name, metadata, metadata_mirrors)
+        push_data = data.get("metadata_push") or {}
+        if not isinstance(push_data, dict):
+            raise ValueError(
+                f"filesystems.{name}.metadata_push must be a mapping, "
+                f"got {push_data!r}"
+            )
         return cls(
             name=name,
             primary=str(primary),
@@ -1244,6 +1367,7 @@ class FilesystemConfig:
             allow_shared_store=bool(data.get("allow_shared_store", False)),
             sync_is_default=sync_is_default,
             write_ack=write_ack,  # type: ignore[arg-type]
+            metadata_push=MetadataPushConfig.from_dict(name, push_data),
             read_parallel=bool(data.get("read_parallel", False)),
             read_sources=[str(s) for s in (data.get("read_sources") or [])],
         )

@@ -10,10 +10,11 @@ or Discord, each its own store), a GitHub repo and a GitLab repo.
 
 Behaviour:
 
-* Every ``push`` writes the primary store and then every mirror. A
-  mirror that fails is logged, marked *stale* and skipped -- the write
-  still succeeds as long as one store holds the tree, and the next push
-  writes the stale store again.
+* Every ``push`` writes the primary store and then every mirror (all
+  stores at once when ``concurrent_stores`` is set). A mirror that fails
+  is logged, marked *stale* and skipped -- the write still succeeds as
+  long as one store holds the tree, and the next push writes the stale
+  store again.
 * ``init`` loads the tree from the primary; when the primary cannot be
   read (store down, repository unreachable) it fails over to the first
   mirror that holds one. A store that holds no document at all counts as
@@ -36,6 +37,7 @@ copy was beaten at load is handed the winner's tree like a stale one.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from dataclasses import dataclass
@@ -81,12 +83,20 @@ class MetadataStore:
 
 
 class ReplicatedMetadataRepository(IMetaDataRepository):
-    def __init__(self, stores: Sequence[MetadataStore]):
+    def __init__(
+        self, stores: Sequence[MetadataStore], concurrent_stores: bool = False
+    ):
         if not stores:
             raise ValueError("a replicated metadata repository needs a store")
         if not stores[0].primary:
             raise ValueError("the first metadata store must be the primary")
         self._stores: List[MetadataStore] = list(stores)
+        # False keeps the historical one-store-after-another write order, so
+        # a push lasts for the sum of every pending store's effort; True
+        # writes all stores at once, so it lasts for the slowest one. The
+        # stale/skipped bookkeeping of :meth:`_write` is per store and needs
+        # no order, so both spread failures the same way.
+        self._concurrent_stores = concurrent_stores
         # Keys of the stores that missed a write and await a re-sync.
         self._stale: Set[str] = set()
         # Keys of the stores that cannot hold the current document at all
@@ -226,16 +236,32 @@ class ReplicatedMetadataRepository(IMetaDataRepository):
 
         any_store_ok = False
         errors: List[str] = []
-        for i, store in enumerate(self._stores):
-            # The primary gets its regular write (a github repo primary has
-            # already written incrementally while the tree was mutated); the
-            # mirrors always get the full sync, since they may have missed
-            # any of those incremental writes while they were down. A primary
-            # that could not serve the tree at boot (it was down or empty)
-            # gets the full sync too: its regular write is a no-op for a tree
-            # store, and everything it missed while it was unavailable has
-            # to land before the next mutation goes through incrementally.
-            ok, error = await self._write(store, full=i > 0 or store.key in self._stale)
+        results: List[tuple[bool, Optional[str]]] = []
+
+        # The primary gets its regular write (a github repo primary has
+        # already written incrementally while the tree was mutated); the
+        # mirrors always get the full sync, since they may have missed any
+        # of those incremental writes while they were down. A primary that
+        # could not serve the tree at boot (it was down or empty) gets the
+        # full sync too: its regular write is a no-op for a tree store, and
+        # everything it missed while it was unavailable has to land before
+        # the next mutation goes through incrementally.
+        def full_for(store: MetadataStore, index: int) -> bool:
+            return index > 0 or store.key in self._stale
+
+        if self._concurrent_stores and len(self._stores) > 1:
+            results.extend(
+                await asyncio.gather(
+                    *(
+                        self._write(store, full=full_for(store, i))
+                        for i, store in enumerate(self._stores)
+                    )
+                )
+            )
+        else:
+            for i, store in enumerate(self._stores):
+                results.append(await self._write(store, full=full_for(store, i)))
+        for ok, error in results:
             any_store_ok = any_store_ok or ok
             if error:
                 errors.append(error)
@@ -294,13 +320,25 @@ class ReplicatedMetadataRepository(IMetaDataRepository):
 
         Called periodically by the heal worker and safe to call any time;
         a store that is up to date costs nothing, and one that just came
-        back is brought in line with the current tree.
+        back is brought in line with the current tree. The stores that
+        are healthy afterwards get their maintenance pass (history
+        compaction and the like), so the heal worker covers single-store
+        and replicated file systems alike.
         """
         if not self.metadata:
             return
         for store in self._stores:
             if store.key in self._stale or store.key in self._skipped:
                 await self._write(store, full=True)
+        for store in self._stores:
+            if store.key in self._stale or store.key in self._skipped:
+                continue
+            try:
+                await store.repo.maintain()
+            except Exception as ex:
+                logger.warning(
+                    f"Maintaining metadata store {store.key} failed: {ex}"
+                )
 
     def stale_stores(self) -> List[str]:
         return sorted(self._stale | set(self._skipped))

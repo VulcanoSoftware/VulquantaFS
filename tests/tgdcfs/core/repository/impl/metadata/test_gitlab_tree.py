@@ -8,9 +8,11 @@ files API and compare -- closely enough that the store's real code paths
 it unchanged.
 """
 
+import asyncio
 import base64
 import hashlib
 import json
+import time
 from typing import Dict, List, Optional
 from unittest.mock import Mock, patch
 from urllib.parse import unquote
@@ -21,9 +23,16 @@ from github import GithubException, InputGitTreeElement
 
 from tgdcfs.config import GitlabRepoConfig
 from tgdcfs.core.model import TGFSDirectory, TGFSMetadata
+from tgdcfs.core.repository.impl.metadata import breaker as breaker_mod
+from tgdcfs.core.repository.impl.metadata.breaker import (
+    StoreCircuitBreaker,
+    StoreUnreachable,
+    is_unreachable_error,
+)
 from tgdcfs.core.repository.impl.metadata.github_repo.gh_directory import (
     GithubDirectory,
 )
+from tgdcfs.core.repository.impl.metadata import gitlab_tree as gitlab_tree_mod
 from tgdcfs.core.repository.impl.metadata.gitlab_tree import (
     GitlabRepository,
     GitlabTreeRepoMetadataRepository,
@@ -97,8 +106,19 @@ class FakeGitlab:
 
     # -- git model ------------------------------------------------------------
 
-    def commit(self, branch: str, message: str, actions: List[dict]) -> str:
-        files = dict(self.branch_files.get(branch, {}))
+    def commit(
+        self,
+        branch: str,
+        message: str,
+        actions: List[dict],
+        start_files: Optional[Dict[str, str]] = None,
+        parent: Optional[str] = None,
+    ) -> str:
+        files = (
+            dict(self.branch_files.get(branch, {}))
+            if start_files is None
+            else dict(start_files)
+        )
         changed = []
         for action in actions:
             path = action["file_path"]
@@ -130,6 +150,7 @@ class FakeGitlab:
             "committed_date": f"2024-06-{len(self.commits) % 28 + 1:02d}" "T00:00:00Z",
             "changed": changed,
             "files": files,
+            "parent": parent if parent is not None else self.branch_heads.get(branch),
         }
         self.branch_files[branch] = files
         self.branch_heads[branch] = sha
@@ -206,7 +227,18 @@ class FakeGitlab:
                 branch = body["branch"]
                 if branch not in self.branch_heads:
                     raise _Conflict("Invalid branch name")
-                sha = self.commit(branch, body["commit_message"], body["actions"])
+                if body.get("force"):
+                    # A force commit replaces the branch's history with a
+                    # commit whose base is start_sha.
+                    sha = self.commit(
+                        branch,
+                        body["commit_message"],
+                        body["actions"],
+                        start_files=self._files_for(body["start_sha"]),
+                        parent=body.get("start_sha"),
+                    )
+                else:
+                    sha = self.commit(branch, body["commit_message"], body["actions"])
                 return 200, self.commits[sha]
             return 200, self._commit_history(params)
         if rest.startswith("repository/commits/"):
@@ -279,11 +311,12 @@ class FakeGitlab:
         return ordered
 
     def _reachable(self, head: str) -> set:
-        # The fake appends commits in creation order; a branch head at index
-        # i means every commit up to i on the same file lineage. Approximate
-        # reachability by commit insertion order up to the head.
-        shas = list(self.commits)
-        return set(shas[: shas.index(head) + 1])
+        reached: set = set()
+        sha: Optional[str] = head
+        while sha is not None and sha not in reached:
+            reached.add(sha)
+            sha = self.commits[sha].get("parent")
+        return reached
 
     def _compare(self, params) -> dict:
         old, new = self._files_for(params["from"]), self._files_for(params["to"])
@@ -364,6 +397,34 @@ class _Conflict(Exception):
     pass
 
 
+class DeadlineGitlab(FakeGitlab):
+    """A GitLab whose storage backend cannot do the work: the endpoints
+    selected by ``dead`` keep the request waiting for its whole timeout
+    window and finally answer with Gitaly's gRPC termination text (the
+    fake skips only the waiting)."""
+
+    DEADLINE_BODY = {"message": "4:Stream removed (Deadline Exceeded)."}
+
+    def __init__(self, *args, dead: str = "all", **kwargs):
+        super().__init__(*args, **kwargs)
+        self.dead = dead
+
+    def _route(self, method, url, params, body):
+        rest = unquote(url.split("/api/v4/projects/", 1)[1].partition("/")[2])
+        storage = rest.startswith(
+            (
+                "repository/branches",
+                "repository/commits",
+                "repository/files",
+                "repository/tree",
+            )
+        )
+        writes = method in ("POST", "PUT", "DELETE")
+        if storage and (self.dead == "all" or (self.dead == "writes" and writes)):
+            return 400, dict(self.DEADLINE_BODY)
+        return super()._route(method, url, params, body)
+
+
 @pytest.fixture(autouse=True)
 def stub_timestamp_store():
     """Keep the date cache out of the store tests, like
@@ -378,15 +439,37 @@ def stub_timestamp_store():
         yield store
 
 
-@pytest.fixture
-def gitlab(monkeypatch):
-    fake = FakeGitlab()
-
+def _route_session(monkeypatch, fake: FakeGitlab) -> FakeGitlab:
     def fake_request(self, method, url, params=None, json=None, timeout=None, **kw):
         return fake.handle(method, url, params, json)
 
     monkeypatch.setattr(requests.Session, "request", fake_request)
     return fake
+
+
+@pytest.fixture
+def gitlab(monkeypatch):
+    return _route_session(monkeypatch, FakeGitlab())
+
+
+@pytest.fixture
+def gitlab_dead_writes(monkeypatch):
+    return _route_session(monkeypatch, DeadlineGitlab(dead="writes"))
+
+
+@pytest.fixture
+def gitlab_dead_storage(monkeypatch):
+    return _route_session(monkeypatch, DeadlineGitlab(dead="all"))
+
+
+@pytest.fixture
+def stop_breakers():
+    """The breakers a test woke up; stopped in teardown, so a leftover
+    prober never reaches the network that a follow-up test patched."""
+    made: List[StoreCircuitBreaker] = []
+    yield made
+    for breaker in made:
+        breaker.stop()
 
 
 def gitlab_config(**overrides) -> GitlabRepoConfig:
@@ -811,3 +894,359 @@ class TestGitlabTreeStore:
         assert layer.metadata is tree
         assert isinstance(tree.dir, GithubDirectory)
         assert gitlab.file_content("main", "docs/readme.42") == ""
+
+
+class TestDeadlineAnswers:
+    """Gitaly's deadline text in an answer means the request hung for its
+    whole timeout window and the storage did no work: an outage, not a
+    refused request."""
+
+    async def test_a_deadline_answer_is_an_unreachable_service(
+        self, gitlab_dead_writes
+    ):
+        repo = GitlabRepository(gitlab_config())
+
+        with pytest.raises(StoreUnreachable):
+            repo.create_file("hello.txt", "create", "", "main")
+
+    async def test_a_probe_of_dead_storage_looks_unreachable(self, gitlab_dead_storage):
+        repo = GitlabRepository(gitlab_config())
+
+        with pytest.raises(StoreUnreachable):
+            repo.probe()
+
+    async def test_a_probe_of_a_missing_branch_still_counts_as_answered(self, gitlab):
+        repo = GitlabRepository(gitlab_config())
+
+        with pytest.raises(GithubException) as answered:
+            repo.probe()
+
+        assert answered.value.status == 404
+        assert not is_unreachable_error(answered.value)
+
+
+async def _wait_closed(store: StoreCircuitBreaker, timeout: float = 10.0) -> None:
+    deadline = time.monotonic() + timeout
+    while store._open and time.monotonic() < deadline:
+        await asyncio.sleep(0.005)
+    assert not store._open
+
+
+class TestFailFastGitlabTreeStore:
+    """While GitLab's storage cannot do the work, the store must refuse
+    its calls instead of cost the request timeout once per push, heal,
+    stats commit and listing -- the wait that made deleting files take a
+    minute each."""
+
+    def repository(self):
+        return GitlabTreeRepoMetadataRepository(gitlab_config())
+
+    async def test_a_deadlining_push_trips_the_breaker(
+        self, gitlab_dead_writes, stop_breakers
+    ):
+        repo = self.repository()
+        stop_breakers.append(repo._gitlab_breaker)
+        repo.metadata = sample_tree()
+
+        with pytest.raises(StoreUnreachable):
+            await repo.push_full()
+        assert repo._gitlab_breaker._open
+
+        # Known dead: the next push is refused without GitLab receiving
+        # another write attempt.
+        posts = [r for r in gitlab_dead_writes.requests if r[0] == "POST"]
+        start = time.monotonic()
+        with pytest.raises(StoreUnreachable):
+            await repo.push_full()
+        assert time.monotonic() - start < 1.0
+        assert [r for r in gitlab_dead_writes.requests if r[0] == "POST"] == posts
+
+    async def test_the_store_writes_again_once_gitlab_answers(
+        self, gitlab_dead_writes, stop_breakers, monkeypatch
+    ):
+        monkeypatch.setattr(breaker_mod, "PROBE_COOLDOWN_SECONDS", 0.05)
+        repo = self.repository()
+        stop_breakers.append(repo._gitlab_breaker)
+        repo.metadata = sample_tree()
+
+        with pytest.raises(StoreUnreachable):
+            await repo.push_full()
+
+        gitlab_dead_writes.dead = "none"
+        await _wait_closed(repo._gitlab_breaker)
+
+        await repo.push_full()
+
+        assert gitlab_dead_writes.file_content("main", "docs/readme.42") == ""
+
+    async def test_a_deadlining_mirror_does_not_stall_replicated_pushes(
+        self, gitlab_dead_writes, stop_breakers
+    ):
+        """The user-visible shape: file operations push the metadata, the
+        GitLab mirror cannot take it, and the operation must not pay the
+        hang more than the first time."""
+        from tgdcfs.core.repository.impl.metadata.replicated import (
+            MetadataStore,
+            ReplicatedMetadataRepository,
+        )
+
+        class PinnedStub(IMetaDataRepository):
+            def __init__(self, tree):
+                super().__init__()
+                self._tree = tree
+
+            async def get(self):
+                return self._tree
+
+            async def push(self):
+                pass
+
+        tree = sample_tree()
+        mirror = self.repository()
+        stop_breakers.append(mirror._gitlab_breaker)
+        layer = ReplicatedMetadataRepository(
+            [
+                MetadataStore(
+                    key="pinned@tg-main", repo=PinnedStub(tree), primary=True
+                ),
+                MetadataStore(key="gitlab_repo@g/p@main", repo=mirror),
+            ]
+        )
+
+        await layer.init()
+        assert layer.stale_stores() == ["gitlab_repo@g/p@main"]
+
+        posts = [r for r in gitlab_dead_writes.requests if r[0] == "POST"]
+        start = time.monotonic()
+        await layer.push()
+        assert time.monotonic() - start < 1.0
+        assert [r for r in gitlab_dead_writes.requests if r[0] == "POST"] == posts
+        assert layer.stale_stores() == ["gitlab_repo@g/p@main"]
+
+
+def _routed(monkeypatch, fake: FakeGitlab) -> GitlabRepository:
+    _route_session(monkeypatch, fake)
+    return GitlabRepository(gitlab_config())
+
+
+def commit_posts(fake: FakeGitlab) -> List[dict]:
+    return [
+        body
+        for method, url, params, body in fake.requests
+        if method == "POST" and url.endswith("repository/commits")
+    ]
+
+
+class TestParallelBlobFetch:
+    """``create_git_tree`` needs the content of every blob the branch
+    does not hold at its path (a tree rewrite that moved it there); the
+    reads must run concurrently and every action must carry the content
+    a sequential read would have found."""
+
+    def moved_blob_elements(self, facade: GitlabRepository, names: list[str]):
+        tree = facade.get_git_tree("main", recursive=True)
+        shas = {
+            entry.path: entry.sha
+            for entry in tree.tree
+            if entry.type == "blob" and entry.path in names
+        }
+        return [
+            InputGitTreeElement(
+                path=f"moved/{name}", mode="100644", type="blob", sha=shas[name]
+            )
+            for name in names
+        ]
+
+    def watch_blob_reads(self, facade: GitlabRepository) -> dict:
+        real = facade.get_git_blob
+        state = {"active": 0, "max_active": 0}
+
+        def counting(sha):
+            state["active"] += 1
+            state["max_active"] = max(state["max_active"], state["active"])
+            try:
+                time.sleep(0.05)
+                return real(sha)
+            finally:
+                state["active"] -= 1
+
+        facade.get_git_blob = counting  # type: ignore[method-assign]
+        return state
+
+    def test_actions_carry_the_read_blob_content(self, gitlab, monkeypatch):
+        _route_session(monkeypatch, gitlab)
+        facade = GitlabRepository(gitlab_config())
+        facade.create_file("docs/a.txt", "seed", "content of a", branch="main")
+        elements = self.moved_blob_elements(facade, ["docs/a.txt"])
+
+        pending = facade.create_git_tree(elements)
+
+        # Without a base tree the elements are the whole desired state:
+        # the moved blob carries its content, the old path is deleted.
+        assert pending.actions == [
+            {
+                "action": "create",
+                "file_path": "moved/docs/a.txt",
+                "content": base64.b64encode(b"content of a").decode(),
+                "encoding": "base64",
+            },
+            {"action": "delete", "file_path": "docs/a.txt"},
+        ]
+
+    def test_blob_reads_overlap(self, gitlab, monkeypatch):
+        _route_session(monkeypatch, gitlab)
+        facade = GitlabRepository(gitlab_config())
+        facade.create_file("docs/a.txt", "seed", "content of a", branch="main")
+        facade.create_file("docs/b.txt", "seed", "content of b", branch="main")
+        elements = self.moved_blob_elements(facade, ["docs/a.txt", "docs/b.txt"])
+        state = self.watch_blob_reads(facade)
+
+        pending = facade.create_git_tree(elements)
+
+        moved = [
+            action["file_path"]
+            for action in pending.actions
+            if action["action"] == "create"
+        ]
+        assert sorted(moved) == ["moved/docs/a.txt", "moved/docs/b.txt"]
+        assert state["max_active"] == 2
+
+
+class TestChunkedCommits:
+    """One GitLab commit is one storage operation for all of its actions,
+    and GitLab's backend refuses the batches of a full-tree sync early
+    ("4:Stream removed (Deadline Exceeded)"). The facade must therefore
+    land a big tree as several ordinary commits of capped size."""
+
+    async def test_a_big_sync_lands_in_capped_commits(self, monkeypatch):
+        monkeypatch.setattr(gitlab_tree_mod, "GITLAB_COMMIT_ACTION_LIMIT", 3)
+        fake = FakeGitlab(seed={"docs/.gitkeep": ""})
+        facade = _routed(monkeypatch, fake)
+        names = [f"big/file{i:02d}.txt" for i in range(8)]
+        pending = facade.create_git_tree(
+            [
+                InputGitTreeElement(
+                    path=name, mode="100644", type="blob", content=str(i)
+                )
+                for i, name in enumerate(names)
+            ]
+        )
+
+        facade.create_git_commit("initial sync", pending, [])
+
+        posts = commit_posts(fake)
+        action_counts = [len(body["actions"]) for body in posts]
+        assert action_counts == [3, 3, 2]
+        changed = {action["file_path"] for body in posts for action in body["actions"]}
+        assert changed == set(names)
+        for i, name in enumerate(names):
+            assert fake.file_content("main", name) == str(i)
+        assert [body["commit_message"] for body in posts] == [
+            "initial sync (1/3)",
+            "initial sync (2/3)",
+            "initial sync (3/3)",
+        ]
+
+    async def test_a_small_sync_stays_one_unsuffixed_commit(self, monkeypatch):
+        fake = FakeGitlab(seed={"docs/.gitkeep": ""})
+        facade = _routed(monkeypatch, fake)
+        pending = facade.create_git_tree(
+            [
+                InputGitTreeElement(
+                    path="hello.txt", mode="100644", type="blob", content="hi"
+                )
+            ]
+        )
+
+        facade.create_git_commit("a small sync", pending, [])
+
+        posts = commit_posts(fake)
+        assert len(posts) == 1
+        assert posts[0]["commit_message"] == "a small sync"
+        assert fake.file_content("main", "hello.txt") == "hi"
+
+    async def test_a_big_full_push_lands_every_file(self, gitlab, monkeypatch):
+        monkeypatch.setattr(gitlab_tree_mod, "GITLAB_COMMIT_ACTION_LIMIT", 4)
+        repo = GitlabTreeRepoMetadataRepository(gitlab_config())
+        root = TGFSDirectory.root_dir()
+        for i in range(10):
+            root.create_file_ref(f"f{i}", i)
+        repo.metadata = TGFSMetadata(root)
+
+        await repo.push_full()
+
+        posts = commit_posts(gitlab)
+        assert len(posts) >= 3
+        assert all(len(body["actions"]) <= 4 for body in posts)
+        for i in range(10):
+            assert gitlab.file_content("main", f"f{i}.{i}") is not None
+
+
+class TestHistoryCompaction:
+    """GitLab keeps every deleted blob alive for as long as a commit
+    references it, so the branch's history has to be bounded before its
+    storage use is. The commits API cannot create a parentless commit, so
+    the squash is a force commit of the branch's whole current state onto
+    its oldest ancestor."""
+
+    def a_used_branch(self, fake: FakeGitlab) -> None:
+        fake.commit("main", "seed", [])
+        for i in range(5):
+            fake.commit(
+                "main",
+                f"add {i}",
+                [
+                    {
+                        "action": "create",
+                        "file_path": f"docs/f{i}.{i}",
+                        "content": "",
+                        "encoding": "text",
+                    }
+                ],
+            )
+        fake.commit(
+            "main",
+            "remove one",
+            [{"action": "delete", "file_path": "docs/f1.1"}],
+        )
+
+    async def test_a_grown_history_is_force_committed_onto_its_root(
+        self, monkeypatch
+    ):
+        fake = FakeGitlab(seed={})
+        self.a_used_branch(fake)
+        facade = _routed(monkeypatch, fake)
+        root = facade.commit_history("main", 100)[-1]
+        assert fake.file_content("main", "docs/f1.1") is None
+        assert len(fake.commits) == 7
+
+        squashed = facade.compact_history("Compact metadata history", 3)
+
+        assert squashed == 7
+        # The branch state survived the rewrite unchanged.
+        assert fake.file_content("main", "docs/f1.1") is None
+        assert fake.file_content("main", "docs/f3.3") == ""
+        assert fake.file_content("main", "docs/.gitkeep") is None
+        # The history carries the anchor's lineage plus one commit.
+        assert len(facade.commit_history("main", 100)) == 2
+        forced = [
+            body
+            for body in commit_posts(fake)
+            if body.get("force") and body.get("start_sha") == root
+        ]
+        assert len(forced) == 1
+        # The replay only carries what changed since the anchor: the files
+        # the pushes added. The removed file predates the anchor, so the
+        # anchor's tree never referenced it and no delete is needed.
+        assert len(forced[0]["actions"]) == 4
+        assert fake.branch_files["main"] == dict(
+            fake.commits[fake._resolve_ref("main")]["files"]
+        )
+
+    async def test_a_history_within_bound_is_left_alone(self, monkeypatch):
+        fake = FakeGitlab(seed={})
+        fake.commit("main", "seed", [])
+        facade = _routed(monkeypatch, fake)
+
+        assert facade.compact_history("Compact metadata history", 100) == 0
+        assert not commit_posts(fake)

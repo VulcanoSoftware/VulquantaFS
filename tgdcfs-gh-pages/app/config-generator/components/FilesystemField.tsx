@@ -17,6 +17,7 @@ import {
   FilesystemConfig,
   MetadataEntry,
   MetadataLayout,
+  MetadataPushMode,
   MetadataType,
   MirrorMode,
   StoreConfig,
@@ -83,11 +84,11 @@ function MetadataStoreEditor({
     onChange({ ...entry, ...patch });
   const updateGithub = (
     field: keyof MetadataEntry["github_repo"],
-    value: string
+    value: string | number
   ) => update({ github_repo: { ...entry.github_repo, [field]: value } });
   const updateGitlab = (
     field: keyof MetadataEntry["gitlab_repo"],
-    value: string
+    value: string | number
   ) => update({ gitlab_repo: { ...entry.gitlab_repo, [field]: value } });
 
   return (
@@ -206,6 +207,20 @@ function MetadataStoreEditor({
                 style={{ flex: 1 }}
               />
             )}
+            {entry.github_repo.layout === "tree" && (
+              <ConfigTextField
+                label="Squash History At"
+                value={String(entry.github_repo.squash_history_max_commits)}
+                onChange={(e) =>
+                  updateGithub(
+                    "squash_history_max_commits",
+                    Math.max(0, parseInt(e.target.value, 10) || 0)
+                  )
+                }
+                helperText="Compact the commit history once it grows past this many commits (0 = off)"
+                style={{ width: 220, flex: "none" }}
+              />
+            )}
           </Box>
         </>
       )}
@@ -286,6 +301,34 @@ function MetadataStoreEditor({
                 onChange={(e) => updateGitlab("file_path", e.target.value)}
                 helperText="Where the JSON document lives; a document left by an older release is migrated from here too. Default: metadata.json"
                 style={{ flex: 1 }}
+              />
+            )}
+            {entry.gitlab_repo.layout === "tree" && (
+              <ConfigTextField
+                label="Blob Fetch Concurrency"
+                value={String(entry.gitlab_repo.blob_fetch_concurrency)}
+                onChange={(e) =>
+                  updateGitlab(
+                    "blob_fetch_concurrency",
+                    Math.max(0, parseInt(e.target.value, 10) || 0)
+                  )
+                }
+                helperText="Parallel blob reads during a full-tree sync; default: 8"
+                style={{ width: 220, flex: "none" }}
+              />
+            )}
+            {entry.gitlab_repo.layout === "tree" && (
+              <ConfigTextField
+                label="Squash History At"
+                value={String(entry.gitlab_repo.squash_history_max_commits)}
+                onChange={(e) =>
+                  updateGitlab(
+                    "squash_history_max_commits",
+                    Math.max(0, parseInt(e.target.value, 10) || 0)
+                  )
+                }
+                helperText="Compact the commit history once it grows past this many commits (0 = off)"
+                style={{ width: 220, flex: "none" }}
               />
             )}
           </Box>
@@ -386,6 +429,63 @@ export function FilesystemField({
         stores={namedStores}
         onChange={onUpdateMetadata}
       />
+
+      <Typography variant="subtitle2" sx={{ mb: 1 }}>
+        Metadata Push
+      </Typography>
+      <Box sx={{ display: "flex", alignItems: "flex-start", gap: 1, mb: 1 }}>
+        <FormControl size="small" sx={{ minWidth: 260 }}>
+          <InputLabel>Write mode</InputLabel>
+          <Select
+            value={filesystem.metadata_push.mode}
+            label="Write mode"
+            onChange={(e) =>
+              onUpdate("metadata_push", {
+                ...filesystem.metadata_push,
+                mode: e.target.value as MetadataPushMode,
+              })
+            }
+          >
+            <MenuItem value="coalesced">Coalesced (default)</MenuItem>
+            <MenuItem value="inline">Inline</MenuItem>
+          </Select>
+        </FormControl>
+        {filesystem.metadata_push.mode === "coalesced" && (
+          <ConfigTextField
+            label="Window (ms)"
+            value={String(filesystem.metadata_push.window_ms)}
+            onChange={(e) =>
+              onUpdate("metadata_push", {
+                ...filesystem.metadata_push,
+                window_ms: Math.max(0, parseInt(e.target.value, 10) || 0),
+              })
+            }
+            helperText="Pushes landing within the window share one write; default: 300"
+            style={{ width: 220, flex: "none" }}
+          />
+        )}
+      </Box>
+      <FormControlLabel
+        label="Write the metadata stores in parallel (the write lasts as long as the slowest store instead of their sum)"
+        control={
+          <Checkbox
+            checked={filesystem.metadata_push.parallel_stores}
+            onChange={(e) =>
+              onUpdate("metadata_push", {
+                ...filesystem.metadata_push,
+                parallel_stores: e.target.checked,
+              })
+            }
+          />
+        }
+      />
+      <Typography variant="body2" color="text.secondary" sx={{ mb: 1, pl: 2 }}>
+        A mutation pushes the metadata tree to the stores once it is done.
+        Coalesced merges the push requests of a burst -- a folder deleted
+        one file at a time -- into one write per window, so a slow mirror
+        is paid once, not per file. A coalesced push that fails is logged
+        and caught up by the heal instead of failing the operation.
+      </Typography>
 
       <Typography variant="subtitle2" sx={{ mb: 1 }}>
         Metadata Mirrors

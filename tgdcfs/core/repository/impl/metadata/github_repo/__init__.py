@@ -30,7 +30,13 @@ from tgdcfs.crypto.path_names import (
 from tgdcfs.errors import MetadataNotInitialized, TechnicalError
 
 from .dir_timestamps import DirTimestampStore, cache_file_name
-from .gh_directory import GithubConfig, GithubDirectory
+from .gh_directory import (
+    DROP_COMMIT_ATTEMPTS,
+    DROP_FLUSH_BATCH,
+    DROP_FLUSH_INTERVAL,
+    GithubConfig,
+    GithubDirectory,
+)
 from .stats_file import STATS_COMMIT_PREFIX, STATS_FILE_NAME
 
 logger = logging.getLogger(__name__)
@@ -105,6 +111,7 @@ class GithubRepoMetadataRepository(IMetaDataRepository):
             name_key=name_key,
             timestamps=self._timestamps,
             tree_fetch_concurrency=config.tree_fetch_concurrency,
+            squash_history_max_commits=config.squash_history_max_commits,
         )
 
     # -- the shared tree -----------------------------------------------------
@@ -173,7 +180,134 @@ class GithubRepoMetadataRepository(IMetaDataRepository):
             )
 
     async def push(self) -> None:
-        pass
+        # The incremental writes already landed while the tree was mutated;
+        # what is left is the batched file-reference deletions.
+        if not self._ghc.pending_drops:
+            return
+        now = time.monotonic()
+        if (
+            len(self._ghc.pending_drops) < DROP_FLUSH_BATCH
+            and now - self._ghc.pending_drops_since < DROP_FLUSH_INTERVAL
+        ):
+            return
+        async with self._ghc.lock:
+            paths = sorted(self._ghc.pending_drops)
+            self._ghc.pending_drops.clear()
+            self._ghc.pending_drops_since = 0.0
+            try:
+                await self._ghc.write(self._commit_drops, paths)
+            except GithubException as ex:
+                if getattr(ex, "status", None) == 404:
+                    # No branch yet: a fresh store holds no blobs.
+                    return
+                self._requeue_drops(paths)
+            except Exception:
+                self._requeue_drops(paths)
+
+    def _requeue_drops(self, paths: list[str]) -> None:
+        logger.exception(
+            f"Committing the deletion of {len(paths)} file reference(s) "
+            f"to {self._ghc.repo_name} failed; the deletes are queued for "
+            "the next metadata push"
+        )
+        self._ghc.pending_drops.update(paths)
+        if not self._ghc.pending_drops_since:
+            self._ghc.pending_drops_since = time.monotonic()
+
+    def _commit_drops(self, paths: list[str]) -> None:
+        """Overlay the pending deletions on the branch head in one commit.
+
+        A tree element with neither content nor sha removes the path from
+        the base tree, like the stats commit does; a path that was never
+        there, or that a directory delete already removed, is a no-op.
+        Blocking; raises when the commit does not land, and retried when
+        the branch moved under it, like the stats commit.
+        """
+        repo = self._ghc.repo
+        elements = [
+            InputGitTreeElement(path=path, mode="100644", type="blob", sha=None)
+            for path in paths
+        ]
+        for attempt in range(DROP_COMMIT_ATTEMPTS):
+            ref = repo.get_git_ref(f"heads/{self._ghc.commit}")
+            base_commit = repo.get_git_commit(ref.object.sha)
+            tree = repo.create_git_tree(elements, base_tree=base_commit.tree)
+            commit = repo.create_git_commit(
+                f"Delete {len(paths)} file reference(s)", tree, [base_commit]
+            )
+            try:
+                ref.edit(commit.sha)
+                logger.info(
+                    f"Deleted {len(paths)} file reference(s) from "
+                    f"{self._ghc.repo_name}"
+                )
+                return
+            except GithubException as ex:
+                if attempt + 1 == DROP_COMMIT_ATTEMPTS:
+                    raise
+                logger.info(
+                    f"Branch {self._ghc.commit} moved while committing the "
+                    f"file reference deletions ({ex.status}), retrying"
+                )
+
+    # -- maintenance (``maintain``) -----------------------------------------
+    #
+    # Run next to ``heal`` by the heal worker: once per interval, with the
+    # store configured for it or not. A git store written one blob at a
+    # time accumulates exactly the history that keeps every deleted blob
+    # alive; squashing it into one commit carrying the whole current
+    # state is what makes the backend reclaim the old ones.
+
+    async def maintain(self) -> None:
+        if self._ghc.squash_history_max_commits <= 0:
+            return
+        await self._ghc.write(self._compact_history)
+
+    def _compact_history(self) -> None:
+        """Rewrite the branch as one orphan commit carrying its whole
+        current state, when its history grew past the configured limit.
+
+        Every deleted blob stays on the backend's disk for as long as a
+        commit references it. The orphan commit (no parents, the same
+        shape the initial sync commit uses) leaves the old history with
+        no ref pointing at it, so the backend's garbage collection can
+        reclaim the deleted blobs. Blocking; raises when the compaction
+        cannot be done safely.
+        """
+        repo = self._ghc.repo
+        limit = self._ghc.squash_history_max_commits
+        try:
+            commits: list = list(repo.get_commits(sha=self._ghc.commit)[: limit + 1])
+        except GithubException as ex:
+            if getattr(ex, "status", None) == 404:
+                return
+            raise
+        if len(commits) <= limit:
+            return
+        ref = repo.get_git_ref(f"heads/{self._ghc.commit}")
+        base_commit = repo.get_git_commit(ref.object.sha)
+        tree = repo.get_git_tree(base_commit.tree.sha, recursive=True)
+        if tree.truncated:
+            raise TechnicalError(
+                f"The tree of {self._ghc.repo_name}@{self._ghc.commit} is "
+                f"truncated; the metadata history cannot be squashed safely"
+            )
+        elements = [
+            InputGitTreeElement(path=e.path, mode=e.mode, type="blob", sha=e.sha)
+            for e in tree.tree
+            if e.type == "blob"
+        ]
+        new_tree = repo.create_git_tree(elements)
+        commit = repo.create_git_commit(
+            f"Compact metadata history ({len(commits)} commits squashed)",
+            new_tree,
+            [],
+        )
+        ref.edit(commit.sha, force=True)
+        logger.info(
+            f"Compacted the metadata history of {self._ghc.repo_name}@"
+            f"{self._ghc.commit}: squashed {len(commits)} commits into one"
+        )
 
     # -- full-tree sync (``push_full``) -------------------------------------
     #
@@ -194,6 +328,11 @@ class GithubRepoMetadataRepository(IMetaDataRepository):
         async with self._ghc.lock:
             desired_blobs = self._desired_blobs()
             await self._ghc.write(self._sync_tree_commit, desired_blobs)
+            # The sync reconciled the whole tree; every pending blob delete
+            # it covered is durable now -- and a tree a file reference was
+            # dropped from wrote them all out.
+            self._ghc.pending_drops.clear()
+            self._ghc.pending_drops_since = 0.0
 
     def _desired_blobs(self) -> Set[str]:
         """The blob paths the in-memory tree implies."""

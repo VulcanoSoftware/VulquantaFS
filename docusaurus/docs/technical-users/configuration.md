@@ -58,6 +58,10 @@ filesystems:
         commit: "master"
         access_token: "ghp_yourPersonalAccessToken"
         tree_fetch_concurrency: 8  # parallel directory reads when rebuilding a big tree
+    metadata_push:
+      mode: coalesced       # coalesced (default) | inline
+      window_ms: 300        # how long a coalesced push groups pushes before it writes
+      parallel_stores: true # write the metadata stores at the same time
 
 tgdcfs:
   users:
@@ -163,7 +167,11 @@ Defines top-level virtual directories exposed via WebDAV/SFTP:
   - `cache`: Client receives 201 Created as soon as upload lands in local cache disk directory. Requires `tgdcfs.cache.enabled: true` and cannot be combined with `sync: tee` or `strict: true`.
 - `read_preference` *(list of strings)*: Order in which stores are tried for reads when `read_parallel` is off. Every name must be the file system's primary or one of its mirrors.
 - `allow_shared_store` *(bool, default `false`)*: Allow a store that is the primary of one file system to also be a mirror of another. A store can never be the primary of two file systems, with or without this flag.
-- `metadata` *(object)*: `type` is `pinned_message` (default) or `github_repo` (which then requires a `github_repo` block).
+- `metadata` *(object)*: `type` is `pinned_message` (default) or `github_repo` (which then requires a `github_repo` block). A `github_repo` block takes `tree_fetch_concurrency` (int, default `8`), a `gitlab_repo` block `blob_fetch_concurrency` (int, default `8`): how many blobs a full-tree sync reads in parallel. A git-backed store (tree layout) also takes `squash_history_max_commits` (int, default `0`): once the branch's commit history grows past this many commits, the periodic heal rewrites it into a single commit that carries the branch's whole current state. Git backends keep every deleted blob alive for as long as a commit references it, so an unbounded history grows the repository's storage use forever; the squash drops those old references so the backend's garbage collection can reclaim them. `0` keeps every commit. Works for both a GitHub and a GitLab store, primary or mirror, and with a single primary store as only the metadata store.
+- `metadata_push` *(object)*: How a mutation reaches the metadata stores.
+  - `mode` *(coalesced, default | inline)*: `coalesced` waits `window_ms` and merges the pushes of all operations that arrived meanwhile into one write, so a folder deleted file by file pays one mirror sync instead of one per file; a failed coalesced push is logged and caught up by the heal. `inline` hands every push straight to the stores and fails the operation with them, the behaviour of older releases.
+  - `window_ms` *(int, default `300`)*: How long a coalesced push groups requests before it writes; `0` pushes right away, still merging operations that run at the same moment.
+  - `parallel_stores` *(bool, default `true`)*: Write the primary and the mirrors at the same time; the write lasts as long as the slowest store instead of the sum of all of them.
 
 ---
 
