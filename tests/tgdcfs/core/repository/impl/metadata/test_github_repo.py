@@ -1650,14 +1650,80 @@ class TestPushFullSync:
 
     @patch("tgdcfs.core.repository.impl.metadata.github_repo.Github")
     @pytest.mark.asyncio
-    async def test_push_full_refuses_a_truncated_tree(
+    async def test_push_full_falls_back_to_a_directory_walk_on_a_truncated_tree(
+        self, mock_github_class, mock_github_config, mock_ghc
+    ):
+        """A repo past GitHub's truncation limit never grows out of it, so
+        the sync rebuilds its listing directory by directory instead of
+        refusing: the mirror heals instead of failing forever."""
+        repository = self.build_repository(
+            mock_github_class, mock_github_config, mock_ghc
+        )
+        repository.metadata = self.plain_tree()
+
+        def walk_entry(path, sha, kind="blob"):
+            entry = Mock(spec=GitTreeElement)
+            entry.path, entry.type, entry.sha, entry.mode = path, kind, sha, "100644"
+            return entry
+
+        def walk_tree(entries, truncated=False):
+            tree = Mock()
+            tree.tree = entries
+            tree.truncated = truncated
+            return tree
+
+        def get_tree(ref, recursive=False):
+            if recursive:
+                return walk_tree([], truncated=True)
+            if ref == "main":
+                return walk_tree([walk_entry("docs", "docs-sha", kind="tree")])
+            if ref == "docs-sha":
+                return walk_tree(
+                    [
+                        walk_entry("docs/readme.42", "readme-sha"),
+                        walk_entry("docs/oldfile.7", "old-sha"),
+                    ]
+                )
+            raise AssertionError(f"unexpected ref {ref}")
+
+        mock_ghc.repo.get_git_tree.side_effect = get_tree
+
+        ref = Mock()
+        ref.object.sha = "commitsha"
+        base_commit = Mock()
+        base_commit.tree.sha = "basetreesha"
+        new_commit = Mock()
+        new_commit.sha = "newcommitsha"
+        mock_ghc.repo.get_git_ref.return_value = ref
+        mock_ghc.repo.get_git_commit.return_value = base_commit
+        mock_ghc.repo.create_git_tree.return_value = Mock()
+        mock_ghc.repo.create_git_commit.return_value = new_commit
+
+        await repository.push_full()
+
+        elements = mock_ghc.repo.create_git_tree.call_args[0][0]
+        paths = [e._InputGitTreeElement__path for e in elements]
+        # The walk saw the stale blob the truncated listing hid, so the
+        # sync deleted it and kept the live one.
+        assert "docs/readme.42" in paths
+        assert "docs/oldfile.7" not in paths
+        mock_ghc.repo.create_git_commit.assert_called_once()
+        ref.edit.assert_called_once_with("newcommitsha")
+
+    @patch("tgdcfs.core.repository.impl.metadata.github_repo.Github")
+    @pytest.mark.asyncio
+    async def test_push_full_still_refuses_when_even_the_walk_is_truncated(
         self, mock_github_class, mock_github_config, mock_ghc
     ):
         repository = self.build_repository(
             mock_github_class, mock_github_config, mock_ghc
         )
         repository.metadata = self.plain_tree()
-        self.sync_tree(mock_ghc.repo, ["docs/readme.42"], truncated=True)
+
+        tree = Mock()
+        tree.tree = []
+        tree.truncated = True
+        mock_ghc.repo.get_git_tree.side_effect = lambda ref, recursive=False: tree
 
         ref = Mock()
         ref.object.sha = "commitsha"

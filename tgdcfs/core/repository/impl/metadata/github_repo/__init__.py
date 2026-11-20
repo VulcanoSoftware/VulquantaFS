@@ -44,11 +44,12 @@ logger = logging.getLogger(__name__)
 
 class _TreeEntry(NamedTuple):
     """The part of a git tree entry the tree builder reads: a full storage
-    path, ``"tree"`` or ``"blob"``, and the object's sha."""
+    path, ``"tree"`` or ``"blob"``, the object's sha and its file mode."""
 
     path: str
     type: str
     sha: str
+    mode: str = "100644"
 
 
 # How often a stats commit is retried when the branch moved under it.
@@ -422,12 +423,28 @@ class GithubRepoMetadataRepository(IMetaDataRepository):
             tree = repo.get_git_tree(base_commit.tree.sha, recursive=True)
             if tree.truncated:
                 # A truncated listing would make the rewrite below drop
-                # every blob it did not see. Never sync from that.
-                raise TechnicalError(
-                    f"The tree of {self._ghc.repo_name}@{self._ghc.commit} is "
-                    f"truncated; the metadata sync cannot run safely"
+                # every blob it did not see. Repositories past GitHub's
+                # truncation limit (100,000 entries or 7 MB) never grow
+                # out of it, so refusing here kept a caught-up store
+                # failing forever; the listing is rebuilt one directory
+                # at a time instead, complete if slower. Only a walk
+                # whose own directories truncate (an unreachable repo)
+                # still refuses the sync.
+                logger.warning(
+                    f"Tree of {self._ghc.repo_name}@{self._ghc.commit} came "
+                    "back truncated; reading it one directory at a time"
                 )
-            current = {e.path: (e.sha, e.mode) for e in tree.tree if e.type == "blob"}
+                current = {
+                    e.path: (e.sha, e.mode)
+                    for e in self._walk_tree()
+                    if e.type == "blob"
+                }
+            else:
+                current = {
+                    e.path: (e.sha, e.mode)
+                    for e in tree.tree
+                    if e.type == "blob"
+                }
             creates = sorted(desired_blobs - set(current))
             deletes = sorted(
                 path
@@ -773,7 +790,7 @@ class GithubRepoMetadataRepository(IMetaDataRepository):
                         )
                     for e in t.tree:
                         path = f"{prefix}{e.path}"
-                        entries.append(_TreeEntry(path, e.type, e.sha))
+                        entries.append(_TreeEntry(path, e.type, e.sha, e.mode))
                         if e.type == "tree":
                             pending.append((f"{path}/", e.sha))
         logger.info(

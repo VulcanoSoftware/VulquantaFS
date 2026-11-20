@@ -462,6 +462,34 @@ def gitlab_dead_storage(monkeypatch):
     return _route_session(monkeypatch, DeadlineGitlab(dead="all"))
 
 
+class RateLimitGitlab(FakeGitlab):
+    """A GitLab that refuses the next ``limited`` repository endpoints
+    with 429 (prescribing ``retry_after`` as the wait) before serving
+    normally again."""
+
+    def __init__(self, *args, limited: int = 0, retry_after: Optional[str] = "0", **kwargs):
+        super().__init__(*args, **kwargs)
+        self.limited = limited
+        self.retry_after = retry_after
+        self.attempts = 0
+
+    def handle(self, method, url, params, body):
+        self.attempts += 1
+        if self.limited > 0 and "/repository/" in url:
+            self.limited -= 1
+            return FakeResponse(
+                429,
+                {"message": "Rate limit exceeded"},
+                {"Retry-After": self.retry_after} if self.retry_after is not None else {},
+            )
+        return super().handle(method, url, params, body)
+
+
+@pytest.fixture
+def rate_limited_gitlab(monkeypatch):
+    return _route_session(monkeypatch, RateLimitGitlab())
+
+
 @pytest.fixture
 def stop_breakers():
     """The breakers a test woke up; stopped in teardown, so a leftover
@@ -923,6 +951,83 @@ class TestDeadlineAnswers:
 
         assert answered.value.status == 404
         assert not is_unreachable_error(answered.value)
+
+
+class TestRateLimitRetries:
+    """A full-tree sync fires many requests in a burst; one 429 used to
+    fail the whole store write, so the facade waits the prescribed wait
+    (or a short backoff) and tries again."""
+
+    @staticmethod
+    def seed(fake: RateLimitGitlab) -> None:
+        fake.commit(
+            "main",
+            "seed",
+            [
+                {
+                    "action": "create",
+                    "file_path": "docs/.gitkeep",
+                    "content": "",
+                    "encoding": "text",
+                }
+            ],
+        )
+        fake.limited = 2
+
+    async def test_a_429_is_retried_until_the_limit_clears(self, rate_limited_gitlab):
+        fake = rate_limited_gitlab
+        self.seed(fake)
+        repo = GitlabRepository(gitlab_config())
+
+        tree = repo.get_git_tree("main", recursive=True)
+
+        assert tree.truncated is False
+        assert fake.attempts == 3
+
+    async def test_the_retry_honours_the_prescribed_wait(
+        self, monkeypatch, rate_limited_gitlab
+    ):
+        fake = rate_limited_gitlab
+        self.seed(fake)
+        fake.limited = 1
+        fake.retry_after = "7"
+        sleeps: List[float] = []
+        monkeypatch.setattr(gitlab_tree_mod.time, "sleep", sleeps.append)
+        repo = GitlabRepository(gitlab_config())
+
+        repo.probe()
+
+        assert sleeps == [7.0]
+        assert fake.attempts == 2
+
+    async def test_without_retry_after_it_backs_off_exponentially(
+        self, monkeypatch, rate_limited_gitlab
+    ):
+        fake = rate_limited_gitlab
+        self.seed(fake)
+        fake.retry_after = None
+        sleeps: List[float] = []
+        monkeypatch.setattr(gitlab_tree_mod.time, "sleep", sleeps.append)
+        repo = GitlabRepository(gitlab_config())
+
+        repo.probe()
+
+        assert sleeps == [1.0, 2.0]
+        assert fake.attempts == 3
+
+    async def test_a_persistent_429_raises_after_the_last_attempt(
+        self, monkeypatch, rate_limited_gitlab
+    ):
+        fake = rate_limited_gitlab
+        fake.limited = 100
+        monkeypatch.setattr(gitlab_tree_mod.time, "sleep", lambda _s: None)
+        repo = GitlabRepository(gitlab_config())
+
+        with pytest.raises(GithubException) as ex:
+            repo.probe()
+
+        assert ex.value.status == 429
+        assert fake.attempts == gitlab_tree_mod.RATE_LIMIT_RETRIES
 
 
 async def _wait_closed(store: StoreCircuitBreaker, timeout: float = 10.0) -> None:
