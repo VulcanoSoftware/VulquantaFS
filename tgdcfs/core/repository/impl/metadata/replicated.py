@@ -134,7 +134,18 @@ class ReplicatedMetadataRepository(IMetaDataRepository):
     async def init(self) -> None:
         tree = await self._load()
         self.metadata = tree
-        await self.push()
+        try:
+            await self.push()
+        except TechnicalError as ex:
+            # A tree was loaded, so the file system can serve reads: the
+            # stores that could not take the write are marked stale and
+            # re-synced by the heal worker. Crashing the boot instead kept
+            # the whole server down over one store's outage (a rate limit,
+            # a repository that came back slower than the write).
+            logger.warning(
+                f"Could not write the metadata tree at startup; the heal "
+                f"worker will re-sync the failed stores: {ex}"
+            )
 
     async def _load(self) -> TGFSMetadata:
         """The tree to serve: the most recent one across the stores.

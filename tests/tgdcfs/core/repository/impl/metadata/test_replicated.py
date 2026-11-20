@@ -392,6 +392,64 @@ class TestTooLarge:
         assert layer.stale_stores() == []
 
 
+class TestStartupResilience:
+    """``init`` loads one tree and pushes it; when every store refuses the
+    write the boot survives: reads run off the loaded tree, the failed
+    stores stay marked stale and the heal worker re-syncs them."""
+
+    async def test_a_failed_startup_push_is_logged_not_raised(self, caplog):
+        primary = FakeMetadataRepo(
+            "primary", tree("primary"), push_error=TechnicalError("down")
+        )
+        layer = replicated(primary)
+
+        with caplog.at_level(logging.WARNING):
+            await layer.init()
+
+        assert layer.metadata is not None
+        assert layer.stale_stores() == ["primary"]
+        messages = [r.getMessage() for r in caplog.records]
+        assert any("Could not write the metadata tree at startup" in m for m in messages)
+
+    async def test_every_store_failing_the_startup_push_still_boots(
+        self, caplog
+    ):
+        """The shape of a rate-limited mirror atop a truncated primary:
+        the mirror's fresher tree wins the load, both writes fail, and the
+        server comes up anyway."""
+        primary_tree, mirror_tree = tree("primary"), tree("mirror")
+        primary_tree.revision = 1_000_000_000.0
+        mirror_tree.revision = primary_tree.revision + 3600.0
+        primary = FakeMetadataRepo(
+            "primary", primary_tree, push_full_error=TechnicalError("truncated")
+        )
+        mirror = FakeMetadataRepo(
+            "mirror", mirror_tree, push_full_error=TechnicalError("429 rate limited")
+        )
+        layer = replicated(primary, mirror)
+
+        with caplog.at_level(logging.WARNING):
+            await layer.init()
+
+        assert layer.metadata is mirror_tree
+        assert layer.stale_stores() == ["mirror", "primary"]
+        messages = [r.getMessage() for r in caplog.records]
+        assert any("Could not write the metadata tree at startup" in m for m in messages)
+
+    async def test_a_mirrors_failed_startup_push_does_not_crash_the_boot(self):
+        primary = FakeMetadataRepo("primary", tree("primary"))
+        mirror = FakeMetadataRepo(
+            "mirror", tree("mirror"), push_full_error=TechnicalError("down")
+        )
+        layer = replicated(primary, mirror)
+
+        await layer.init()
+
+        assert layer.metadata is not None
+        assert primary.stored is layer.metadata
+        assert layer.stale_stores() == ["mirror"]
+
+
 class TestHeal:
     async def test_heal_rewrites_only_the_stale_stores(self):
         primary = FakeMetadataRepo("primary")

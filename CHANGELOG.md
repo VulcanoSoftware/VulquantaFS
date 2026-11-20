@@ -54,6 +54,28 @@ the fact on the commits that shipped them.
 
 ### Fixed
 
+- A boot no longer crashes when the startup write of the metadata fails
+  for every store while a tree could be read from one of them. The
+  previous behaviour raised "Writing the metadata failed for every
+  store" out of ``init()`` and took the server down, which let one
+  store's transient outage (a rate limit, a repository that answered
+  slower than the write) stop the whole file system even though its
+  metadata was loaded and readable. The failures are now logged, the
+  failed stores stay marked stale, and the periodic heal re-syncs them.
+  A boot with no readable tree at all still refuses to start.
+- The full metadata sync onto a GitHub tree store no longer refuses a
+  repository whose recursive tree listing GitHub truncates (over 100,000
+  entries or 7 MB -- a size a busy metadata repo passes permanently, so
+  refusing meant the store never healed again). The sync now rebuilds
+  the listing one directory at a time, the same fallback the loading
+  path already used, and only refuses when even a single directory's
+  tree comes back truncated.
+- The GitLab metadata facade waits out HTTP 429 rate limits instead of
+  failing the request: it retries on the wait GitLab prescribes
+  (``Retry-After``, capped), or on a doubling backoff when none is
+  given, a few times before raising. A full-tree sync fires enough
+  requests in a burst to hit the usage quota, and one un-retried 429
+  failed the whole store write at boot.
 - Deleting a file through the protocols no longer leases out its own
   metadata commit per file. SFTP and WebDAV name one removal at a time,
   so a folder with 20k files used to pay two repository API calls per

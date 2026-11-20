@@ -19,6 +19,7 @@ import base64
 import json
 import logging
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from typing import Any, Dict, List, NamedTuple, Optional, Sequence, cast
@@ -67,6 +68,14 @@ GITALY_DEADLINE_MARKERS = ("Stream removed", "Deadline Exceeded")
 # large file system has to arrive as several ordinary commits, or GitLab
 # kills the operation on its own deadline.
 GITLAB_COMMIT_ACTION_LIMIT = 500
+
+# GitLab answers 429 when the access token runs into its usage quota. A
+# full-tree sync fires many requests in a burst and one 429 used to fail
+# the whole store write, so the request is retried: for the wait the API
+# prescribes (``Retry-After``), a doubling backoff when it prescribes
+# none, and then the failure stands for the stale/heal machinery.
+RATE_LIMIT_RETRIES = 5
+RATE_LIMIT_MAX_SLEEP_SECONDS = 30.0
 
 # How deep a history squash pages for its anchor (the oldest commit it
 # can force the branch onto): 1000 pages of PER_PAGE. Reaching the cap
@@ -220,6 +229,17 @@ class GitlabRepository:
             self._local.session = session
         return session
 
+    def _rate_limit_wait(self, response: requests.Response, attempt: int) -> float:
+        """Seconds to wait before the next try against a 429: the wait
+        GitLab prescribes (``Retry-After``) when it says one, a doubling
+        backoff otherwise, never beyond ``RATE_LIMIT_MAX_SLEEP_SECONDS``."""
+        value = response.headers.get("Retry-After", "")
+        try:
+            wait = float(value)
+        except (TypeError, ValueError):
+            wait = float(2**attempt)
+        return min(max(wait, 1.0), RATE_LIMIT_MAX_SLEEP_SECONDS)
+
     def _request(
         self,
         method: str,
@@ -236,6 +256,23 @@ class GitlabRepository:
             json=json_body,
             timeout=REQUEST_TIMEOUT_SECONDS,
         )
+        for attempt in range(RATE_LIMIT_RETRIES - 1):
+            if response.status_code != 429:
+                break
+            wait = self._rate_limit_wait(response, attempt)
+            logger.warning(
+                f"GitLab rate limit exceeded on {method} {path} "
+                f"(attempt {attempt + 1} of {RATE_LIMIT_RETRIES}); "
+                f"retrying in {wait:.0f}s"
+            )
+            time.sleep(wait)
+            response = self._session.request(
+                method,
+                url,
+                params=params,
+                json=json_body,
+                timeout=REQUEST_TIMEOUT_SECONDS,
+            )
         if response.status_code >= 400:
             data = _error_data(response)
             if _is_gitaly_deadline(data):
