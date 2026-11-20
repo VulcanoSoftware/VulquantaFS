@@ -16,6 +16,27 @@ the fact on the commits that shipped them.
 
 ## [Unreleased]
 
+### Added
+
+- Metadata pushes are configurable per file system (``metadata_push:
+  {mode, window_ms, parallel_stores}``). The default ``mode: coalesced``
+  merges the pushes of operations that run within one window (300 ms) into
+  a single store write: deleting a folder over SFTP -- the protocol names
+  one file at a time, so every removal pushed the whole tree to the
+  mirrors -- now pays one mirror sync for the burst instead of one per
+  file. The callers of a coalesced push still wait for the write that
+  covers them; a push that fails is logged and caught up by the heal
+  worker instead of failing operations whose local changes are already
+  real. ``mode: inline`` restores the previous behaviour. With
+  ``parallel_stores: true`` (the default) the primary and the mirrors are
+  written at the same time, so a push lasts for the slowest store instead
+  of the sum of all of them.
+- The GitLab tree mirrors read the blobs a full-tree sync needs (the
+  content GitLab commits alongside its actions) concurrently; the new
+  ``blob_fetch_concurrency`` setting (default `8`, like the GitHub
+  equivalent) turns a catch-up sync over thousands of blobs from a chain
+  of round trips into a handful of parallel ones.
+
 ### Fixed
 
 - A GitLab metadata mirror that could not do the work (its storage backend

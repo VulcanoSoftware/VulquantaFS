@@ -216,7 +216,11 @@ class Client:
             fd_repo, fc_repo, write_ack="cache" if write_back else "primary"
         )
 
-        metadata_api = MetaDataApi(metadata_repo)
+        metadata_api = MetaDataApi(
+            metadata_repo,
+            push_mode=filesystem.metadata_push.mode,
+            push_window=filesystem.metadata_push.window_seconds,
+        )
         await metadata_api.init()
 
         on_written = None
@@ -389,7 +393,10 @@ class Client:
                     cfg, path_name_key, metadata_blob_key
                 )
             stores.append(MetadataStore(key=cfg.key, repo=repo, primary=i == 0))
-        return ReplicatedMetadataRepository(stores)
+        return ReplicatedMetadataRepository(
+            stores,
+            concurrent_stores=filesystem.metadata_push.parallel_stores,
+        )
 
 
 Clients = Dict[str, Client]

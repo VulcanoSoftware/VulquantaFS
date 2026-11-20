@@ -21,9 +21,12 @@ import {
   FilesystemConfig,
   GITLAB_DEFAULTS,
   LISTING_DEFAULTS,
+  METADATA_PUSH_DEFAULTS,
   ListingConfig,
   MetadataEntry,
   MetadataLayout,
+  MetadataPushConfig,
+  MetadataPushMode,
   MetadataType,
   MirrorMode,
   StoreConfig,
@@ -122,6 +125,36 @@ const LAYOUTS: readonly MetadataLayout[] = ["tree", "document"];
 const MIRROR_MODES: readonly MirrorMode[] = ["auto", "forward", "reupload"];
 const SYNC_MODES: readonly SyncMode[] = ["inline", "background", "tee"];
 const WRITE_ACKS: readonly WriteAck[] = ["primary", "cache"];
+const METADATA_PUSH_MODES: readonly MetadataPushMode[] = ["coalesced", "inline"];
+
+// The file system's metadata_push block, back on the form; every value
+// equal to the loader's default is written back as the default, so a
+// round trip does not pin values today's default keeps changing.
+const readMetadataPush = (
+  path: string,
+  raw: unknown,
+  notes: Notes
+): MetadataPushConfig => {
+  const data = asMapping(raw);
+  notes.unknownKeys(path, data, ["mode", "window_ms", "parallel_stores"]);
+  const push: MetadataPushConfig = { ...METADATA_PUSH_DEFAULTS };
+  push.mode = notes.choice(
+    `${path}.mode`,
+    data.mode,
+    METADATA_PUSH_MODES,
+    METADATA_PUSH_DEFAULTS.mode
+  );
+  const window = asNumber(data.window_ms, METADATA_PUSH_DEFAULTS.window_ms);
+  if (window < 0) {
+    notes.add(
+      `${path}.window_ms must be 0 or more, using ${METADATA_PUSH_DEFAULTS.window_ms}`
+    );
+  } else {
+    push.window_ms = window;
+  }
+  push.parallel_stores = asBoolean(data.parallel_stores, push.parallel_stores);
+  return push;
+};
 
 // One metadata store, as the primary ``metadata`` block or as an entry
 // of ``metadata_mirrors``.
@@ -174,6 +207,7 @@ const readMetadataEntry = (
     "base_url",
     "file_path",
     "layout",
+    "blob_fetch_concurrency",
   ]);
   entry.gitlab_repo = {
     repo: asString(gitlab.repo),
@@ -186,6 +220,10 @@ const readMetadataEntry = (
       gitlab.layout,
       LAYOUTS,
       "tree"
+    ),
+    blob_fetch_concurrency: asNumber(
+      gitlab.blob_fetch_concurrency,
+      GITLAB_DEFAULTS.blob_fetch_concurrency
     ),
   };
   return entry;
@@ -245,6 +283,7 @@ const readStoresAndFilesystems = (
       "allow_shared_store",
       "metadata",
       "metadata_mirrors",
+      "metadata_push",
     ]);
     const fs = newFilesystem(name, asString(data.primary).trim());
     fs.mirrors = asList(data.mirrors);
@@ -263,6 +302,11 @@ const readStoresAndFilesystems = (
     fs.metadata_mirrors = readMetadataMirrors(
       `${path}.metadata_mirrors`,
       data.metadata_mirrors,
+      notes
+    );
+    fs.metadata_push = readMetadataPush(
+      `${path}.metadata_push`,
+      data.metadata_push,
       notes
     );
     // Left out, sync is derived from the stores, as the loader does it.

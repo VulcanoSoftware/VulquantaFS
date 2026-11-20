@@ -10,6 +10,7 @@ from tgdcfs.config import (
     FilesystemConfig,
     GitlabRepoConfig,
     MetadataConfig,
+    MetadataPushConfig,
     MetadataType,
     StoreConfig,
 )
@@ -733,6 +734,93 @@ class TestGitlabRepoConfig:
                 }
             )
 
+    def test_blob_fetch_concurrency_defaults_to_eight(self):
+        config = GitlabRepoConfig.from_dict(
+            {"repo": "group/project", "branch": "main", "access_token": "t"}
+        )
+        assert config.blob_fetch_concurrency == 8
+
+    def test_blob_fetch_concurrency_is_read_from_the_block(self):
+        config = GitlabRepoConfig.from_dict(
+            {
+                "repo": "group/project",
+                "branch": "main",
+                "access_token": "t",
+                "blob_fetch_concurrency": "16",
+            }
+        )
+        assert config.blob_fetch_concurrency == 16
+
+    @pytest.mark.parametrize("concurrency", [0, -3])
+    def test_a_non_positive_blob_fetch_concurrency_is_rejected(self, concurrency):
+        with pytest.raises(ValueError, match="blob_fetch_concurrency"):
+            GitlabRepoConfig.from_dict(
+                {
+                    "repo": "group/project",
+                    "branch": "main",
+                    "access_token": "t",
+                    "blob_fetch_concurrency": concurrency,
+                }
+            )
+
     def test_gitlab_is_listed_among_the_metadata_types(self):
         with pytest.raises(ValueError, match="gitlab_repo"):
             MetadataConfig.from_dict({"type": "carrier-pigeon"})
+
+
+class TestMetadataPushConfig:
+    def test_defaults(self):
+        config = MetadataPushConfig()
+        assert config.mode == "coalesced"
+        assert config.window_ms == 300
+        assert config.parallel_stores is True
+
+    def test_every_field_is_read_from_the_block(self):
+        config = MetadataPushConfig.from_dict(
+            "media",
+            {"mode": "inline", "window_ms": 750, "parallel_stores": False},
+        )
+        assert config.mode == "inline"
+        assert config.window_ms == 750
+        assert config.parallel_stores is False
+        assert config.window_seconds == 0.75
+
+    def test_a_filesystem_defaults_to_the_coalesced_push(self):
+        fs = FilesystemConfig.from_dict("media", {"primary": "tg-main", "mirrors": []})
+        assert fs.metadata_push.mode == "coalesced"
+
+    @pytest.mark.parametrize("mode", ["immediate", "", "COALESCED"])
+    def test_an_unknown_mode_is_rejected(self, mode):
+        with pytest.raises(ValueError, match="metadata_push"):
+            MetadataPushConfig.from_dict("media", {"mode": mode})
+
+    @pytest.mark.parametrize("window_ms", [-1, 60001, "none"])
+    def test_a_window_outside_the_bounds_is_rejected(self, window_ms):
+        with pytest.raises(ValueError, match="window_ms"):
+            MetadataPushConfig.from_dict("media", {"window_ms": window_ms})
+
+    def test_the_boundaries_are_allowed(self):
+        assert MetadataPushConfig.from_dict("media", {"window_ms": 0}).window_ms == 0
+        assert (
+            MetadataPushConfig.from_dict("media", {"window_ms": 60000}).window_ms
+            == 60000
+        )
+
+    def test_a_filesystem_with_a_non_mapping_block_is_rejected(self):
+        with pytest.raises(ValueError, match="metadata_push"):
+            FilesystemConfig.from_dict(
+                "media", {"primary": "tg-main", "metadata_push": "inline"}
+            )
+
+    def test_a_filesystem_reads_the_block(self):
+        fs = FilesystemConfig.from_dict(
+            "media",
+            {
+                "primary": "tg-main",
+                "mirrors": [],
+                "metadata_push": {"mode": "inline", "parallel_stores": False},
+            },
+        )
+        assert fs.metadata_push.mode == "inline"
+        assert fs.metadata_push.window_ms == 300
+        assert fs.metadata_push.parallel_stores is False

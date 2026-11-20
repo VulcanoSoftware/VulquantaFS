@@ -1013,6 +1013,81 @@ def commit_posts(fake: FakeGitlab) -> List[dict]:
     ]
 
 
+class TestParallelBlobFetch:
+    """``create_git_tree`` needs the content of every blob the branch
+    does not hold at its path (a tree rewrite that moved it there); the
+    reads must run concurrently and every action must carry the content
+    a sequential read would have found."""
+
+    def moved_blob_elements(self, facade: GitlabRepository, names: list[str]):
+        tree = facade.get_git_tree("main", recursive=True)
+        shas = {
+            entry.path: entry.sha
+            for entry in tree.tree
+            if entry.type == "blob" and entry.path in names
+        }
+        return [
+            InputGitTreeElement(
+                path=f"moved/{name}", mode="100644", type="blob", sha=shas[name]
+            )
+            for name in names
+        ]
+
+    def watch_blob_reads(self, facade: GitlabRepository) -> dict:
+        real = facade.get_git_blob
+        state = {"active": 0, "max_active": 0}
+
+        def counting(sha):
+            state["active"] += 1
+            state["max_active"] = max(state["max_active"], state["active"])
+            try:
+                time.sleep(0.05)
+                return real(sha)
+            finally:
+                state["active"] -= 1
+
+        facade.get_git_blob = counting  # type: ignore[method-assign]
+        return state
+
+    def test_actions_carry_the_read_blob_content(self, gitlab, monkeypatch):
+        _route_session(monkeypatch, gitlab)
+        facade = GitlabRepository(gitlab_config())
+        facade.create_file("docs/a.txt", "seed", "content of a", branch="main")
+        elements = self.moved_blob_elements(facade, ["docs/a.txt"])
+
+        pending = facade.create_git_tree(elements)
+
+        # Without a base tree the elements are the whole desired state:
+        # the moved blob carries its content, the old path is deleted.
+        assert pending.actions == [
+            {
+                "action": "create",
+                "file_path": "moved/docs/a.txt",
+                "content": base64.b64encode(b"content of a").decode(),
+                "encoding": "base64",
+            },
+            {"action": "delete", "file_path": "docs/a.txt"},
+        ]
+
+    def test_blob_reads_overlap(self, gitlab, monkeypatch):
+        _route_session(monkeypatch, gitlab)
+        facade = GitlabRepository(gitlab_config())
+        facade.create_file("docs/a.txt", "seed", "content of a", branch="main")
+        facade.create_file("docs/b.txt", "seed", "content of b", branch="main")
+        elements = self.moved_blob_elements(facade, ["docs/a.txt", "docs/b.txt"])
+        state = self.watch_blob_reads(facade)
+
+        pending = facade.create_git_tree(elements)
+
+        moved = [
+            action["file_path"]
+            for action in pending.actions
+            if action["action"] == "create"
+        ]
+        assert sorted(moved) == ["moved/docs/a.txt", "moved/docs/b.txt"]
+        assert state["max_active"] == 2
+
+
 class TestChunkedCommits:
     """One GitLab commit is one storage operation for all of its actions,
     and GitLab's backend refuses the batches of a full-tree sync early

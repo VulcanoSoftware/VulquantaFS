@@ -19,6 +19,7 @@ import base64
 import json
 import logging
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from typing import Any, Dict, List, NamedTuple, Optional, Sequence, cast
 from urllib.parse import quote
@@ -193,6 +194,7 @@ class GitlabRepository:
         self._project = quote(config.repo, safe="")
         self._branch = config.branch
         self._token = config.access_token
+        self._blob_fetch_concurrency = config.blob_fetch_concurrency
         self._local = threading.local()
         # Tree object ids seen in listings, mapped to their path: GitLab's
         # tree API takes a commit-ish ref plus a path, never a tree id,
@@ -570,6 +572,21 @@ class GitlabRepository:
             entry.path: entry.sha for entry in current_tree.tree if entry.type == "blob"
         }
 
+        # GitLab commits by content: every blob the branch does not hold
+        # yet travels with its action, so the diff has to read those blobs
+        # first. A catch-up sync after an outage names thousands of them;
+        # one round trip per blob turns that into a chain of them, so they
+        # are fetched concurrently and the actions still come out in the
+        # deterministic sorted order below.
+        needed_shas = {
+            sha
+            for path, (sha, content) in desired.items()
+            if content is None
+            and sha is not None
+            and (path not in current or current[path] != sha)
+        }
+        contents = self._fetch_blobs(needed_shas)
+
         actions: List[dict] = []
         for path, (sha, content) in sorted(desired.items()):
             if content is None and sha is None:
@@ -593,7 +610,7 @@ class GitlabRepository:
                     {
                         "action": "create",
                         "file_path": path,
-                        "content": self.get_git_blob(sha).content,
+                        "content": contents[sha],
                         "encoding": "base64",
                     }
                 )
@@ -602,7 +619,7 @@ class GitlabRepository:
                     {
                         "action": "update",
                         "file_path": path,
-                        "content": self.get_git_blob(sha).content,
+                        "content": contents[sha],
                         "encoding": "base64",
                     }
                 )
@@ -613,6 +630,29 @@ class GitlabRepository:
                 if path not in desired
             )
         return _PendingTree(actions)
+
+    def _fetch_blobs(self, shas: set) -> Dict[str, str]:
+        """The base64 content of the named blobs, fetched concurrently.
+
+        The sessions are thread-local (see ``_session``), so one connection
+        per worker fetches in parallel; a fetch failure surfaces from the
+        result iteration, the same exception a sequential fetch would have
+        raised, only earlier in wall time.
+        """
+        if not shas:
+            return {}
+        ordered = sorted(shas)
+        if len(ordered) == 1 or self._blob_fetch_concurrency <= 1:
+            return {sha: self.get_git_blob(sha).content for sha in ordered}
+        workers = min(self._blob_fetch_concurrency, len(ordered))
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            return {
+                sha: content
+                for sha, content in zip(
+                    ordered,
+                    pool.map(lambda sha: self.get_git_blob(sha).content, ordered),
+                )
+            }
 
     def create_git_commit(
         self, message: str, tree: _PendingTree, parents: Sequence[Any]

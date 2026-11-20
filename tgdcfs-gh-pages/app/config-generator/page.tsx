@@ -61,7 +61,9 @@ import {
   newFilesystem,
   newMetadataEntry,
   GITLAB_DEFAULTS,
+  METADATA_PUSH_DEFAULTS,
   MetadataEntry,
+  MetadataPushConfig,
 } from "./types";
 
 // Type-safe path mapping for updateConfig
@@ -107,7 +109,26 @@ type MetadataEntryYaml = {
     base_url?: string;
     file_path?: string;
     layout?: string;
+    blob_fetch_concurrency?: number;
   };
+};
+
+// One metadata_push block as it reaches the YAML, or nothing when every
+// value equals the loader's default.
+type MetadataPushYaml = {
+  mode?: string;
+  window_ms?: number;
+  parallel_stores?: boolean;
+};
+
+const metadataPushYaml = (push: MetadataPushConfig): MetadataPushYaml | undefined => {
+  const yaml: MetadataPushYaml = {};
+  if (push.mode !== METADATA_PUSH_DEFAULTS.mode) yaml.mode = push.mode;
+  if (push.window_ms !== METADATA_PUSH_DEFAULTS.window_ms)
+    yaml.window_ms = push.window_ms;
+  if (push.parallel_stores !== METADATA_PUSH_DEFAULTS.parallel_stores)
+    yaml.parallel_stores = push.parallel_stores;
+  return Object.keys(yaml).length > 0 ? yaml : undefined;
 };
 
 const metadataEntryYaml = (entry: MetadataEntry): MetadataEntryYaml => {
@@ -146,6 +167,11 @@ const metadataEntryYaml = (entry: MetadataEntry): MetadataEntryYaml => {
         : {}),
       ...(entry.gitlab_repo.layout === "document"
         ? { layout: entry.gitlab_repo.layout }
+        : {}),
+      ...(entry.gitlab_repo.layout === "tree" &&
+      entry.gitlab_repo.blob_fetch_concurrency !==
+        GITLAB_DEFAULTS.blob_fetch_concurrency
+        ? { blob_fetch_concurrency: entry.gitlab_repo.blob_fetch_concurrency }
         : {}),
     };
   }
@@ -647,6 +673,7 @@ export default function ConfigGenerator() {
         allow_shared_store?: boolean;
         metadata: MetadataEntryYaml;
         metadata_mirrors?: MetadataEntryYaml[];
+        metadata_push?: MetadataPushYaml;
       };
     } = {};
     config.filesystems
@@ -688,6 +715,9 @@ export default function ConfigGenerator() {
               }
             : {}),
           ...(writeBack ? { write_ack: "cache" } : {}),
+          ...(metadataPushYaml(fs.metadata_push) !== undefined
+            ? { metadata_push: metadataPushYaml(fs.metadata_push) }
+            : {}),
           metadata: metadataEntryYaml(fs.metadata),
           // A pinned mirror naming a store that is gone from the config
           // would fail to load; dropped like a file mirror would be.
