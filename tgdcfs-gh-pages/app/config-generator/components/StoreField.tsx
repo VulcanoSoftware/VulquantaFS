@@ -32,7 +32,7 @@ export function StoreField({
 }: StoreFieldProps) {
   return (
     <Box sx={{ mb: 2 }}>
-      <Box sx={{ display: "flex", alignItems: "flex-start", gap: 1, mb: 1 }}>
+      <Box sx={{ display: "flex", flexWrap: "wrap", alignItems: "flex-start", gap: 1, mb: 1 }}>
         <ConfigTextField
           label="Store Name"
           value={store.name}

@@ -1002,7 +1002,7 @@ export default function ConfigGenerator() {
           display: "flex",
           gap: 2,
           alignItems: "stretch",
-          flexDirection: { xs: "column", md: "row" },
+          flexDirection: { xs: "column", lg: "row" },
         }}
       >
         <Box sx={{ flex: 1, minWidth: 0 }}>
@@ -1121,7 +1121,13 @@ export default function ConfigGenerator() {
               {config.telegram.enabled && (
                 <>
                   <Box
-                    sx={{ display: "flex", alignItems: "center", gap: 2, mb: 2 }}
+                    sx={{
+                      display: "flex",
+                      flexWrap: "wrap",
+                      alignItems: "center",
+                      gap: 2,
+                      mb: 2,
+                    }}
                   >
                     <Typography variant="h6">API Credentials</Typography>
                     <Button
@@ -1200,6 +1206,7 @@ export default function ConfigGenerator() {
                     <Box
                       sx={{
                         display: "flex",
+                        flexWrap: "wrap",
                         alignItems: "center",
                         gap: 2,
                         mt: 2,
@@ -1395,7 +1402,7 @@ export default function ConfigGenerator() {
               <Typography variant="h6" sx={{ mt: 2, mb: 1 }}>
                 JWT
               </Typography>
-              <Box sx={{ display: "flex", gap: 1, mb: 2 }}>
+              <Box sx={{ display: "flex", flexWrap: "wrap", gap: 1, mb: 2 }}>
                 <ConfigTextField
                   label="JWT Secret"
                   value={config.tgdcfs.jwt.secret}
@@ -2086,8 +2093,8 @@ export default function ConfigGenerator() {
 
         <Box
           sx={{
-            width: { xs: "100%", md: sidebarWidth },
-            maxWidth: { md: "calc(100% - 522px)" },
+            width: { xs: "100%", lg: sidebarWidth },
+            maxWidth: { lg: "calc(100% - 522px)" },
             flexShrink: 0,
           }}
         >
@@ -2099,7 +2106,7 @@ export default function ConfigGenerator() {
               top: 24,
               // Taller than the viewport, the panel scrolls on its own so
               // the Docker command below the YAML stays reachable.
-              maxHeight: { md: "calc(100vh - 48px)" },
+              maxHeight: { lg: "calc(100vh - 48px)" },
               overflowY: "auto",
             }}
           >
@@ -2188,6 +2195,8 @@ export default function ConfigGenerator() {
                     fontSize: "0.75rem",
                     margin: 0,
                     background: "transparent",
+                    overflowX: "auto",
+                    whiteSpace: "pre",
                   }}
                 >
                   {generateYaml()}

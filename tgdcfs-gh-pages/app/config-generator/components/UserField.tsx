@@ -24,7 +24,7 @@ export function UserField({
   canDelete,
 }: UserFieldProps) {
   return (
-    <Box sx={{ display: "flex", alignItems: "flex-start", gap: 1, mb: 1 }}>
+    <Box sx={{ display: "flex", flexWrap: "wrap", alignItems: "flex-start", gap: 1, mb: 1 }}>
       <ConfigTextField
         label="Username"
         value={username}

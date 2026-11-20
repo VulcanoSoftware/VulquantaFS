@@ -152,7 +152,7 @@ export function DockerRunPanel({
         Put the downloaded config.yaml into the directory below; the
         sessions, the salt and the cache are written next to it.
       </Typography>
-      <Box sx={{ display: "flex", alignItems: "center", gap: 2, mb: 2 }}>
+      <Box sx={{ display: "flex", flexWrap: "wrap", alignItems: "center", gap: 2, mb: 2 }}>
         <ToggleButtonGroup
           value={variant}
           exclusive
@@ -163,7 +163,7 @@ export function DockerRunPanel({
           <ToggleButton value="compose">{engine} compose</ToggleButton>
         </ToggleButtonGroup>
       </Box>
-      <Box sx={{ display: "flex", alignItems: "center", gap: 2, mb: 2 }}>
+      <Box sx={{ display: "flex", flexWrap: "wrap", alignItems: "center", gap: 2, mb: 2 }}>
         <Typography variant="body2" color="text.secondary">
           Engine:
         </Typography>
@@ -177,7 +177,7 @@ export function DockerRunPanel({
           <ToggleButton value="podman">Podman</ToggleButton>
         </ToggleButtonGroup>
       </Box>
-      <Box sx={{ display: "flex", alignItems: "center", gap: 2, mb: 2 }}>
+      <Box sx={{ display: "flex", flexWrap: "wrap", alignItems: "center", gap: 2, mb: 2 }}>
         <Typography variant="body2" color="text.secondary">
           Registry:
         </Typography>
@@ -191,7 +191,7 @@ export function DockerRunPanel({
           <ToggleButton value="ghcr">GHCR</ToggleButton>
         </ToggleButtonGroup>
       </Box>
-      <Box sx={{ display: "flex", alignItems: "center", gap: 2, mb: 2 }}>
+      <Box sx={{ display: "flex", flexWrap: "wrap", alignItems: "center", gap: 2, mb: 2 }}>
         <Typography variant="body2" color="text.secondary">
           Path Style:
         </Typography>

@@ -9,5 +9,11 @@ export function ConfigTextField({
   sx,
   ...props
 }: ConfigTextFieldProps) {
-  return <TextField size="small" sx={{ width, ...sx }} {...props} />;
+  return (
+    <TextField
+      size="small"
+      sx={{ width: { xs: "100%", sm: width }, maxWidth: "100%", ...sx }}
+      {...props}
+    />
+  );
 }
