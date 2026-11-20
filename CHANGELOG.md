@@ -18,6 +18,21 @@ the fact on the commits that shipped them.
 
 ### Added
 
+- Git-backed metadata stores (GitHub and GitLab, tree layout) take a new
+  `squash_history_max_commits` setting (default `0`, off). Once the
+  branch's commit history grows past it, the periodic heal rewrites the
+  branch into a single commit that carries its whole current state:
+  GitHub gets a genuine parentless orphan commit, GitLab -- whose commits
+  API cannot create one -- a commit forced onto the history's oldest
+  ancestor that replays the current state. Git backends keep every
+  deleted blob alive for as long as a commit references it, so an
+  unbounded history grows the repository's storage (and the cost of a
+  fresh clone of it) forever; with the squash the old history loses its
+  reference and the backend's garbage collection reclaims the blobs. Set
+  it on any store, primary or mirror; a single primary metadata store
+  alone is enough. A history whose tree walks truncated refuses to
+  squash, and a store that cannot be squashed is logged and skipped, so
+  the heal worker retries on the next round.
 - Metadata pushes are configurable per file system (``metadata_push:
   {mode, window_ms, parallel_stores}``). The default ``mode: coalesced``
   merges the pushes of operations that run within one window (300 ms) into
@@ -39,6 +54,15 @@ the fact on the commits that shipped them.
 
 ### Fixed
 
+- Deleting a file through the protocols no longer leases out its own
+  metadata commit per file. SFTP and WebDAV name one removal at a time,
+  so a folder with 20k files used to pay two repository API calls per
+  file in the coalesced window (one to delete the blob, one to advance
+  the ref). The deletions a window collects now land as one overlay
+  commit that removes every path at once (flushed when 100 files or 5
+  seconds have accumulated); a failed flush is re-queued and caught up
+  by the next push, and a missing branch (a store not yet synced) is
+  simply dropped from the queue.
 - A GitLab metadata mirror that could not do the work (its storage backend
   answering "Deadline Exceeded"/"Stream removed" after the full request
   timeout, or the connection dying) no longer holds every file operation

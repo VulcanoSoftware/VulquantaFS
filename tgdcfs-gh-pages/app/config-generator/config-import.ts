@@ -186,6 +186,7 @@ const readMetadataEntry = (
     "access_token",
     "layout",
     "file_path",
+    "squash_history_max_commits",
   ]);
   entry.github_repo = {
     repo: asString(github.repo),
@@ -198,6 +199,7 @@ const readMetadataEntry = (
       "tree"
     ),
     file_path: asString(github.file_path, GITLAB_DEFAULTS.file_path),
+    squash_history_max_commits: asNumber(github.squash_history_max_commits, 0),
   };
   const gitlab = asMapping(data.gitlab_repo);
   notes.unknownKeys(`${path}.gitlab_repo`, gitlab, [
@@ -208,6 +210,7 @@ const readMetadataEntry = (
     "file_path",
     "layout",
     "blob_fetch_concurrency",
+    "squash_history_max_commits",
   ]);
   entry.gitlab_repo = {
     repo: asString(gitlab.repo),
@@ -225,6 +228,7 @@ const readMetadataEntry = (
       gitlab.blob_fetch_concurrency,
       GITLAB_DEFAULTS.blob_fetch_concurrency
     ),
+    squash_history_max_commits: asNumber(gitlab.squash_history_max_commits, 0),
   };
   return entry;
 };

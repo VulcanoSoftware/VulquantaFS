@@ -101,6 +101,7 @@ type MetadataEntryYaml = {
     access_token: string;
     layout?: string;
     file_path?: string;
+    squash_history_max_commits?: number;
   };
   gitlab_repo?: {
     repo: string;
@@ -110,6 +111,7 @@ type MetadataEntryYaml = {
     file_path?: string;
     layout?: string;
     blob_fetch_concurrency?: number;
+    squash_history_max_commits?: number;
   };
 };
 
@@ -150,6 +152,13 @@ const metadataEntryYaml = (entry: MetadataEntry): MetadataEntryYaml => {
       ...(filePath !== "" && filePath !== GITLAB_DEFAULTS.file_path
         ? { file_path: filePath }
         : {}),
+      ...(entry.github_repo.layout === "tree" &&
+      entry.github_repo.squash_history_max_commits !== 0
+        ? {
+            squash_history_max_commits:
+              entry.github_repo.squash_history_max_commits,
+          }
+        : {}),
     };
   }
   if (entry.type === "gitlab_repo") {
@@ -172,6 +181,13 @@ const metadataEntryYaml = (entry: MetadataEntry): MetadataEntryYaml => {
       entry.gitlab_repo.blob_fetch_concurrency !==
         GITLAB_DEFAULTS.blob_fetch_concurrency
         ? { blob_fetch_concurrency: entry.gitlab_repo.blob_fetch_concurrency }
+        : {}),
+      ...(entry.gitlab_repo.layout === "tree" &&
+      entry.gitlab_repo.squash_history_max_commits !== 0
+        ? {
+            squash_history_max_commits:
+              entry.gitlab_repo.squash_history_max_commits,
+          }
         : {}),
     };
   }

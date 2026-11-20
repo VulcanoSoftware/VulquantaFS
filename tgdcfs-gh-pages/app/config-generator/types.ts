@@ -64,6 +64,9 @@ export interface MetadataEntry {
     // layout uses it to find (and remove) a document left by an older
     // release or by the document layout.
     file_path: string;
+    // Tree layout only: compact the commit history once it grows past
+    // this many commits; 0 keeps it forever.
+    squash_history_max_commits: number;
   };
   gitlab_repo: {
     repo: string;
@@ -75,6 +78,9 @@ export interface MetadataEntry {
     // Tree layout only: how many blobs a full-tree sync reads in
     // parallel; more is faster but bursts harder against the rate limit.
     blob_fetch_concurrency: number;
+    // Tree layout only: compact the commit history once it grows past
+    // this many commits; 0 keeps it forever.
+    squash_history_max_commits: number;
   };
 }
 
@@ -95,6 +101,7 @@ export const newMetadataEntry = (): MetadataEntry => ({
     access_token: "",
     layout: "tree",
     file_path: GITLAB_DEFAULTS.file_path,
+    squash_history_max_commits: 0,
   },
   gitlab_repo: {
     repo: "",
@@ -104,6 +111,7 @@ export const newMetadataEntry = (): MetadataEntry => ({
     file_path: GITLAB_DEFAULTS.file_path,
     layout: "tree",
     blob_fetch_concurrency: GITLAB_DEFAULTS.blob_fetch_concurrency,
+    squash_history_max_commits: 0,
   },
 });
 

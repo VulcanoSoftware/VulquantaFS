@@ -84,7 +84,7 @@ function MetadataStoreEditor({
     onChange({ ...entry, ...patch });
   const updateGithub = (
     field: keyof MetadataEntry["github_repo"],
-    value: string
+    value: string | number
   ) => update({ github_repo: { ...entry.github_repo, [field]: value } });
   const updateGitlab = (
     field: keyof MetadataEntry["gitlab_repo"],
@@ -207,6 +207,20 @@ function MetadataStoreEditor({
                 style={{ flex: 1 }}
               />
             )}
+            {entry.github_repo.layout === "tree" && (
+              <ConfigTextField
+                label="Squash History At"
+                value={String(entry.github_repo.squash_history_max_commits)}
+                onChange={(e) =>
+                  updateGithub(
+                    "squash_history_max_commits",
+                    Math.max(0, parseInt(e.target.value, 10) || 0)
+                  )
+                }
+                helperText="Compact the commit history once it grows past this many commits (0 = off)"
+                style={{ width: 220, flex: "none" }}
+              />
+            )}
           </Box>
         </>
       )}
@@ -300,6 +314,20 @@ function MetadataStoreEditor({
                   )
                 }
                 helperText="Parallel blob reads during a full-tree sync; default: 8"
+                style={{ width: 220, flex: "none" }}
+              />
+            )}
+            {entry.gitlab_repo.layout === "tree" && (
+              <ConfigTextField
+                label="Squash History At"
+                value={String(entry.gitlab_repo.squash_history_max_commits)}
+                onChange={(e) =>
+                  updateGitlab(
+                    "squash_history_max_commits",
+                    Math.max(0, parseInt(e.target.value, 10) || 0)
+                  )
+                }
+                helperText="Compact the commit history once it grows past this many commits (0 = off)"
                 style={{ width: 220, flex: "none" }}
               />
             )}
