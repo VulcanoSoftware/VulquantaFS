@@ -139,7 +139,7 @@ function MetadataStoreEditor({
       {entry.type === "github_repo" && (
         <>
           <Box
-            sx={{ display: "flex", alignItems: "flex-start", gap: 1, mb: 1 }}
+            sx={{ display: "flex", flexWrap: "wrap", alignItems: "flex-start", gap: 1, mb: 1 }}
           >
             <ConfigTextField
               label="Repository"
@@ -157,7 +157,7 @@ function MetadataStoreEditor({
             />
           </Box>
           <Box
-            sx={{ display: "flex", alignItems: "flex-start", gap: 1, mb: 1 }}
+            sx={{ display: "flex", flexWrap: "wrap", alignItems: "flex-start", gap: 1, mb: 1 }}
           >
             <ConfigTextField
               label="Access Token"
@@ -180,7 +180,7 @@ function MetadataStoreEditor({
             </Button>
           </Box>
           <Box
-            sx={{ display: "flex", alignItems: "flex-start", gap: 1, mb: 1 }}
+            sx={{ display: "flex", flexWrap: "wrap", alignItems: "flex-start", gap: 1, mb: 1 }}
           >
             <FormControl size="small" sx={{ minWidth: 240 }}>
               <InputLabel>Layout</InputLabel>
@@ -227,7 +227,7 @@ function MetadataStoreEditor({
       {entry.type === "gitlab_repo" && (
         <>
           <Box
-            sx={{ display: "flex", alignItems: "flex-start", gap: 1, mb: 1 }}
+            sx={{ display: "flex", flexWrap: "wrap", alignItems: "flex-start", gap: 1, mb: 1 }}
           >
             <ConfigTextField
               label="Repository"
@@ -245,7 +245,7 @@ function MetadataStoreEditor({
             />
           </Box>
           <Box
-            sx={{ display: "flex", alignItems: "flex-start", gap: 1, mb: 1 }}
+            sx={{ display: "flex", flexWrap: "wrap", alignItems: "flex-start", gap: 1, mb: 1 }}
           >
             <ConfigTextField
               label="Access Token"
@@ -269,7 +269,7 @@ function MetadataStoreEditor({
             </Button>
           </Box>
           <Box
-            sx={{ display: "flex", alignItems: "flex-start", gap: 1, mb: 1 }}
+            sx={{ display: "flex", flexWrap: "wrap", alignItems: "flex-start", gap: 1, mb: 1 }}
           >
             <ConfigTextField
               label="Base URL"
@@ -365,7 +365,7 @@ export function FilesystemField({
 
   return (
     <Box sx={{ mb: 3, pb: 2, borderBottom: 1, borderColor: "divider" }}>
-      <Box sx={{ display: "flex", alignItems: "flex-start", gap: 1, mb: 2 }}>
+      <Box sx={{ display: "flex", flexWrap: "wrap", alignItems: "flex-start", gap: 1, mb: 2 }}>
         <ConfigTextField
           label="File System Name"
           value={filesystem.name}
@@ -433,7 +433,7 @@ export function FilesystemField({
       <Typography variant="subtitle2" sx={{ mb: 1 }}>
         Metadata Push
       </Typography>
-      <Box sx={{ display: "flex", alignItems: "flex-start", gap: 1, mb: 1 }}>
+      <Box sx={{ display: "flex", flexWrap: "wrap", alignItems: "flex-start", gap: 1, mb: 1 }}>
         <FormControl size="small" sx={{ minWidth: 260 }}>
           <InputLabel>Write mode</InputLabel>
           <Select
@@ -495,6 +495,7 @@ export function FilesystemField({
           key={index}
           sx={{
             display: "flex",
+            flexWrap: "wrap",
             alignItems: "flex-start",
             gap: 1,
             mb: 1,
@@ -550,7 +551,7 @@ export function FilesystemField({
       <Typography variant="subtitle2" sx={{ mb: 1 }}>
         Mirrors
       </Typography>
-      <Box sx={{ display: "flex", alignItems: "flex-start", gap: 1, mb: 1 }}>
+      <Box sx={{ display: "flex", flexWrap: "wrap", alignItems: "flex-start", gap: 1, mb: 1 }}>
         <FormControl
           size="small"
           sx={{ minWidth: 300, flex: 1 }}

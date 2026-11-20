@@ -106,7 +106,7 @@ export function ColumnResizeHandle({
       onDoubleClick={onReset}
       onKeyDown={handleKeyDown}
       sx={{
-        display: { xs: "none", md: "flex" },
+        display: { xs: "none", lg: "flex" },
         alignItems: "center",
         justifyContent: "center",
         width: 10,
