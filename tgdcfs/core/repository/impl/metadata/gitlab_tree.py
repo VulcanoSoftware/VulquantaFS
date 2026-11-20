@@ -61,6 +61,12 @@ REQUEST_TIMEOUT_SECONDS = 60.0
 # circuit breaker cut that off.
 GITALY_DEADLINE_MARKERS = ("Stream removed", "Deadline Exceeded")
 
+# The most actions one GitLab commit may carry. A GitLab commit is one
+# storage operation for every action it holds, so the full-tree sync of a
+# large file system has to arrive as several ordinary commits, or GitLab
+# kills the operation on its own deadline.
+GITLAB_COMMIT_ACTION_LIMIT = 500
+
 
 def _is_gitaly_deadline(data: dict) -> bool:
     text = str(data)
@@ -614,7 +620,23 @@ class GitlabRepository:
         actions = tree.actions
         if not actions:
             return _Commit(self._noop_commit())
-        sha = self._post_commit(message, actions)
+        chunks = [
+            actions[i : i + GITLAB_COMMIT_ACTION_LIMIT]
+            for i in range(0, len(actions), GITLAB_COMMIT_ACTION_LIMIT)
+        ]
+        # A single commit is one storage operation for all of its actions:
+        # GitLab's backend gives the batches of a full-tree sync up early
+        # ("4:Stream removed (Deadline Exceeded)"), long before the
+        # request itself times out. Land the tree as ordinary, capped
+        # commits instead. The diff never names a path twice, so every
+        # chunk applies cleanly on the one before it, and a chunk that
+        # does not land leaves the store stale for the next full sync,
+        # like any failed push.
+        total = len(chunks)
+        sha = ""
+        for number, chunk in enumerate(chunks, start=1):
+            chunk_message = f"{message} ({number}/{total})" if total > 1 else message
+            sha = self._post_commit(chunk_message, chunk)
         tree.sha = sha
         return _Commit(sha)
 

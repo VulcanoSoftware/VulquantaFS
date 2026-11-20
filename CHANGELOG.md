@@ -34,6 +34,16 @@ the fact on the commits that shipped them.
   whose reads answer but whose writes keep deadlining rare, so a
   permanently broken mirror costs one write timeout per escalating
   interval instead of nearly constantly.
+- A full metadata sync onto the GitLab tree mirror now arrives as a
+  series of commits of at most 500 actions instead of one commit for the
+  whole tree. GitLab applies a commit's actions in a single storage
+  operation, and the batches of a tree with thousands of entries exceeded
+  that operation's own deadline ("4:Stream removed (Deadline
+  Exceeded)") every time, no matter which repository or access token the
+  mirror used -- the reason a healthy-looking GitLab mirrored nothing.
+  The actions of one sync never name a path twice, so the capped commits
+  land cleanly one after the other; a sync that stops in between leaves
+  the store stale and the next push re-syncs it, as before.
 - The file data of a replicated file system now heals itself the way the
   metadata does. With ``sync: tee`` a mirror write that failed (a mirror
   store being temporarily down, for instance) was detected and the file's

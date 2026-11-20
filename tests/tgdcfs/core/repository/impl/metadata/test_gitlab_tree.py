@@ -32,6 +32,7 @@ from tgdcfs.core.repository.impl.metadata.breaker import (
 from tgdcfs.core.repository.impl.metadata.github_repo.gh_directory import (
     GithubDirectory,
 )
+from tgdcfs.core.repository.impl.metadata import gitlab_tree as gitlab_tree_mod
 from tgdcfs.core.repository.impl.metadata.gitlab_tree import (
     GitlabRepository,
     GitlabTreeRepoMetadataRepository,
@@ -997,3 +998,86 @@ class TestFailFastGitlabTreeStore:
         assert time.monotonic() - start < 1.0
         assert [r for r in gitlab_dead_writes.requests if r[0] == "POST"] == posts
         assert layer.stale_stores() == ["gitlab_repo@g/p@main"]
+
+
+def _routed(monkeypatch, fake: FakeGitlab) -> GitlabRepository:
+    _route_session(monkeypatch, fake)
+    return GitlabRepository(gitlab_config())
+
+
+def commit_posts(fake: FakeGitlab) -> List[dict]:
+    return [
+        body
+        for method, url, params, body in fake.requests
+        if method == "POST" and url.endswith("repository/commits")
+    ]
+
+
+class TestChunkedCommits:
+    """One GitLab commit is one storage operation for all of its actions,
+    and GitLab's backend refuses the batches of a full-tree sync early
+    ("4:Stream removed (Deadline Exceeded)"). The facade must therefore
+    land a big tree as several ordinary commits of capped size."""
+
+    async def test_a_big_sync_lands_in_capped_commits(self, monkeypatch):
+        monkeypatch.setattr(gitlab_tree_mod, "GITLAB_COMMIT_ACTION_LIMIT", 3)
+        fake = FakeGitlab(seed={"docs/.gitkeep": ""})
+        facade = _routed(monkeypatch, fake)
+        names = [f"big/file{i:02d}.txt" for i in range(8)]
+        pending = facade.create_git_tree(
+            [
+                InputGitTreeElement(
+                    path=name, mode="100644", type="blob", content=str(i)
+                )
+                for i, name in enumerate(names)
+            ]
+        )
+
+        facade.create_git_commit("initial sync", pending, [])
+
+        posts = commit_posts(fake)
+        action_counts = [len(body["actions"]) for body in posts]
+        assert action_counts == [3, 3, 2]
+        changed = {action["file_path"] for body in posts for action in body["actions"]}
+        assert changed == set(names)
+        for i, name in enumerate(names):
+            assert fake.file_content("main", name) == str(i)
+        assert [body["commit_message"] for body in posts] == [
+            "initial sync (1/3)",
+            "initial sync (2/3)",
+            "initial sync (3/3)",
+        ]
+
+    async def test_a_small_sync_stays_one_unsuffixed_commit(self, monkeypatch):
+        fake = FakeGitlab(seed={"docs/.gitkeep": ""})
+        facade = _routed(monkeypatch, fake)
+        pending = facade.create_git_tree(
+            [
+                InputGitTreeElement(
+                    path="hello.txt", mode="100644", type="blob", content="hi"
+                )
+            ]
+        )
+
+        facade.create_git_commit("a small sync", pending, [])
+
+        posts = commit_posts(fake)
+        assert len(posts) == 1
+        assert posts[0]["commit_message"] == "a small sync"
+        assert fake.file_content("main", "hello.txt") == "hi"
+
+    async def test_a_big_full_push_lands_every_file(self, gitlab, monkeypatch):
+        monkeypatch.setattr(gitlab_tree_mod, "GITLAB_COMMIT_ACTION_LIMIT", 4)
+        repo = GitlabTreeRepoMetadataRepository(gitlab_config())
+        root = TGFSDirectory.root_dir()
+        for i in range(10):
+            root.create_file_ref(f"f{i}", i)
+        repo.metadata = TGFSMetadata(root)
+
+        await repo.push_full()
+
+        posts = commit_posts(gitlab)
+        assert len(posts) >= 3
+        assert all(len(body["actions"]) <= 4 for body in posts)
+        for i in range(10):
+            assert gitlab.file_content("main", f"f{i}.{i}") is not None
