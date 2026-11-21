@@ -16,6 +16,7 @@ All methods are blocking and run on the store's writer thread (or a
 
 import asyncio
 import base64
+import hashlib
 import json
 import logging
 import threading
@@ -46,6 +47,15 @@ from tgdcfs.crypto.metadata_blob import decrypt_metadata_blob
 from tgdcfs.errors import TechnicalError
 
 logger = logging.getLogger(__name__)
+
+
+def _blob_sha(data: bytes) -> str:
+    # Git's object id, so a sha the cache folds back in agrees with what a
+    # tree listing reports for the same content.
+    return hashlib.sha1(
+        b"blob %d\0" % len(data) + data, usedforsecurity=False
+    ).hexdigest()
+
 
 # One listing page; the facade always follows the whole pagination, so a
 # load never silently misses the tail of a big repository the way a
@@ -214,9 +224,91 @@ class GitlabRepository:
         # tree API takes a commit-ish ref plus a path, never a tree id,
         # while the store walks trees by the shas a parent listing showed.
         self._tree_paths: Dict[str, str] = {}
+        # The branch's blobs, walked while the head was the sha cached
+        # beside them: the diff of a commit (``create_git_tree``) reads
+        # the whole branch to distinguish its elements from everything
+        # already there, and without the cache every overlay commit --
+        # each file drop, each stats commit, every sync chunk -- paid
+        # hundreds of paginated listing requests for it, rate-limited
+        # waits on top. Writes that land through this repository fold
+        # their actions back in; any sign of a write from elsewhere
+        # invalidates the cache (one re-read) silently.
+        self._cached_head: Optional[str] = None
+        self._cached_blobs: Optional[Dict[str, _TreeEntry]] = None
         # Set when ``get_git_ref`` answered 404: the next commit creates
         # the branch, which needs a start point (see ``_post_commit``).
         self._branch_missing = False
+
+    def _invalidate_tree_cache(self) -> None:
+        self._cached_head = None
+        self._cached_blobs = None
+
+    def _branch_entries(self) -> Dict[str, _TreeEntry]:
+        """The branch's tree entries, keyed by path, served from the cache
+        while the head still is the one the cache was walked at.
+
+        A cache that does not match the head re-reads once -- paginated,
+        like every listing -- and re-caches; callers translate a 404 (the
+        branch is not there yet) to their own blank-page handling.
+        """
+        head = self._branch_head()
+        if self._cached_head == head and self._cached_blobs is not None:
+            return self._cached_blobs
+        items = self._paginated(
+            "/repository/tree", {"ref": self._branch, "recursive": "true"}
+        )
+        entries = [
+            _TreeEntry(
+                path=item["path"],
+                type=item["type"],
+                sha=item["id"],
+                mode=item.get("mode", "100644"),
+            )
+            for item in items
+        ]
+        for entry in entries:
+            if entry.type == "tree":
+                self._tree_paths[entry.sha] = entry.path
+        self._cached_blobs = {entry.path: entry for entry in entries}
+        self._cached_head = head
+        return self._cached_blobs
+
+    def _cache_actions(self, actions: List[dict], head: str) -> None:
+        """Fold a commit that just landed through ``_post_commit`` into the
+        branch cache, and record the head it left the branch at."""
+        if self._cached_blobs is None or self._branch_missing:
+            return
+        for action in actions:
+            path = cast(str, action.get("file_path"))
+            if action.get("action") == "delete":
+                self._cached_blobs.pop(path, None)
+                continue
+            content = cast(str, action.get("content", ""))
+            if action.get("encoding") == "text":
+                data = content.encode("utf-8")
+            else:
+                data = base64.b64decode(content)
+            self._cached_blobs[path] = _TreeEntry(
+                path=path, type="blob", sha=_blob_sha(data), mode="100644"
+            )
+        self._cached_head = head
+
+    def _cache_file_write(self, path: str, data: bytes, deleted: bool) -> None:
+        """Fold a single-path files-API write into the branch cache; the
+        files API answers nothing about the head it left behind, so the
+        new one is read once."""
+        if self._cached_blobs is None or self._branch_missing:
+            return
+        if deleted:
+            self._cached_blobs.pop(path, None)
+        else:
+            self._cached_blobs[path] = _TreeEntry(
+                path=path, type="blob", sha=_blob_sha(data), mode="100644"
+            )
+        try:
+            self._cached_head = self._branch_head()
+        except GithubException:
+            self._invalidate_tree_cache()
 
     # -- transport -----------------------------------------------------------
 
@@ -368,6 +460,10 @@ class GitlabRepository:
         # callers treat exactly like GitHub's non-fast-forward refusal.
         head = self._branch_head(branch)
         if head != sha:
+            if branch == self._branch:
+                # The write that moved the head from under this ref
+                # invalidated the cache's claim on it.
+                self._invalidate_tree_cache()
             raise GithubException(422, {"message": "Update is not a fast forward"})
 
     def create_git_ref(self, ref: str, sha: str) -> None:
@@ -398,6 +494,29 @@ class GitlabRepository:
         return _Commit(sha, data.get("committed_date"))
 
     def get_git_tree(self, sha: str, recursive: bool = False) -> _Tree:
+        if sha == self._branch or (
+            self._cached_blobs is not None and sha == self._cached_head
+        ):
+            if sha == self._branch:
+                # A listing of the branch; the cache is revalidated
+                # against the head with a single request, since a write
+                # from outside this process would make it stale.
+                try:
+                    cached = self._branch_entries()
+                except GithubException as ex:
+                    if ex.status != 404:
+                        raise
+                    # The branch does not exist yet, which the next
+                    # write has to bootstrap.
+                    self._branch_missing = True
+                    raise
+            else:
+                cached = cast(Dict[str, _TreeEntry], self._cached_blobs)
+            if not recursive:
+                return _Tree(
+                    [entry for entry in cached.values() if "/" not in entry.path]
+                )
+            return _Tree(list(cached.values()))
         # A tree id the facade itself listed maps back to its path; a
         # commit sha or branch name goes through as the ref directly.
         params: Dict[str, Any] = {"ref": sha}
@@ -568,6 +687,7 @@ class GitlabRepository:
                     422, {"message": '"sha" wasn\'t supplied'}
                 ) from ex
             raise
+        self._cache_file_write(path, content.encode("utf-8"), deleted=False)
 
     def delete_file(
         self, path: str, message: str, sha: str, branch: str, **_kwargs: Any
@@ -580,6 +700,7 @@ class GitlabRepository:
                 "commit_message": message,
             },
         )
+        self._cache_file_write(path, b"", deleted=True)
 
     def create_git_tree(
         self,
@@ -603,15 +724,16 @@ class GitlabRepository:
             )
 
         try:
-            current_tree = self.get_git_tree(self._branch, recursive=True)
+            entries = self._branch_entries()
         except GithubException as ex:
             if ex.status != 404:
                 raise
             # The branch does not exist yet (a fresh repository); the
             # desired tree is the whole state, nothing to diff against.
-            current_tree = _Tree([])
+            self._branch_missing = True
+            entries = {}
         current = {
-            entry.path: entry.sha for entry in current_tree.tree if entry.type == "blob"
+            path: entry.sha for path, entry in entries.items() if entry.type == "blob"
         }
 
         # GitLab commits by content: every blob the branch does not hold
@@ -719,6 +841,7 @@ class GitlabRepository:
         for number, chunk in enumerate(chunks, start=1):
             chunk_message = f"{message} ({number}/{total})" if total > 1 else message
             sha = self._post_commit(chunk_message, chunk)
+            self._cache_actions(chunk, sha)
         tree.sha = sha
         return _Commit(sha)
 
@@ -826,13 +949,15 @@ class GitlabRepository:
                 for i in range(0, len(actions), GITLAB_COMMIT_ACTION_LIMIT)
             ]
         total = len(chunks)
+        sha = ""
         for number, chunk in enumerate(chunks, start=1):
-            self._post_commit(
+            sha = self._post_commit(
                 message if total == 1 else f"{message} ({number}/{total})",
                 chunk,
                 force=number == 1,
                 start_sha=anchor if number == 1 else None,
             )
+            self._cache_actions(chunk, sha)
         return len(history)
 
     def _noop_commit(self) -> str:
@@ -864,6 +989,8 @@ class GitlabRepository:
             # The branch came into existence in the meantime.
             head = self._branch_head()
         self._branch_missing = False
+        # The cache, if any, described a branch that was not there.
+        self._invalidate_tree_cache()
         return head
 
     def _post_commit(
@@ -889,6 +1016,7 @@ class GitlabRepository:
                 # A one-action commit on an empty project: writing the
                 # first file already created it.
                 self._branch_missing = False
+                self._invalidate_tree_cache()
                 return self._branch_head()
         try:
             data = self._json(

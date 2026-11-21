@@ -2,19 +2,17 @@ import base64
 import datetime
 import json
 import time
+from typing import List
+from unittest.mock import Mock, patch
 
 import pytest
-from unittest.mock import Mock, MagicMock, patch
-from typing import List
 from github import Github, GithubException
-from github.Repository import Repository
 from github.ContentFile import ContentFile
 from github.GitTreeElement import GitTreeElement
+from github.Repository import Repository
 
 from tgdcfs.config import GithubRepoConfig
 from tgdcfs.core.model import FileStat, TGFSDirectory, TGFSFileRef, TGFSMetadata
-from tgdcfs.crypto.path_names import encrypt_path_name
-from tgdcfs.errors import MetadataNotInitialized, TechnicalError
 from tgdcfs.core.repository.impl.metadata.breaker import FailFastRepository
 from tgdcfs.core.repository.impl.metadata.github_repo import (
     GithubRepoMetadataRepository,
@@ -27,6 +25,8 @@ from tgdcfs.core.repository.impl.metadata.github_repo.gh_directory import (
     GithubConfig,
     GithubDirectory,
 )
+from tgdcfs.crypto.path_names import encrypt_path_name
+from tgdcfs.errors import MetadataNotInitialized, TechnicalError
 
 
 def mock_tree(repo, paths, truncated=False):
@@ -930,7 +930,9 @@ class TestGithubDirectory:
         assert file_ref not in directory.files
 
     def test_delete_directory(self, mock_ghc):
-        """Deleting a directory rewrites the tree without its whole subtree."""
+        """Deleting a directory overlays a delta that drops its subtree:
+        only the removed paths are named, unrelated blobs survive via the
+        base tree."""
 
         def blob(path):
             e = Mock()
@@ -969,9 +971,19 @@ class TestGithubDirectory:
 
         directory.delete()
 
-        # New tree keeps only the unrelated blob (both testdir blobs dropped).
-        kept = mock_ghc.repo.create_git_tree.call_args[0][0]
-        assert len(kept) == 1
+        # The delta names the two removed blobs (the nested one included);
+        # the unrelated blob is not named and survives via the base tree.
+        elements = mock_ghc.repo.create_git_tree.call_args[0][0]
+        assert [e._identity["path"] for e in elements] == [
+            "testdir/.gitkeep",
+            "testdir/sub/.gitkeep",
+        ]
+        assert all(
+            "sha" in e._identity
+            and e._identity["sha"] is None
+            and "content" not in e._identity
+            for e in elements
+        )
         mock_ghc.repo.get_git_tree.assert_called_once_with(
             "basetreesha", recursive=True
         )
@@ -1000,7 +1012,9 @@ class TestGithubDirectory:
         assert directory not in parent.children
 
     def test_move_directory(self, mock_ghc):
-        """Moving a directory re-paths its whole subtree in one commit."""
+        """Moving a directory overlays its subtree: each old path is removed
+        and re-added under the new prefix with the same blob sha, and
+        entries the move does not touch are not named."""
 
         def blob(path):
             e = Mock()
@@ -1043,12 +1057,26 @@ class TestGithubDirectory:
         moving.move_to(dest)
 
         elements = mock_ghc.repo.create_git_tree.call_args[0][0]
-        assert sorted(e._identity["path"] for e in elements) == [
-            "dest/moving/.gitkeep",
-            "dest/moving/sub/.gitkeep",
-            "dest/moving/sub/note.txt.7",
-            "other/.gitkeep",
-        ]
+        idents = [e._identity for e in elements]
+        deleted = {
+            i["path"] for i in idents if "sha" in i and i["sha"] is None
+        }
+        assert deleted == {
+            "src/moving/.gitkeep",
+            "src/moving/sub/.gitkeep",
+            "src/moving/sub/note.txt.7",
+        }
+        moved = {
+            i["path"]: i["sha"]
+            for i in idents
+            if "sha" in i and i["sha"] is not None
+        }
+        assert moved == {
+            "dest/moving/.gitkeep": "src/moving/.gitkeep-sha",
+            "dest/moving/sub/.gitkeep": "src/moving/sub/.gitkeep-sha",
+            "dest/moving/sub/note.txt.7": "src/moving/sub/note.txt.7-sha",
+        }
+        assert {"other/.gitkeep"}.isdisjoint(i["path"] for i in idents)
         ref.edit.assert_called_once_with("newcommitsha")
         assert dest.children == [moving]
         assert src.children == []
@@ -1574,6 +1602,66 @@ class TestPushFullSync:
 
     @patch("tgdcfs.core.repository.impl.metadata.github_repo.Github")
     @pytest.mark.asyncio
+    async def test_push_full_lands_a_big_delta_in_capped_commits(
+        self, mock_github_class, mock_github_config, mock_ghc
+    ):
+        """A delta bigger than one tree request arrives as several overlay
+        commits of at most TREE_OVERLAY_ACTION_LIMIT elements, chained by
+        base tree, with the branch moved once at the end: no request ever
+        names the whole repository (the full-tree rewrite that used to die
+        with GitHub's "your input was too large" 422 -- or took 26 minutes
+        -- on an 80k-file metadata store)."""
+        repository = self.build_repository(
+            mock_github_class, mock_github_config, mock_ghc
+        )
+        repository.metadata = self.plain_tree()
+        self.sync_tree(
+            mock_ghc.repo,
+            [f"stale/file.{n}" for n in range(2500)],
+        )
+
+        ref = Mock()
+        ref.object.sha = "commitsha"
+        base_commit = Mock()
+        base_commit.tree.sha = "basetreesha"
+        commits: list = []
+        mock_ghc.repo.get_git_ref.return_value = ref
+        mock_ghc.repo.get_git_commit.return_value = base_commit
+        mock_ghc.repo.create_git_tree.return_value = Mock()
+
+        def fake_commit(message, tree, parents):
+            commit = Mock()
+            commit.sha = f"commit{len(commits)}"
+            commits.append(commit)
+            return commit
+
+        mock_ghc.repo.create_git_commit.side_effect = fake_commit
+
+        await repository.push_full()
+
+        tree_calls = mock_ghc.repo.create_git_tree.call_args_list
+        chunks = [call[0][0] for call in tree_calls]
+        assert [len(chunk) for chunk in chunks] == [1000, 1000, 501]
+        # The created file ref (content only) leads the first chunk; the
+        # rest are deletes of the stale refs.
+        assert chunks[0][0]._identity["content"] == ""
+        assert chunks[0][0]._identity["path"] == "docs/readme.42"
+        assert all(
+            "sha" in e._identity and e._identity["sha"] is None
+            for e in chunks[0][1:] + chunks[1] + chunks[2]
+        )
+        bases = [call[1]["base_tree"] for call in tree_calls]
+        assert bases[0] is base_commit.tree
+        assert bases[1] is commits[0].tree
+        assert bases[2] is commits[1].tree
+        commit_calls = mock_ghc.repo.create_git_commit.call_args_list
+        assert commit_calls[0][0][2] == []
+        assert commit_calls[1][0][2] == [commits[0]]
+        assert commit_calls[2][0][2] == [commits[1]]
+        ref.edit.assert_called_once_with(commits[-1].sha)
+
+    @patch("tgdcfs.core.repository.impl.metadata.github_repo.Github")
+    @pytest.mark.asyncio
     async def test_push_full_deletes_stale_file_refs_but_keeps_foreign_files(
         self, mock_github_class, mock_github_config, mock_ghc
     ):
@@ -1605,24 +1693,24 @@ class TestPushFullSync:
         await repository.push_full()
 
         elements = mock_ghc.repo.create_git_tree.call_args[0][0]
-        paths = [e._InputGitTreeElement__path for e in elements]
-        # Created: the file ref of the tree. Kept: the stats file and the
-        # README. Deleted: the stale ref and the now-unneeded gitkeep (a
-        # directory with a blob beneath it no longer carries one).
-        assert "docs/readme.42" in paths
-        assert "docs/.gitkeep" not in paths
-        assert "docs/.tgdcfsstats.json" in paths
-        assert "README.md" in paths
-        assert "docs/oldfile.7" not in paths
-        kept = {
-            e._InputGitTreeElement__path: e._InputGitTreeElement__sha
-            for e in elements
-            if e._InputGitTreeElement__content != ""
+        idents = [e._identity for e in elements]
+        # Created: the file ref of the tree; deleted: the stale ref and
+        # the now-unneeded gitkeep (a directory with a blob beneath it no
+        # longer carries one). The stats file and the README are not named
+        # at all: the delta overlays the branch's current tree, so
+        # untouched paths survive without being re-sent.
+        created = {i["path"] for i in idents if "content" in i}
+        deleted = {
+            i["path"] for i in idents if "sha" in i and i["sha"] is None
         }
-        assert kept == {
-            "docs/.tgdcfsstats.json": "docs/.tgdcfsstats.json-sha",
-            "README.md": "README.md-sha",
-        }
+        assert created == {"docs/readme.42"}
+        assert deleted == {"docs/oldfile.7", "docs/.gitkeep"}
+        assert {"docs/.tgdcfsstats.json", "README.md"}.isdisjoint(
+            i["path"] for i in idents
+        )
+        # A create must carry content only: an element with a sha (even a
+        # null one) alongside content is rejected by GitHub with a 422.
+        assert all("sha" not in i for i in idents if "content" in i)
 
     @patch("tgdcfs.core.repository.impl.metadata.github_repo.Github")
     @pytest.mark.asyncio

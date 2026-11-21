@@ -76,6 +76,27 @@ the fact on the commits that shipped them.
   given, a few times before raising. A full-tree sync fires enough
   requests in a burst to hit the usage quota, and one un-retried 429
   failed the whole store write at boot.
+- Directory metadata deletes and moves no longer rewrite the whole
+  metadata tree. Deleting a folder over SFTP re-sent every blob it kept
+  as tree elements, and moving one re-sent them under a new prefix: on a
+  grown metadata repository a single request exceeded GitHub's "your
+  input was too large" processing limit (one sync of an 80k-entry store
+  answered with it until one landed after 26 minutes), and the whole
+  rewrite with it. Both now overwrite their path on top of the branch's
+  current tree with an overlay commit that names only the entries on it,
+  and a delta larger than one request arrives in chunks of at most 1000
+  elements chained by base tree with the branch moved once at the end.
+  The full sync commits its diff the same chunked way.
+- The GitLab metadata facade re-read the branch's whole recursive tree
+  (hundreds of paginated GETs on a grown repository) to diff every
+  overlay commit: each file drop, each stats commit, every sync chunk
+  paid that again, the rate limits it hit while doing so added 30 s
+  waits (measured: a single-file delete alone took 18 minutes), and
+  cumulative 429 retries on a big folder delete stretched it into hours.
+  The branch's listing is now cached and keyed to its head commit: comes
+  free, writes that land through the repository fold their actions back
+  in and files-API writes refresh the head once, and a write from
+  elsewhere invalidates the cache with one re-read.
 - Deleting a file through the protocols no longer leases out its own
   metadata commit per file. SFTP and WebDAV name one removal at a time,
   so a folder with 20k files used to pay two repository API calls per
