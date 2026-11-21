@@ -833,6 +833,76 @@ class GitlabRepository:
         )
         self._cache_file_write(path, b"", deleted=True)
 
+    def delete_subtree(self, path: str, keep_parent: bool) -> int:
+        """Remove only files under a pinned path, not the whole repo tree."""
+        head = self._branch_head()
+        cached = self._cached_blobs if self._cached_head == head else None
+        prefix = path + "/"
+        if cached is not None:
+            paths = [
+                entry.path
+                for entry in cached.values()
+                if entry.type == "blob" and entry.path.startswith(prefix)
+            ]
+        else:
+            self._invalidate_tree_cache()
+            try:
+                items = self._paginated(
+                    "/repository/tree",
+                    {"ref": head, "path": path, "recursive": "true"},
+                    resume_key=f"{head}:{path}",
+                )
+            except GithubException as ex:
+                if ex.status == 404:
+                    return 0
+                raise
+            paths = [
+                item["path"]
+                for item in items
+                if item["type"] == "blob" and item["path"].startswith(prefix)
+            ]
+        if not paths:
+            return 0
+
+        actions = [{"action": "delete", "file_path": item} for item in sorted(paths)]
+        if keep_parent:
+            marker = path.rsplit("/", 1)[0] + "/.gitkeep"
+            if not (
+                marker in cached
+                if cached is not None
+                else self._read_blob_paths([marker], head)
+            ):
+                actions.insert(
+                    0,
+                    {
+                        "action": "create",
+                        "file_path": marker,
+                        "encoding": "text",
+                        "content": "",
+                    },
+                )
+        try:
+            for offset in range(0, len(actions), GITLAB_COMMIT_ACTION_LIMIT):
+                if self._branch_head() != head:
+                    raise GithubException(
+                        409, {"message": "Metadata branch moved"}, None
+                    )
+                chunk = actions[offset : offset + GITLAB_COMMIT_ACTION_LIMIT]
+                head = self._post_commit(f"Delete directory {path}", chunk)
+                self._cache_actions(chunk, head)
+        except Exception:
+            self._invalidate_tree_cache()
+            raise
+        # Cached directory entries are not maintained by file-action commits.
+        # Drop the removed tree entries, or they can reappear when read back.
+        if cached is not None:
+            for entry in list(cached.values()):
+                if entry.type == "tree" and (
+                    entry.path == path or entry.path.startswith(path + "/")
+                ):
+                    cached.pop(entry.path, None)
+        return len(paths)
+
     def create_git_tree(
         self,
         elements: Sequence[InputGitTreeElement],
@@ -1298,6 +1368,7 @@ class GitlabTreeRepoMetadataRepository(GithubRepoMetadataRepository):
             name_key=name_key,
             repo=cast(Repository, self._gitlab),
         )
+        self._ghc.delete_subtree = self._gitlab.delete_subtree
 
     async def close(self) -> None:
         self._gitlab_breaker.stop()
@@ -1395,7 +1466,12 @@ class GitlabTreeRepoMetadataRepository(GithubRepoMetadataRepository):
         await super().push_full()
         await self._remove_document()
 
-    def _compact_history(self) -> None:
+    async def maintain(self) -> None:
+        if self._ghc.squash_history_max_commits > 0:
+            async with self._ghc.lock:
+                await self._ghc.write(self._compact_gitlab_history)
+
+    def _compact_gitlab_history(self) -> None:
         """The GitLab form of the history squash: the facade force-commits
         the branch's current state onto its oldest ancestor, since the
         commits API cannot create a parentless commit."""

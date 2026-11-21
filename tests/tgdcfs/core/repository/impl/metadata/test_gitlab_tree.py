@@ -1362,6 +1362,50 @@ def commit_posts(fake: FakeGitlab) -> List[dict]:
     ]
 
 
+@pytest.mark.parametrize("warm_cache", [False, True])
+async def test_gitlab_rmdir_limits_reads_and_deletes_to_the_subtree(
+    monkeypatch, warm_cache
+):
+    fake = FakeGitlab()
+    target_paths = ["parent/batch/file.1", "parent/batch/old/.tgdcfsstats.json"]
+    fake.commit(
+        "main",
+        "seed",
+        [
+            {"action": "create", "file_path": path, "content": "", "encoding": "text"}
+            for path in target_paths + ["parent/batch-other/file.2"]
+        ],
+    )
+    facade = _routed(monkeypatch, fake)
+    head = fake.branch_heads["main"]
+    if warm_cache:
+        facade.get_git_tree("main", recursive=True)
+    fake.requests.clear()
+    monkeypatch.setattr(gitlab_tree_mod, "GITLAB_COMMIT_ACTION_LIMIT", 2)
+
+    assert facade.delete_subtree("parent/batch", keep_parent=True) == len(target_paths)
+
+    expected = {"parent/batch-other/file.2", "parent/.gitkeep"}
+    assert fake.branch_files["main"].keys() == expected
+    assert [len(body["actions"]) for body in commit_posts(fake)] == [2, 1]
+    probes = [
+        params
+        for method, url, params, _ in fake.requests
+        if method == "GET" and url.endswith("/repository/tree")
+    ]
+    if warm_cache:
+        assert probes == []
+    else:
+        assert len(probes) == 1
+        assert probes[0]["path"] == "parent/batch"
+        assert probes[0]["ref"] == head
+    assert {
+        entry.path
+        for entry in facade.get_git_tree("main", recursive=True).tree
+        if entry.type == "blob"
+    } == expected
+
+
 class TestParallelBlobFetch:
     """``create_git_tree`` needs the content of every blob the branch
     does not hold at its path (a tree rewrite that moved it there); the

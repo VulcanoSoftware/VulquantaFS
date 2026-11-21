@@ -4,6 +4,7 @@ from typing import Any, Dict, Iterable, List, Optional, Self
 
 from tgdcfs.backends.base import normalize_store_key
 from tgdcfs.errors import (
+    DirectoryIsNotEmpty,
     FileOrDirectoryAlreadyExists,
     FileOrDirectoryDoesNotExist,
     InvalidPath,
@@ -463,6 +464,11 @@ class TGFSDirectory:
             self.children.clear()
             self.files.clear()
             self._touch_modified()
+
+    async def delete_empty_async(self) -> None:
+        if self.find_dirs() or self.find_files():
+            raise DirectoryIsNotEmpty(self.absolute_path)
+        self.delete()
 
     @property
     def absolute_path(self) -> str:

@@ -434,10 +434,8 @@ class ReplicatedMetadataRepository(IMetaDataRepository):
 
         Called periodically by the heal worker and safe to call any time;
         a store that is up to date costs nothing, and one that just came
-        back is brought in line with the current tree. The stores that
-        are healthy afterwards get their maintenance pass (history
-        compaction and the like), so the heal worker covers single-store
-        and replicated file systems alike.
+        back is brought in line with the current tree. Maintenance is
+        deliberately separate so history reads don't hold the write lock.
         """
         if self._initial_push is not None and not self._initial_push.done():
             return
@@ -450,6 +448,12 @@ class ReplicatedMetadataRepository(IMetaDataRepository):
         for store in self._stores:
             if store.key in self._stale or store.key in self._skipped:
                 await self._write(store, full=True)
+
+    async def maintain(self) -> None:
+        if not self.metadata or (
+            self._initial_push is not None and not self._initial_push.done()
+        ):
+            return
         for store in self._stores:
             if store.key in self._stale or store.key in self._skipped:
                 continue
