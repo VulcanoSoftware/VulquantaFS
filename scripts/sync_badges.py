@@ -19,7 +19,10 @@ to the upstream UI or image page -- and a renamed repository heals its
 own links on the next push. The Pages and Docker Hub links are matched
 case-insensitively: GitHub keeps the repository's display name in
 ``GITHUB_REPOSITORY`` while the URLs in the README may carry any
-lowercase or mixed-case spelling left over from before a rename.
+lowercase or mixed-case spelling left over from before a rename. The
+rewritten Pages URLs keep the repository's exact name, because GitHub
+Pages serves the site under that exact spelling and does not redirect an
+all-lowercase path.
 
 The web frontend in vulquantafs-gh-pages is not touched: it derives its Docker
 image names and Pages links from GITHUB_REPOSITORY and DOCKERHUB_NAMESPACE
@@ -55,9 +58,12 @@ UPSTREAM_REPOSITORY = "Xyvran/vulquantafs"
 
 def _canonical_pages_site(repository: str) -> str:
     owner, repo_name = repository.split("/", 1)
-    # GitHub Pages serves under lowercase owner and repository names;
-    # next.config.ts derives its links the same way.
-    return "https://{}.github.io/{}".format(owner.lower(), repo_name.lower())
+    # GitHub Pages serves under a lowercase owner subdomain but under the
+    # repository's exact name, capitals included: the site for
+    # vecstack-prog/VulquantaFS answers at /VulquantaFS/ and the
+    # all-lowercase path is a plain 404. next.config.ts and
+    # docusaurus.config.ts derive their base paths the same way.
+    return "https://{}.github.io/{}".format(owner.lower(), repo_name)
 
 
 def sync_text(
