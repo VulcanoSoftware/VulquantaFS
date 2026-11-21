@@ -17,15 +17,13 @@ All methods are blocking and run on the store's writer thread (or a
 import asyncio
 import base64
 import hashlib
-import io
 import json
 import logging
-import tarfile
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
-from typing import Any, Dict, Iterable, List, NamedTuple, Optional, Sequence, cast
+from typing import Any, Dict, List, NamedTuple, Optional, Sequence, cast
 from urllib.parse import quote
 
 import requests
@@ -59,15 +57,6 @@ def _blob_sha(data: bytes) -> str:
     ).hexdigest()
 
 
-def _tree_sha(path: str) -> str:
-    # A synthetic id for the tree rows an archive listing implies. GitLab's
-    # tree API cannot address a tree by id at all, so an id only has to be
-    # stable per path for a parent listing's tree rows to walk back.
-    return hashlib.sha1(
-        b"tree %d\0" % len(path) + path.encode(), usedforsecurity=False
-    ).hexdigest()
-
-
 # One listing page; the facade always follows the whole pagination, so a
 # load never silently misses the tail of a big repository the way a
 # truncated GitHub tree would.
@@ -97,11 +86,6 @@ GITLAB_COMMIT_ACTION_LIMIT = 500
 # none, and then the failure stands for the stale/heal machinery.
 RATE_LIMIT_RETRIES = 5
 RATE_LIMIT_MAX_SLEEP_SECONDS = 30.0
-
-# The tree export of a grown repository takes GitLab a moment to build
-# and serve; its download outruns the per-request waiting an ordinary
-# listing page needs.
-ARCHIVE_TIMEOUT_SECONDS = 300.0
 
 # How deep a history squash pages for its anchor (the oldest commit it
 # can force the branch onto): 1000 pages of PER_PAGE. Reaching the cap
@@ -270,49 +254,17 @@ class GitlabRepository:
         """The branch's tree entries, keyed by path, served from the cache
         while the head still is the one the cache was walked at.
 
-        A cache that does not match the head re-reads once -- one whole-
-        tree archive export when GitLab answers it, the paginated walk
-        when it does not -- and re-caches; callers translate a 404 (the
+        A cache that does not match the head re-reads once -- paginated,
+        like every listing -- and re-caches; callers translate a 404 (the
         branch is not there yet) to their own blank-page handling.
         """
         head = self._branch_head()
         if self._cached_head == head and self._cached_blobs is not None:
             return self._cached_blobs
-        try:
-            merged = self._entry_map(self._entries_from_archive(head))
-        except (
-            GithubException,
-            requests.exceptions.RequestException,
-            StoreUnreachable,
-            tarfile.TarError,
-        ) as ex:
-            # The export answered with any error but a missing branch:
-            # fall back to walking the tree page by page, exactly like the
-            # listing always did. Whatever the branch itself reports (its
-            # head, its absence), the walk reports like it always did.
-            logger.warning(
-                "GitLab tree archive export did not answer (%s); "
-                "listing the tree paginated",
-                ex,
-            )
-            merged = self._entry_map(self._entries_paginated())
-        self._cached_blobs = merged
-        self._cached_head = head
-        return self._cached_blobs
-
-    def _entry_map(self, entries: Iterable[_TreeEntry]) -> Dict[str, _TreeEntry]:
-        merged: Dict[str, _TreeEntry] = {}
-        for entry in entries:
-            merged[entry.path] = entry
-            if entry.type == "tree":
-                self._tree_paths[entry.sha] = entry.path
-        return merged
-
-    def _entries_paginated(self) -> List[_TreeEntry]:
         items = self._paginated(
             "/repository/tree", {"ref": self._branch, "recursive": "true"}
         )
-        return [
+        entries = [
             _TreeEntry(
                 path=item["path"],
                 type=item["type"],
@@ -321,62 +273,12 @@ class GitlabRepository:
             )
             for item in items
         ]
-
-    def _entries_from_archive(self, ref: str) -> List[_TreeEntry]:
-        """The branch's tree in one request: the tar.gz export of the
-        branch's head, translated back into the entries a ``repository/
-        tree`` listing reports -- every blob's git object id computed from
-        its content, every directory a row.
-
-        A paginated listing of a grown metadata repository is hundreds of
-        GETs; on a rate-limited store it is those GETs one 429-wave at a
-        time, which is exactly where a boot spent its first minutes. The
-        export costs one.
-        """
-        response = self._request(
-            "GET",
-            "/repository/archive.tar.gz",
-            params={"sha": ref},
-            timeout=ARCHIVE_TIMEOUT_SECONDS,
-        )
-        # GitLab wraps the export in one root directory named for the
-        # project and sha; the paths below it are the tree's own.
-        entries: Dict[str, _TreeEntry] = {}
-        with tarfile.open(fileobj=io.BytesIO(response.content), mode="r:gz") as archive:
-            for member in archive:
-                _, _, path = member.name.partition("/")
-                path = path.rstrip("/")
-                if not path:
-                    continue
-                if member.isdir():
-                    entries[path] = _TreeEntry(
-                        path=path, type="tree", sha=_tree_sha(path), mode="040000"
-                    )
-                elif member.isreg():
-                    stream = archive.extractfile(member)
-                    data = stream.read() if stream is not None else b""
-                    entries[path] = _TreeEntry(
-                        path=path,
-                        type="blob",
-                        sha=_blob_sha(data),
-                        mode="100755" if member.mode & 0o100 else "100644",
-                    )
-                elif member.issym() or member.islnk():
-                    data = member.linkname.encode("utf-8")
-                    entries[path] = _TreeEntry(
-                        path=path, type="blob", sha=_blob_sha(data), mode="120000"
-                    )
-        # A tar need not carry a row per directory; the paths of its files
-        # imply the tree rows, and the store's walk expects each parent.
-        for path in [e.path for e in entries.values() if e.type == "blob"]:
-            parts = path.split("/")
-            for depth in range(1, len(parts)):
-                parent = "/".join(parts[:depth])
-                if parent not in entries:
-                    entries[parent] = _TreeEntry(
-                        path=parent, type="tree", sha=_tree_sha(parent), mode="040000"
-                    )
-        return [entries[path] for path in sorted(entries)]
+        for entry in entries:
+            if entry.type == "tree":
+                self._tree_paths[entry.sha] = entry.path
+        self._cached_blobs = {entry.path: entry for entry in entries}
+        self._cached_head = head
+        return self._cached_blobs
 
     def _cache_actions(self, actions: List[dict], head: str) -> None:
         """Fold a commit that just landed through ``_post_commit`` into the
@@ -458,7 +360,6 @@ class GitlabRepository:
         params: Optional[dict] = None,
         json_body: Optional[dict] = None,
         retry_rate_limit: bool = True,
-        timeout: float = REQUEST_TIMEOUT_SECONDS,
     ) -> requests.Response:
         url = f"{self._base_url}/api/v4/projects/{self._project}{path}"
 
@@ -472,7 +373,7 @@ class GitlabRepository:
                 url,
                 params=params,
                 json=json_body,
-                timeout=timeout,
+                timeout=REQUEST_TIMEOUT_SECONDS,
             )
 
         attempts = RATE_LIMIT_RETRIES if retry_rate_limit else 1
