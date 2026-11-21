@@ -1,5 +1,6 @@
 import asyncio
 import datetime
+from typing import cast
 
 import asyncssh
 import pytest
@@ -7,7 +8,7 @@ from tgdcfs.app.sftp.server import USER_INFO_KEY, TGFSSFTPServer
 from tgdcfs.auth.user import AdminUser, ReadonlyUser
 from tgdcfs.config import SFTPConfig
 from tgdcfs.core import Client
-from tgdcfs.core.api import FileStatApi
+from tgdcfs.core.api import FileDescApi, FileStatApi
 from tgdcfs.core.model import FileStat, TGFSDirectory, TGFSFileDesc, TGFSFileVersion
 from tgdcfs.utils.time import ts
 from tests.tgdcfs.app.sftp.mocked_stats import MockedDescApi, mocked_stats
@@ -155,7 +156,9 @@ class TestScandir:
 
         metadata = mocker.Mock(load_stats=mocker.AsyncMock(side_effect=load_stats))
         client.file_api.stats = FileStatApi(
-            MockedDescApi(client), metadata_api=metadata, persist=True
+            cast(FileDescApi, MockedDescApi(client)),
+            metadata_api=metadata,
+            persist=True,
         )
 
         entries = {
