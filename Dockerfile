@@ -34,24 +34,24 @@ COPY --from=builder /usr/local/lib/python3.13/site-packages /usr/local/lib/pytho
 COPY --from=builder /usr/local/bin /usr/local/bin
 
 # Copy application code
-COPY tgdcfs/ ./tgdcfs/
+COPY vulquantafs/ ./vulquantafs/
 COPY asgidav/ ./asgidav/
 COPY main.py ./
 
 # Create non-root user
-RUN useradd --create-home --shell /bin/bash tgdcfs
-USER tgdcfs
+RUN useradd --create-home --shell /bin/bash vulquantafs
+USER vulquantafs
 
 # HTTP (WebDAV + manager API)
 EXPOSE 1900
-# SFTP, when tgdcfs.sftp.enabled is set in the config
+# SFTP, when vulquantafs.sftp.enabled is set in the config
 EXPOSE 2222
 
-# The application reads TGDCFS_DATA_DIR. Pin it so the data directory does not
+# The application reads VULQUANTAFS_DATA_DIR. Pin it so the data directory does not
 # depend on HOME or on the passwd entry of whatever user the container runs as
 # -- without it, `--user <uid with no passwd entry>` makes Python's expanduser
-# return "~/.tgdcfs" literally and the config is looked for under /app/~/.tgdcfs.
-ENV TGDCFS_DATA_DIR=/home/tgdcfs/.tgdcfs
+# return "~/.vulquantafs" literally and the config is looked for under /app/~/.vulquantafs.
+ENV VULQUANTAFS_DATA_DIR=/home/vulquantafs/.vulquantafs
 
 # Run the application
 CMD ["python", "main.py"]

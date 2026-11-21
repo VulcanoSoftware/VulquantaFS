@@ -17,7 +17,7 @@ import asyncio
 import time
 from typing import AsyncIterator, List
 
-from tgdcfs.utils.prefetching_chain import prefetching_chain
+from vulquantafs.utils.prefetching_chain import prefetching_chain
 
 CHUNK = b"x" * 1024
 

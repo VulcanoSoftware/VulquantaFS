@@ -8,12 +8,12 @@ ruff:
 
 test:
 	@echo "Running tests..."
-	@TGDCFS_DATA_DIR=. TGDCFS_CONFIG_FILE=config-test.yaml pytest
+	@VULQUANTAFS_DATA_DIR=. VULQUANTAFS_CONFIG_FILE=config-test.yaml pytest
 
 cov:
 	@echo "Running tests with coverage..."
-	@TGDCFS_DATA_DIR=. TGDCFS_CONFIG_FILE=config-test.yaml pytest --cov --cov-report=term-missing
+	@VULQUANTAFS_DATA_DIR=. VULQUANTAFS_CONFIG_FILE=config-test.yaml pytest --cov --cov-report=term-missing
 
 build-push:
 	@echo "Building the package..."
-	@docker buildx build --platform linux/amd64,linux/arm64 . -t xyvran/tgdcfs --push
+	@docker buildx build --platform linux/amd64,linux/arm64 . -t xyvran/vulquantafs --push

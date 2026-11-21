@@ -1,6 +1,6 @@
-# tgdcfs: Architecture and Implementation Plan
+# vulquantafs: Architecture and Implementation Plan
 
-Status: phases 0 to 4 implemented (see "Progress" at the end). This document plans how to build tgdcfs as a new
+Status: phases 0 to 4 implemented (see "Progress" at the end). This document plans how to build vulquantafs as a new
 project: the tgfs code base as the main part, plus Discord as a second
 storage backend that can be configured next to Telegram, either as the
 primary store or as a mirror, in both directions.
@@ -83,22 +83,22 @@ Consequences:
 
 ### 3.1 Repository
 
-* Create `tgdcfs` as a flat copy of the tgfs working tree (master at
+* Create `vulquantafs` as a flat copy of the tgfs working tree (master at
   the time of the copy) with one initial commit. The tgfs history is
   not carried over; the initial commit message records the tgfs commit
   hash the copy was taken from, so later tgfs fixes can be ported as
-  patches (`git format-patch` from tgfs, `sed 's#/tgfs/#/tgdcfs/#'`,
+  patches (`git format-patch` from tgfs, `sed 's#/tgfs/#/vulquantafs/#'`,
   `git am`). Keep the module layout of tgfs so those patches apply.
-* Rename the Python package from `tgfs` to `tgdcfs` in the same
+* Rename the Python package from `tgfs` to `vulquantafs` in the same
   initial step (imports, `TGFS_*` environment variables, `~/.tgfs`
   data dir, Docker user, `TGFS` realm strings, docs). Keep the class
   prefix `TGFS` in the model (`TGFSFileDesc`, ...) for now; renaming
   those touches the serialized `type` tags in metadata and buys nothing.
 * Not copied: `tgfs.png`, the tgfs-specific badges and the GitHub Pages
   URL in the README; the `tgfs-gh-pages` frontend is copied as
-  `tgdcfs-gh-pages` and gets its own Pages deployment in phase 4.
-* Environment variables become `TGDCFS_DATA_DIR`, `TGDCFS_CONFIG_FILE`,
-  `TGDCFS_MASTER_PASSPHRASE`. Accept the old `TGFS_*` names as fallback
+  `vulquantafs-gh-pages` and gets its own Pages deployment in phase 4.
+* Environment variables become `VULQUANTAFS_DATA_DIR`, `VULQUANTAFS_CONFIG_FILE`,
+  `VULQUANTAFS_MASTER_PASSPHRASE`. Accept the old `TGFS_*` names as fallback
   for one release, with a deprecation log line.
 
 ### 3.2 Build and CI
@@ -106,25 +106,25 @@ Consequences:
 * `pyproject.toml`: add `discord.py` and `aiohttp` as explicit
   dependencies. Python 3.13 stays.
 * GitHub Actions: copy `test.yml`, `docker-publish.yml`,
-  `docker-preview.yml`, `gh-pages.yml`; image names `xyvran/tgdcfs` and
-  `xyvran/tgdcfs-fe`.
+  `docker-preview.yml`, `gh-pages.yml`; image names `xyvran/vulquantafs` and
+  `xyvran/vulquantafs-fe`.
 * The build pipeline has to be set up again for the new repository,
   nothing carries over from tgfs: create the Docker Hub repositories
-  `xyvran/tgdcfs` and `xyvran/tgdcfs-fe`, add the `DOCKERHUB_USERNAME`
+  `xyvran/vulquantafs` and `xyvran/vulquantafs-fe`, add the `DOCKERHUB_USERNAME`
   and `DOCKERHUB_TOKEN` secrets, enable GitHub Pages for the frontend,
   and run the multi-arch build (linux/amd64 + linux/arm64) once by hand
   (`workflow_dispatch`) before the first tag. Existing tgfs deployments
   (web1, Jellyfin on Hetzner, the home PVE server) keep the `xyvran/tgfs`
-  image until they are switched to `xyvran/tgdcfs` deliberately.
+  image until they are switched to `xyvran/vulquantafs` deliberately.
 * Dockerfile: identical to tgfs apart from the package name, the user
-  (`tgdcfs`) and the data dir.
+  (`vulquantafs`) and the data dir.
 * Keep `docs/design/` and add this document, later one design doc per
   phase where the phase changes a data format.
 
 ### 3.3 Package layout (target state)
 
 ```
-tgdcfs/
+vulquantafs/
   config.py                 # schema v2 + legacy tgfs loader
   reqres.py                 # unchanged request/response dataclasses
   backends/
@@ -157,7 +157,7 @@ Today tgfs has three layers that know about Telegram:
    `TGMsgMetadataRepository`) and `FileUploader`.
 
 dcfs kept exactly this shape and swapped the implementations, so the
-seam is already known. tgdcfs introduces one explicit interface at layer
+seam is already known. vulquantafs introduces one explicit interface at layer
 2, the **store**, and makes the repositories depend on it only:
 
 ```python
@@ -217,7 +217,7 @@ range download. Improvements to make while porting:
 
 Mirror maps in the metadata are keyed by a string that must be stable
 for the life of the data and unique across backends. tgfs uses the
-channel id as written in the config. tgdcfs uses
+channel id as written in the config. vulquantafs uses
 
 ```
 <backend>:<channel id as written in config>     e.g. tg:-1001234567890, dc:1234567890123456789
@@ -239,7 +239,7 @@ in the metadata, so renaming a store in the config is safe.
 
 `mirrors` requires the copy to have the same number of parts as the
 primary. That holds for Telegram forwarding and breaks for everything
-else. tgdcfs adds a second, general map and keeps `mirrors` as the
+else. vulquantafs adds a second, general map and keeps `mirrors` as the
 compact special case:
 
 ```json
@@ -279,7 +279,7 @@ and far above Discord's. Two measures, both from dcfs:
    `messageIds` keeps its format for compatibility.
 2. Transparent overflow in `send_text`/`edit_text`/`get_text` of every
    store: text longer than `caps.max_text_chars` is sent as a small
-   document (`fd.json`, caption `TGDCFS_OVERFLOW`) and read back through
+   document (`fd.json`, caption `VULQUANTAFS_OVERFLOW`) and read back through
    `download`. The repositories never see the difference. Telegram
    descriptors that fit stay plain text, so existing installations keep
    their current on-channel format until a descriptor actually grows.
@@ -306,7 +306,7 @@ deletes, mark the primary dead) but with pluggable replicators:
 
 Timing. tgfs replicates synchronously inside `save()`, which is fine for
 a forward (one RPC) and unacceptable for a reupload into Discord (a
-2 GiB PUT would wait for 200 rate-limited uploads). tgdcfs therefore
+2 GiB PUT would wait for 200 rate-limited uploads). vulquantafs therefore
 adds a replication queue:
 
 * `sync: inline | background` per file system, default `inline` for
@@ -516,7 +516,7 @@ distribution worker moves the version from the cache into the primary
 and every mirror at the same time.
 
 **What it buys.** The client's upload runs at the speed of the link to
-the tgdcfs host, not of the slowest backend; a FloodWait or a Discord
+the vulquantafs host, not of the slowest backend; a FloodWait or a Discord
 rate limit never stalls a client; primary and mirrors are filled in
 parallel from one local file instead of one after the other; and the
 Telegram store can push several parts of one version at once, which the
@@ -563,7 +563,7 @@ when the source is seekable, that is a cache file.
 **Reading a pending version.** On the instance that holds the cache,
 `get()` serves a pending version from the cache file, so a client that
 uploads and downloads sees its own write at once. Every other reader
-(a second tgdcfs instance on the same channel, tgsaver, the mini app's
+(a second vulquantafs instance on the same channel, tgsaver, the mini app's
 import) must treat a version without message ids as invalid, exactly as
 `_validate_fv` does today, and therefore sees the previous version until
 distribution completes. The `pending` flag is only serialized when set,
@@ -637,7 +637,7 @@ several bots at once need a seekable source, which is the cache
 
 ## 5. Configuration
 
-Schema v2. Everything under `tgdcfs:` is the old `tgfs:` block, renamed.
+Schema v2. Everything under `vulquantafs:` is the old `tgfs:` block, renamed.
 The old `telegram:` block with `private_file_channel` and `redundancy` is
 still accepted and translated into stores and file systems on load, so
 a tgfs `config.yaml` works as is.
@@ -683,7 +683,7 @@ filesystems:
     mirrors: [tg-main]
     metadata: {type: pinned_message}
 
-tgdcfs:
+vulquantafs:
   users: {...}
   jwt: {...}
   server: {host: 0.0.0.0, port: 1900}
@@ -775,7 +775,7 @@ configs; manager UI for queue and backfill progress.
 its own:
 
 Every step that adds a config field adds it to the config generator
-(`tgdcfs-gh-pages/app/config-generator`) in the same step, with the
+(`vulquantafs-gh-pages/app/config-generator`) in the same step, with the
 loader's validation mirrored in the form and the field left out of the
 YAML when it equals the default (as `sync` is since Phase 4). A field
 the generator does not know is a field the next deployment gets wrong.
@@ -858,7 +858,7 @@ of scope for now.
   volume is as safe as the channel, but it is still a copy of the data
   on the host: say so in the README. A full or slow disk must never
   fail a transfer, which is why every cache error is a bypass. The
-  budget is enforced by tgdcfs, not by the file system; running the
+  budget is enforced by vulquantafs, not by the file system; running the
   cache dir on a volume shared with other data needs headroom for one
   version above the budget while a staging write is in flight.
 * **Write-back durability (Phase 5).** With `write_ack: cache` a
@@ -881,7 +881,7 @@ of scope for now.
 
 Decisions taken (2026-09-24):
 
-1. The package is named `tgdcfs`.
+1. The package is named `vulquantafs`.
 2. The repository starts from a flat copy of tgfs with one initial
    commit, not from the tgfs history. Build artefacts (Docker images,
    Pages) are set up fresh for the new repository, see section 3.2.
@@ -898,8 +898,8 @@ deprecation warning, on-disk format constants kept.
 
 ### Phase 1 (done)
 
-* `tgdcfs/backends/base.py`: `IStore`, `StoreCapabilities`, store keys
-  (`make_store_key`, `normalize_store_key`). `tgdcfs/backends/telegram/`
+* `vulquantafs/backends/base.py`: `IStore`, `StoreCapabilities`, store keys
+  (`make_store_key`, `normalize_store_key`). `vulquantafs/backends/telegram/`
   holds the moved Telegram code; `TelegramStore` (formerly `MessageApi`)
   owns the 2 GiB partitioning, `replace_document`, `copy_within` and
   `copy_from`; `factory.py` logs in and builds stores.
@@ -955,7 +955,7 @@ first bot runs):
 | Bulk delete | at most 100 ids, none older than 14 days; older ones one by one |
 | Pins | `channel.pins()` is a paginated iterator since discord.py 2.6 |
 
-Implemented in `tgdcfs/backends/discord/`: `client.py` (discord.py
+Implemented in `vulquantafs/backends/discord/`: `client.py` (discord.py
 wrapper: send, edit, fetch, pins, deletion split by message age, CDN
 range download that slices a 200 answer itself), `store.py`
 (`DiscordStore`: partitioning at `max_file_size_bytes`, descriptor
@@ -990,7 +990,7 @@ messages (replicas with their own part layout).
   stopped. `read_preference` reorders them. Validation
   (`StoreFDRepository._validate_fv`) accepts a version whose aligned
   copies are gone when a replica is complete.
-* `tgdcfs/core/replication.py`: persistent `ReplicationQueue`
+* `vulquantafs/core/replication.py`: persistent `ReplicationQueue`
   (`replication_queue.json`) and one `ReplicationWorker` per file
   system with `sync: background`; the write path records the primary
   copy and queues the file, the worker runs the backfill's per-file
@@ -1006,7 +1006,7 @@ messages (replicas with their own part layout).
   configs; NOTICE.
 * Manager API: `/stores`, `/filesystems`, `/replication/queue`,
   `/replication/retry`, backfill kept.
-* Config generator (`tgdcfs-gh-pages/app/config-generator`): rebuilt
+* Config generator (`vulquantafs-gh-pages/app/config-generator`): rebuilt
   around the current layout. Stores (name, backend, channel) and file
   systems (primary, mirrors, copy mode, sync, strict, shared-store
   flag, metadata type) with the loader's validation rules mirrored in
@@ -1025,7 +1025,7 @@ messages (replicas with their own part layout).
 
 ### Phase 5 (done)
 
-* `tgdcfs/core/local_cache.py`: `LocalCache` on the data volume
+* `vulquantafs/core/local_cache.py`: `LocalCache` on the data volume
   (entries keyed by version id, sparse `<id>.bin` plus a `<id>.map`
   block map, `index.json`; budget by size, count and largest version;
   LRU over unpinned entries, pins survive a restart, disk errors are a
@@ -1033,7 +1033,7 @@ messages (replicas with their own part layout).
   streams to the primary; `FileMessageFromCache` is the seekable source
   the stores upload from; `version_cache_for` hands the read side a
   per-version filler. The cache sits below the encryption decorator, so
-  it holds ciphertext. Config: `tgdcfs.cache` (`CacheConfig`).
+  it holds ciphertext. Config: `vulquantafs.cache` (`CacheConfig`).
 * Mirroring reads from the cache: `MirrorGroup.mirror_parts`,
   `_replicate` and `_copy_to` take the cache and re-upload from disk
   when the version is there, downloading only the missing ranges.
@@ -1054,7 +1054,7 @@ messages (replicas with their own part layout).
   fetches only the missing blocks; pending versions are served from the
   cache on the instance that holds it; pinned metadata blobs are never
   cached (`cacheable = False`).
-* Multi-source reads (`tgdcfs/core/multisource.py`): `MultiSourceRead`
+* Multi-source reads (`vulquantafs/core/multisource.py`): `MultiSourceRead`
   cuts a range into pieces, every `StoreView` runs `read_slots` workers
   that steal the next unclaimed piece, output is reordered through a
   window of `transfer.read_parallel_window` pieces, a failed piece moves

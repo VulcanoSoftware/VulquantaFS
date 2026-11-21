@@ -6,7 +6,7 @@ description: REST endpoints reference for system status, stores, cache, and repl
 
 # 📡 Management API & Monitoring
 
-TGDCFS provides a RESTful **Manager API** served on port `1900` under `/api`.
+VulquantaFS provides a RESTful **Manager API** served on port `1900` under `/api`.
 
 ---
 
@@ -14,8 +14,8 @@ TGDCFS provides a RESTful **Manager API** served on port `1900` under `/api`.
 
 Every request on the HTTP server — including `/api` and `/webdav` — requires an `Authorization` header (only `OPTIONS` and `POST /login` are exempt). Two schemes are accepted:
 
-- **Basic**: `Authorization: Basic <base64(username:password)>`, checked against the users configured under `tgdcfs.users`.
-- **Bearer**: `Authorization: Bearer <jwt_token>`, a JWT signed with the `tgdcfs.jwt` secret:
+- **Basic**: `Authorization: Basic <base64(username:password)>`, checked against the users configured under `vulquantafs.users`.
+- **Bearer**: `Authorization: Bearer <jwt_token>`, a JWT signed with the `vulquantafs.jwt` secret:
 
 ```http
 Authorization: Bearer <jwt_token>
@@ -25,7 +25,7 @@ Tokens are issued by the login endpoint on the same server:
 
 #### `POST /login`
 
-Body: `{"username": "...", "password": "..."}`. Returns `{"token": "<jwt_token>"}`. The token carries the user's `readonly` flag and expires after `tgdcfs.jwt.life` seconds. `/login` itself requires no `Authorization` header. When no users are configured at all, an anonymous read-only token is returned without credentials.
+Body: `{"username": "...", "password": "..."}`. Returns `{"token": "<jwt_token>"}`. The token carries the user's `readonly` flag and expires after `vulquantafs.jwt.life` seconds. `/login` itself requires no `Authorization` header. When no users are configured at all, an anonymous read-only token is returned without credentials.
 
 Read-only users may call read-only endpoints; write operations (such as `POST /api/cache/evict`, `POST /api/import` or replication retries) answer `403 Forbidden` for them.
 
@@ -92,7 +92,7 @@ Reports local disk cache status. When the cache is disabled, returns `{"enabled"
 ```json
 {
   "enabled": true,
-  "directory": "/home/tgdcfs/.tgdcfs/cache",
+  "directory": "/home/vulquantafs/.vulquantafs/cache",
   "entries": 42,
   "complete_entries": 40,
   "used_bytes": 1073741824,
@@ -156,7 +156,7 @@ Imports a pre-existing Telegram message document into the virtual file system. B
 curl -f -u probe_user:probe_password http://localhost:1900/api/stores || exit 1
 ```
 
-When `tgdcfs.users` is empty, any Basic credentials are accepted (as the read-only `anonymous` user), but the header must still be present.
+When `vulquantafs.users` is empty, any Basic credentials are accepted (as the read-only `anonymous` user), but the header must still be present.
 
 ### Transport security and CORS
 

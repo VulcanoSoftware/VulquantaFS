@@ -6,16 +6,16 @@ description: Learn how to manage files using the Telegram Mini App interface.
 
 # 📱 Telegram Mini App & Web Explorer
 
-TGDCFS includes a built-in **Telegram Mini App** interface. This web interface allows you to view, explore, and manage your stored files directly from inside Telegram or via a browser.
+VulquantaFS includes a built-in **Telegram Mini App** interface. This web interface allows you to view, explore, and manage your stored files directly from inside Telegram or via a browser.
 
 ---
 
 ## Accessing the Mini App
 
-The Mini App is a web page served by the TGDCFS frontend, separate from your TGDCFS server (the server does not set up a bot menu button itself). Open it in a browser, or inside Telegram if you configured it as the Mini App of your bot (for example through BotFather).
+The Mini App is a web page served by the VulquantaFS frontend, separate from your VulquantaFS server (the server does not set up a bot menu button itself). Open it in a browser, or inside Telegram if you configured it as the Mini App of your bot (for example through BotFather).
 
 1. Open the Mini App page.
-2. Enter the URL of your TGDCFS server (it must be `https://` when the page itself is served over HTTPS) and your username and password, or choose anonymous access when the server has no users configured.
+2. Enter the URL of your VulquantaFS server (it must be `https://` when the page itself is served over HTTPS) and your username and password, or choose anonymous access when the server has no users configured.
 3. The file explorer loads once the login succeeds.
 
 ---
@@ -43,9 +43,9 @@ Tap on the **Mirrors and replication** icon in the header bar to inspect the bac
 
 ## Importing Pre-existing Files on Telegram
 
-If you already have files uploaded to a Telegram channel before setting up TGDCFS, you can import them into your file system using the Mini App:
+If you already have files uploaded to a Telegram channel before setting up VulquantaFS, you can import them into your file system using the Mini App:
 
 0. The message must be in the Telegram channel that is the primary store of the file system you import into; forward it there first if it is not.
 1. Copy the Telegram message link or ID of the file in your channel.
 2. Open the Mini App and go to the target directory.
-3. Use the **Import** feature to add the file directly into your TGDCFS virtual file system without downloading and re-uploading the data!
+3. Use the **Import** feature to add the file directly into your VulquantaFS virtual file system without downloading and re-uploading the data!

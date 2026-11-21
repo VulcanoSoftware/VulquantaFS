@@ -6,7 +6,7 @@ description: Guide to running unit tests, static typechecking, linting, and smok
 
 # 🧪 Local Testing & Quality Assurance
 
-TGDCFS maintains high test coverage and strict type safety. All code changes must pass unit tests, type checks, and linter rules before being merged.
+VulquantaFS maintains high test coverage and strict type safety. All code changes must pass unit tests, type checks, and linter rules before being merged.
 
 ---
 
@@ -36,14 +36,14 @@ The test suite contains over 75 test modules covering all subsystems (`tests/`).
 The tests read a configuration through the environment. The Makefile targets set it for you:
 
 ```bash
-make test   # TGDCFS_DATA_DIR=. TGDCFS_CONFIG_FILE=config-test.yaml pytest
+make test   # VULQUANTAFS_DATA_DIR=. VULQUANTAFS_CONFIG_FILE=config-test.yaml pytest
 make cov    # same, with --cov --cov-report=term-missing
 ```
 
 When invoking `pytest` directly, export the variables first — without them many test modules fail at collection because no config file is found:
 
 ```bash
-TGDCFS_DATA_DIR=. TGDCFS_CONFIG_FILE=config-test.yaml poetry run pytest
+VULQUANTAFS_DATA_DIR=. VULQUANTAFS_CONFIG_FILE=config-test.yaml poetry run pytest
 ```
 
 Run the complete test suite:
@@ -53,17 +53,17 @@ make test
 
 Run a specific test file:
 ```bash
-poetry run pytest tests/tgdcfs/core/test_local_cache.py
+poetry run pytest tests/vulquantafs/core/test_local_cache.py
 ```
 
 Run a specific test function with verbose output:
 ```bash
-poetry run pytest tests/tgdcfs/core/test_replication.py -k "test_reads_fall_over_to_the_replica" -v
+poetry run pytest tests/vulquantafs/core/test_replication.py -k "test_reads_fall_over_to_the_replica" -v
 ```
 
 Generate test coverage report:
 ```bash
-poetry run pytest --cov=tgdcfs --cov-report=term-missing
+poetry run pytest --cov=vulquantafs --cov-report=term-missing
 ```
 
 ---
@@ -72,7 +72,7 @@ poetry run pytest --cov=tgdcfs --cov-report=term-missing
 
 You **do not need live Telegram or Discord API tokens** to write or run unit tests!
 
-TGDCFS provides a feature-rich in-memory fake store implementation in `tests/fakes/store.py`:
+VulquantaFS provides a feature-rich in-memory fake store implementation in `tests/fakes/store.py`:
 - `FakeStore`: Implements `IStore` entirely in memory.
 - Configurable capabilities (`max_part_bytes`, `max_text_chars`, `supports_server_copy`).
 - Fault injection: Simulate network timeouts, `FloodWait` rate limits, transient channel errors, or dead stores.
@@ -93,9 +93,9 @@ async def test_fake_store_send_and_fetch():
         server_copy=False,
     )
 
-    msg_id = await store.send_text("Hello TGDCFS")
+    msg_id = await store.send_text("Hello VulquantaFS")
     [message] = await store.get_messages([msg_id])
-    assert message.text == "Hello TGDCFS"
+    assert message.text == "Hello VulquantaFS"
 ```
 
 Fault injection is a set of method names: `store.fail.add("download_file")` makes the next `download_file` calls raise, which is how the replication and failover tests simulate network trouble.
@@ -104,7 +104,7 @@ Fault injection is a set of method names: `store.fail.add("download_file")` make
 
 ## 3. Static Typechecking with `mypy`
 
-TGDCFS uses strict `mypy` configuration for full static type coverage:
+VulquantaFS uses strict `mypy` configuration for full static type coverage:
 
 ```bash
 poetry run mypy .
@@ -118,7 +118,7 @@ Ensure no type errors (`Success: no issues found in XX source files`) remain.
 
 ## 4. Linting & Code Style with `ruff`
 
-TGDCFS uses **Ruff** for fast linting and code formatting:
+VulquantaFS uses **Ruff** for fast linting and code formatting:
 
 ```bash
 # Check code for lint errors
@@ -138,6 +138,6 @@ make ruff
 To verify that a built Docker image or container starts properly and serves SFTP/WebDAV requests:
 
 ```bash
-docker run --rm -v "$PWD/scripts:/app/scripts:ro" <namespace>/tgdcfs:latest \
+docker run --rm -v "$PWD/scripts:/app/scripts:ro" <namespace>/vulquantafs:latest \
   python scripts/docker_smoke_check.py
 ```

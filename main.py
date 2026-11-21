@@ -16,18 +16,18 @@ except ImportError:
 from uvicorn.config import Config as UvicornConfig
 from uvicorn.server import Server
 
-from tgdcfs.app import create_app
-from tgdcfs.app.sftp import start_sftp_server
-from tgdcfs.backends.base import IStore
-from tgdcfs.backends.discord import factory as discord
-from tgdcfs.backends.telegram import factory as telegram
-from tgdcfs.config import Config, StoreConfig, get_config
-from tgdcfs.core import Client, Clients
-from tgdcfs.core.client import StoreFactory
-from tgdcfs.core.local_cache import CacheSweeper, LocalCache
-from tgdcfs.core.metadata_healing import MetadataHealWorker
-from tgdcfs.core.replication import ReplicationQueue, ReplicationWorker
-from tgdcfs.utils.message_cache import set_message_cache_size
+from vulquantafs.app import create_app
+from vulquantafs.app.sftp import start_sftp_server
+from vulquantafs.backends.base import IStore
+from vulquantafs.backends.discord import factory as discord
+from vulquantafs.backends.telegram import factory as telegram
+from vulquantafs.config import Config, StoreConfig, get_config
+from vulquantafs.core import Client, Clients
+from vulquantafs.core.client import StoreFactory
+from vulquantafs.core.local_cache import CacheSweeper, LocalCache
+from vulquantafs.core.metadata_healing import MetadataHealWorker
+from vulquantafs.core.replication import ReplicationQueue, ReplicationWorker
+from vulquantafs.utils.message_cache import set_message_cache_size
 
 
 async def create_store_factory(config: Config) -> StoreFactory:
@@ -60,9 +60,9 @@ async def create_store_factory(config: Config) -> StoreFactory:
 
 def create_cache(config: Config) -> Optional[LocalCache]:
     """The local cache when the config turns it on; loaded from disk."""
-    if not config.tgdcfs.cache.enabled:
+    if not config.vulquantafs.cache.enabled:
         return None
-    cache = LocalCache(config.tgdcfs.cache)
+    cache = LocalCache(config.vulquantafs.cache)
     cache.load()
     return cache
 
@@ -81,7 +81,7 @@ async def create_clients(
             filesystem,
             config,
             store_factory,
-            encryption_cfg=config.tgdcfs.encryption,
+            encryption_cfg=config.vulquantafs.encryption,
             replication=replication,
             cache=cache,
         )
@@ -154,7 +154,7 @@ async def main():
     logger = logging.getLogger(__name__)
     config = get_config()
     # Before the first store exists, so every channel starts at this size.
-    set_message_cache_size(config.tgdcfs.listing.message_cache_size)
+    set_message_cache_size(config.vulquantafs.listing.message_cache_size)
 
     replication = ReplicationQueue(config.replication_queue_file)
     cache = create_cache(config)
@@ -175,7 +175,10 @@ async def main():
 
     try:
         await run_server(
-            app, config.tgdcfs.server.host, config.tgdcfs.server.port, "TGDCFS"
+            app,
+            config.vulquantafs.server.host,
+            config.vulquantafs.server.port,
+            "VulquantaFS",
         )
     finally:
         for worker in workers:

@@ -1,4 +1,4 @@
-"""Tests for :mod:`tgdcfs.crypto.names`.
+"""Tests for :mod:`vulquantafs.crypto.names`.
 
 Covers the basic round-trip property, the AAD-free GCM authentication, the
 "randomized" property (same plaintext produces different ciphertexts), and
@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import pytest
 
-from tgdcfs.crypto.names import (
+from vulquantafs.crypto.names import (
     NAME_PREFIX,
     NameEncryptionError,
     decrypt_name,
@@ -119,7 +119,7 @@ def test_tampered_ciphertext_fails_authentication() -> None:
 
 def test_decrypt_rejects_missing_prefix() -> None:
     with pytest.raises(NameEncryptionError):
-        decrypt_name(_key(), "not-a-tgdcfs-name")
+        decrypt_name(_key(), "not-a-vulquantafs-name")
 
 
 def test_decrypt_rejects_truncated_blob() -> None:

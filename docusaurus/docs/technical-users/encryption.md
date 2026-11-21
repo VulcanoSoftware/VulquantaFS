@@ -6,7 +6,7 @@ description: Detailed technical breakdown of client-side AES-256-GCM encryption.
 
 # 🔒 Security & At-Rest Encryption
 
-When `tgdcfs.encryption.enabled: true` is set, TGDCFS performs **client-side at-rest encryption** before transmitting any data over the network. Telegram channels, Discord channels, and GitHub metadata repositories store **only ciphertext**.
+When `vulquantafs.encryption.enabled: true` is set, VulquantaFS performs **client-side at-rest encryption** before transmitting any data over the network. Telegram channels, Discord channels, and GitHub metadata repositories store **only ciphertext**.
 
 ---
 
@@ -27,7 +27,7 @@ When `tgdcfs.encryption.enabled: true` is set, TGDCFS performs **client-side at-
 ```
 
 ### 1. Key Derivation (Argon2id + HKDF)
-- **Master Key**: Derived from your secret passphrase using **Argon2id** and a 16-byte random salt stored in `$TGDCFS_DATA_DIR/master.salt`.
+- **Master Key**: Derived from your secret passphrase using **Argon2id** and a 16-byte random salt stored in `$VULQUANTAFS_DATA_DIR/master.salt`.
 - **Per-File Key**: Generated for each uploaded file using **HKDF-SHA256** from the Master Key and a 32-byte cryptographically secure random salt generated per file.
 
 The Argon2id parameters are fixed in code (time cost 3, 64 MiB memory, parallelism 4, 32-byte output) and the HKDF info string is the constant `tgfs-file-key-v1` inherited from tgfs; neither is configurable, and changing them would make existing files unreadable.
@@ -64,7 +64,7 @@ Inside WebDAV, SFTP, the Manager API, and the Telegram Mini App, file and direct
 
 ## Master Salt Management (`master.salt`)
 
-The master salt file (`master.salt`) is created automatically on first boot in `$TGDCFS_DATA_DIR/master.salt` with mode `0600`.
+The master salt file (`master.salt`) is created automatically on first boot in `$VULQUANTAFS_DATA_DIR/master.salt` with mode `0600`.
 
 - **Is it secret?** No, the salt is non-secret, but it is **strictly required** to re-derive the Master Key from your passphrase.
 - **Backup Rule**: You **must** back up `master.salt` alongside your passphrase.
@@ -76,7 +76,7 @@ The master salt file (`master.salt`) is created automatically on first boot in `
 
 Passphrase resolution checks sources in this priority order:
 
-1. `passphrase_env`: Environment variable name (e.g. `TGDCFS_MASTER_PASSPHRASE`). Recommended for Docker.
+1. `passphrase_env`: Environment variable name (e.g. `VULQUANTAFS_MASTER_PASSPHRASE`). Recommended for Docker.
 2. `passphrase_file`: File path containing passphrase. Recommended for systemd `LoadCredential`.
 3. `passphrase`: Plaintext string in `config.yaml` (Development only).
 
