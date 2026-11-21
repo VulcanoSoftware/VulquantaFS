@@ -39,7 +39,7 @@ from tgdcfs.auth.basic import authenticate
 from tgdcfs.auth.user import AdminUser, ReadonlyUser, User
 from tgdcfs.config import Config
 from tgdcfs.core import Client, Clients, Ops
-from tgdcfs.core.model import TGFSDirectory
+from tgdcfs.core.model import FileStat, TGFSDirectory
 from tgdcfs.errors import (
     DirectoryIsNotEmpty,
     FileOrDirectoryAlreadyExists,
@@ -254,7 +254,13 @@ class TGFSSFTPServer(asyncssh.SFTPServer):
         # The stat API reports the logical size: with encryption on that is
         # the plaintext length, which is what the client will get. It is the
         # same answer a WebDAV listing gives, configured by ``listing``.
-        stat = await client.file_api.stats.get(fr)
+        return self._file_entry_attrs(await client.file_api.stats.get(fr))
+
+    def _file_entry_attrs(self, stat: Optional[FileStat]) -> SFTPAttrs:
+        if stat is None:
+            # An absent size is not a zero-byte file. Preserve the file type
+            # and access bits so a client can still operate on the entry.
+            return file_attrs(None, None, None, self._readonly)
         return file_attrs(
             size=stat.size,
             created_ms=stat.created_at,
@@ -380,6 +386,23 @@ class TGFSSFTPServer(asyncssh.SFTPServer):
             entries.append(self._name(sub.name, self._dir_entry_attrs(sub)))
 
         file_refs = directory.find_files()
+        threshold = self._config.tgdcfs.sftp.fast_readdir_min_files
+        if threshold and len(file_refs) >= threshold:
+            client = self._client(resolved.client_name)
+            stats = await client.file_api.stats.get_stored_listing(directory, file_refs)
+            entries.extend(
+                self._name(ref.name, self._file_entry_attrs(stat))
+                for ref, stat in zip(file_refs, stats)
+            )
+            missing = stats.count(None)
+            if missing:
+                logger.info(
+                    "SFTP READDIR: listed %d files without fetching %d missing stats",
+                    len(file_refs),
+                    missing,
+                )
+            return entries
+
         attrs = await asyncio.gather(
             *(self._file_attrs(resolved.child(fr.name)) for fr in file_refs),
             return_exceptions=True,

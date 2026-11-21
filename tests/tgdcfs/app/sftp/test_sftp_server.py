@@ -5,9 +5,12 @@ import asyncssh
 import pytest
 from tgdcfs.app.sftp.server import USER_INFO_KEY, TGFSSFTPServer
 from tgdcfs.auth.user import AdminUser, ReadonlyUser
+from tgdcfs.config import SFTPConfig
 from tgdcfs.core import Client
-from tgdcfs.core.model import TGFSDirectory, TGFSFileDesc, TGFSFileVersion
-from tests.tgdcfs.app.sftp.mocked_stats import mocked_stats
+from tgdcfs.core.api import FileStatApi
+from tgdcfs.core.model import FileStat, TGFSDirectory, TGFSFileDesc, TGFSFileVersion
+from tgdcfs.utils.time import ts
+from tests.tgdcfs.app.sftp.mocked_stats import MockedDescApi, mocked_stats
 
 CREATED_AT = datetime.datetime(2024, 1, 1, 12, 0, 0)
 UPDATED_AT = datetime.datetime(2024, 6, 1, 12, 0, 0)
@@ -78,6 +81,9 @@ def build_server(mocker, user=None, clients=None) -> TGFSSFTPServer:
     config = mocker.Mock()
     config.tgdcfs.sftp.upload_buffer_size_bytes = 1024
     config.tgdcfs.sftp.upload_buffer_dir = None
+    config.tgdcfs.sftp.fast_readdir_min_files = (
+        SFTPConfig.DEFAULT_FAST_READDIR_MIN_FILES
+    )
 
     if clients is None:
         clients = {"notes": build_client(mocker, "notes")}
@@ -132,6 +138,48 @@ class TestScandir:
         note = next(e for e in entries if e.filename == b"note.txt")
 
         assert note.attrs.size == FILE_SIZE
+
+    async def test_fast_listing_keeps_stored_stats_and_omits_unknown_ones(
+        self, admin, mocker
+    ):
+        admin._config.tgdcfs.sftp.fast_readdir_min_files = 2
+        client = admin._clients["notes"]
+        root = client.dir_api.root
+        known = root.find_file("note.txt")
+        root.create_file_ref("cold.txt", fd_message_id=101)
+
+        async def load_stats(directory):
+            assert directory is root
+            known.stat = FileStat(FILE_SIZE, ts(CREATED_AT), ts(UPDATED_AT))
+            return True
+
+        metadata = mocker.Mock(load_stats=mocker.AsyncMock(side_effect=load_stats))
+        client.file_api.stats = FileStatApi(
+            MockedDescApi(client), metadata_api=metadata, persist=True
+        )
+
+        entries = {
+            entry.filename: entry.attrs async for entry in admin.scandir(b"/notes")
+        }
+
+        metadata.load_stats.assert_awaited_once_with(root)
+        client.file_api.desc.assert_not_called()
+        assert entries[b"note.txt"].size == FILE_SIZE
+        assert entries[b"note.txt"].mtime == int(UPDATED_AT.timestamp())
+        assert entries[b"cold.txt"].size is None
+        assert entries[b"cold.txt"].mtime is None
+        attrs = await admin.stat(b"/notes/cold.txt")
+        assert attrs.size == FILE_SIZE
+        assert attrs.mtime == int(UPDATED_AT.timestamp())
+        await client.file_api.stats.close()
+
+    async def test_disabling_fast_listing_keeps_exact_attributes(self, admin):
+        admin._config.tgdcfs.sftp.fast_readdir_min_files = 0
+        entries = await collect(admin.scandir(b"/notes"))
+        assert (
+            next(e for e in entries if e.filename == b"note.txt").attrs.size
+            == FILE_SIZE
+        )
 
     async def test_unknown_client_is_reported_as_missing(self, admin):
         with pytest.raises(asyncssh.SFTPNoSuchFile):

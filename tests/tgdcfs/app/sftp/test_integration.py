@@ -7,6 +7,7 @@ between OPEN, READ/WRITE and CLOSE.
 
 import asyncio
 import datetime
+import stat
 import threading
 from types import SimpleNamespace
 from unittest.mock import call
@@ -163,7 +164,7 @@ async def server(mocker, channel, users):
         await acceptor.wait_closed()
 
 
-async def test_sequential_remove_does_not_wait_for_remote_mirror(
+async def test_cold_listing_and_sequential_remove_do_not_wait_for_backend(
     mocker, users, tmp_path
 ):
     root = TGFSDirectory.root_dir()
@@ -190,7 +191,17 @@ async def test_sequential_remove_does_not_wait_for_remote_mirror(
     api = MetaDataApi(repo, push_mode="coalesced", removal_journal=journal)
     await api.init()
     store = mocker.Mock(deletes_on_remove=False)
-    descriptors = mocker.Mock(get_file_desc=mocker.AsyncMock())
+
+    async def stalled_descriptor(*args, **kwargs):
+        # Outlast the client's timeout without leaving the server stuck
+        # closing the SFTP session if the listing regresses.
+        await asyncio.sleep(4)
+        return TGFSFileDesc.empty("unavailable.txt")
+
+    descriptors = mocker.Mock(
+        get_file_desc=mocker.AsyncMock(side_effect=stalled_descriptor),
+        content_length=mocker.AsyncMock(return_value=len(CONTENT)),
+    )
     client = mocker.Mock(spec=Client, name="notes")
     client.file_api = FileApi(
         api, descriptors, store, has_cached_versions=lambda: False
@@ -211,6 +222,16 @@ async def test_sequential_remove_does_not_wait_for_remote_mirror(
     try:
         async with await connect(acceptor) as conn:
             async with conn.start_sftp_client() as sftp:
+                entries = await asyncio.wait_for(
+                    sftp.readdir("/notes/batch"), timeout=3
+                )
+                files = [
+                    entry for entry in entries if entry.filename.startswith("file-")
+                ]
+                assert len(files) == 2640
+                assert all(entry.attrs.size is None for entry in files)
+                assert all(stat.S_ISREG(entry.attrs.permissions) for entry in files)
+                descriptors.get_file_desc.assert_not_called()
                 await sftp.remove("/notes/batch/file-0")
                 flush = asyncio.create_task(api.flush_removals())
                 try:

@@ -1,10 +1,11 @@
+import asyncio
 import datetime
 from unittest.mock import AsyncMock, Mock
 
 import pytest
 
 from tgdcfs.core.api import FileStatApi
-from tgdcfs.core.model import TGFSFileDesc, TGFSFileVersion
+from tgdcfs.core.model import FileStat, TGFSDirectory, TGFSFileDesc, TGFSFileVersion
 from tgdcfs.utils.time import ts
 
 OLD = datetime.datetime(2024, 1, 1, 12, 0, 0)
@@ -50,3 +51,27 @@ class TestFileStatApi:
         ).get(Mock())
 
         assert stat.size == 0
+
+    async def test_stored_listing_does_not_wait_for_unavailable_metadata(
+        self, monkeypatch
+    ):
+        monkeypatch.setattr("tgdcfs.core.api.stat.STORED_LISTING_TIMEOUT", 0.01)
+        directory = TGFSDirectory.root_dir()
+        known = directory.create_file_ref("known", 1)
+        unknown = directory.create_file_ref("unknown", 2)
+        known.stat = FileStat(7, ts(OLD), ts(NEW))
+        descriptors = file_desc_api(two_versions())
+
+        async def unavailable(directory):
+            await asyncio.Event().wait()
+
+        metadata = Mock(load_stats=AsyncMock(side_effect=unavailable))
+        api = FileStatApi(descriptors, metadata_api=metadata, persist=True)
+
+        async with asyncio.timeout(1):
+            assert await api.get_stored_listing(directory, [known, unknown]) == [
+                known.stat,
+                None,
+            ]
+        metadata.load_stats.assert_awaited_once_with(directory)
+        descriptors.get_file_desc.assert_not_called()

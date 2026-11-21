@@ -1,4 +1,5 @@
 import stat
+from typing import Optional
 
 from asyncssh import SFTPAttrs
 
@@ -28,17 +29,20 @@ def dir_attrs(created_ms: int, modified_ms: int, readonly: bool) -> SFTPAttrs:
 
 
 def file_attrs(
-    size: int, created_ms: int, modified_ms: int, readonly: bool
+    size: Optional[int],
+    created_ms: Optional[int],
+    modified_ms: Optional[int],
+    readonly: bool,
 ) -> SFTPAttrs:
     mode = FILE_MODE_READONLY if readonly else FILE_MODE
     return SFTPAttrs(
-        size=max(0, size),
+        size=max(0, size) if size is not None else None,
         permissions=stat.S_IFREG | mode,
         uid=0,
         gid=0,
-        atime=_seconds(modified_ms),
-        mtime=_seconds(modified_ms),
-        crtime=_seconds(created_ms),
+        atime=_seconds(modified_ms) if modified_ms is not None else None,
+        mtime=_seconds(modified_ms) if modified_ms is not None else None,
+        crtime=_seconds(created_ms) if created_ms is not None else None,
         nlink=1,
     )
 
