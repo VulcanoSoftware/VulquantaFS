@@ -1,6 +1,7 @@
 import pytest
 
 from tgdcfs.config import (
+    BotConfig,
     CacheConfig,
     Config,
     GithubRepoConfig,
@@ -18,6 +19,22 @@ from tgdcfs.config import (
     WebDAVConfig,
     _env_with_legacy_fallback,
 )
+
+
+@pytest.mark.parametrize("value", [0, -1, float("inf"), float("nan")])
+def test_telegram_bot_login_timeout_must_be_finite_and_positive(value):
+    with pytest.raises(ValueError, match="login_timeout_s"):
+        BotConfig.from_dict({"session_file": "bot.session", "login_timeout_s": value})
+
+
+def test_telegram_bot_login_timeout_defaults_to_twenty_and_can_be_changed():
+    assert BotConfig.from_dict({"session_file": "bot.session"}).login_timeout_s == 20
+    assert (
+        BotConfig.from_dict(
+            {"session_file": "bot.session", "login_timeout_s": 5.5}
+        ).login_timeout_s
+        == 5.5
+    )
 
 
 class TestWebDAVConfig:

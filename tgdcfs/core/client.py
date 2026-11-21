@@ -1,5 +1,6 @@
 import hashlib
 import json
+import logging
 from typing import Awaitable, Callable, Dict, List, Optional
 
 from tgdcfs.backends.base import IStore
@@ -240,7 +241,10 @@ class Client:
                 else None
             ),
         )
+        logger = logging.getLogger(__name__)
+        logger.info("Loading metadata for filesystem %s", filesystem.name)
         await metadata_api.init()
+        logger.info("Metadata ready for filesystem %s", filesystem.name)
 
         on_written = None
         # Mirrors filled in the background put every write on the queue;

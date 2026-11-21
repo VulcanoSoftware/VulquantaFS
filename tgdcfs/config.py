@@ -1,4 +1,5 @@
 import logging
+import math
 import os
 from dataclasses import dataclass, field
 from enum import Enum
@@ -924,13 +925,18 @@ class BotConfig:
     token: str
     session_file: str
     tokens: List[str] = field(default_factory=list)
+    login_timeout_s: float = 20.0
 
     @classmethod
     def from_dict(cls, data: dict) -> "BotConfig":
+        timeout = float(data.get("login_timeout_s", 20.0))
+        if not math.isfinite(timeout) or timeout <= 0:
+            raise ValueError("Telegram bot login_timeout_s must be a positive number")
         return cls(
             token=data.get("token", ""),
             tokens=data.get("tokens", []),
             session_file=expand_path(data["session_file"]),
+            login_timeout_s=timeout,
         )
 
 
