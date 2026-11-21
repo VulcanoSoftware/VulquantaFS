@@ -91,6 +91,7 @@ tgdcfs:
     # upload_buffer_size_mb: 64
     # upload_buffer_dir: ""
     # max_ahead_gap_mb: 1024
+    # fast_readdir_min_files: 256
 
   encryption:
     enabled: true
@@ -194,6 +195,7 @@ Main application parameters:
   - `upload_buffer_size_mb` *(int, default `64`)*: How much of an incoming upload may sit ahead of the streamed position in memory before it spills over to `upload_buffer_dir`. Uploads stream straight into the cloud channel; the buffer only absorbs writes that run ahead.
   - `upload_buffer_dir` *(optional)*: Spill directory for the upload buffer (the system temp directory when empty).
   - `max_ahead_gap_mb` *(int, default `1024`)*: How far ahead of the streamed position a single write may jump before the upload fails. Within that bound writes may arrive in any order; a gap no write ever fills is zero-filled when the client closes the file.
+  - `fast_readdir_min_files` *(int, default `256`)*: In directories with at least this many files, SFTP lists names and types without fetching each file's missing size and timestamps from storage. Known values are still sent; `STAT`/`LSTAT` can fetch the exact values. Set to `0` for clients that require exact attributes in every listing.
 - **`encryption`**: Client-side AES-256-GCM settings (see [Security & At-Rest Encryption](./encryption.md)).
 - **`cache`** (off unless `enabled: true`): Local disk cache configuration (see [Local Cache & Performance Tuning](./cache-and-performance.md)).
 - **`listing`**: Folder listing behaviour (see [Local Cache & Performance Tuning](./cache-and-performance.md)).

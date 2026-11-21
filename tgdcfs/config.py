@@ -466,6 +466,10 @@ class SFTPConfig:
     likes; the buffer takes it, in memory first and on disk beyond
     ``upload_buffer_size_mb``. A gap that no write ever covers is
     zero-filled when the client closes the file.
+
+    ``fast_readdir_min_files`` lets SFTP list large folders from metadata
+    alone. Files without stored stats are listed without size or dates,
+    which a client can still request with STAT/LSTAT. Zero disables it.
     """
 
     enabled: bool
@@ -481,6 +485,9 @@ class SFTPConfig:
     DEFAULT_HOST_KEY_FILE = "sftp_host_key"
     DEFAULT_UPLOAD_BUFFER_SIZE_MB = 64
     DEFAULT_MAX_AHEAD_GAP_MB = 1024
+    DEFAULT_FAST_READDIR_MIN_FILES = 256
+
+    fast_readdir_min_files: int = DEFAULT_FAST_READDIR_MIN_FILES
 
     @property
     def upload_buffer_size_bytes(self) -> int:
@@ -514,6 +521,15 @@ class SFTPConfig:
                 f"sftp.max_ahead_gap_mb must be positive, got {max_ahead_gap_mb}"
             )
 
+        fast_readdir_min_files = int(
+            data.get("fast_readdir_min_files", cls.DEFAULT_FAST_READDIR_MIN_FILES)
+        )
+        if fast_readdir_min_files < 0:
+            raise ValueError(
+                "sftp.fast_readdir_min_files must not be negative, "
+                f"got {fast_readdir_min_files}"
+            )
+
         return cls(
             enabled=bool(data.get("enabled", False)),
             host=str(data.get("host", "0.0.0.0")),  # noqa: S104
@@ -533,6 +549,7 @@ class SFTPConfig:
                 else None
             ),
             max_ahead_gap_mb=max_ahead_gap_mb,
+            fast_readdir_min_files=fast_readdir_min_files,
         )
 
 
