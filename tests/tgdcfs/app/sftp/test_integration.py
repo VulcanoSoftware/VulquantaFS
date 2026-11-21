@@ -231,6 +231,9 @@ async def test_cold_listing_and_sequential_remove_do_not_wait_for_backend(
                 assert len(files) == 2640
                 assert all(entry.attrs.size is None for entry in files)
                 assert all(stat.S_ISREG(entry.attrs.permissions) for entry in files)
+                assert all(
+                    entry.longname == f"type=file; {entry.filename}" for entry in files
+                )
                 descriptors.get_file_desc.assert_not_called()
                 await sftp.remove("/notes/batch/file-0")
                 flush = asyncio.create_task(api.flush_removals())

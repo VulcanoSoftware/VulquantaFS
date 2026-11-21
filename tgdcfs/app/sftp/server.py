@@ -423,9 +423,12 @@ class TGFSSFTPServer(asyncssh.SFTPServer):
 
     @staticmethod
     def _name(filename: str, attrs: SFTPAttrs) -> SFTPName:
-        return SFTPName(
-            filename=filename.encode("utf-8", "surrogateescape"), attrs=attrs
-        )
+        encoded = filename.encode("utf-8", "surrogateescape")
+        # FileZilla parses the SFTP v3 display field for sizes. A Unix
+        # longname needs a numeric size, so use the MLSD form it also
+        # understands: a file with no size or timestamp fact.
+        longname = b"type=file; " + encoded if attrs.size is None else b""
+        return SFTPName(filename=encoded, longname=longname, attrs=attrs)
 
     # ------------------------------------------------------------------
     # file access
