@@ -363,16 +363,17 @@ class GitlabRepository:
     ) -> requests.Response:
         url = f"{self._base_url}/api/v4/projects/{self._project}{path}"
 
-        def send() -> requests.Response:
-            return cast(
-                requests.Response,
-                self._session.request(
-                    method,
-                    url,
-                    params=params,
-                    json=json_body,
-                    timeout=REQUEST_TIMEOUT_SECONDS,
-                ),
+        def send():
+            # Unannotated on purpose: naming ``requests.Response`` here makes
+            # a stub-less mypy read ``Response.status_code`` out of the
+            # untyped requests source, where the branch's own ``_request``
+            # return type already carries the guarantee.
+            return self._session.request(
+                method,
+                url,
+                params=params,
+                json=json_body,
+                timeout=REQUEST_TIMEOUT_SECONDS,
             )
 
         attempts = RATE_LIMIT_RETRIES if retry_rate_limit else 1
