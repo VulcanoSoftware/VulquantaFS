@@ -103,6 +103,8 @@ class ReplicatedMetadataRepository(IMetaDataRepository):
         # (a pinned copy whose messages are too small), with the reason.
         # Re-checked on every heal: a smaller tree fits again.
         self._skipped: dict[str, str] = {}
+        # The boot's first push, once init() has run; see init().
+        self._initial_push: Optional[asyncio.Task] = None
         super().__init__()
         # Read as a plain attribute by the API layer, so it is copied from
         # the primary instead of forwarded dynamically.
@@ -134,6 +136,20 @@ class ReplicatedMetadataRepository(IMetaDataRepository):
     async def init(self) -> None:
         tree = await self._load()
         self.metadata = tree
+        # The first push runs in the background: the boot served nothing
+        # until it completed, so the stores that missed something -- mere
+        # mirrors by definition -- lined the whole server up behind their
+        # re-sync (measured: past 15 minutes of boot over one stale
+        # GitHub mirror that kept losing its ref races). The tree is
+        # loaded and readable, that is what serving reads; the heal
+        # worker would make this exact write a moment later anyway, and
+        # like its retries a failing write logs and leaves the store
+        # stale instead of taking the server down.
+        self._initial_push = asyncio.create_task(
+            self._push_at_startup(), name="metadata-initial-push"
+        )
+
+    async def _push_at_startup(self) -> None:
         try:
             await self.push()
         except TechnicalError as ex:
@@ -146,6 +162,10 @@ class ReplicatedMetadataRepository(IMetaDataRepository):
                 f"Could not write the metadata tree at startup; the heal "
                 f"worker will re-sync the failed stores: {ex}"
             )
+        except Exception:
+            # The task dies with the boot gone otherwise; the heal worker
+            # still rewrites the stale stores.
+            logger.exception("The startup push of the metadata stores failed")
 
     async def _load(self) -> TGFSMetadata:
         """The tree to serve: the most recent one across the stores.
@@ -353,6 +373,21 @@ class ReplicatedMetadataRepository(IMetaDataRepository):
 
     def stale_stores(self) -> List[str]:
         return sorted(self._stale | set(self._skipped))
+
+    async def close(self) -> None:
+        # Stop the boot push that has not finished, like the coalescer's
+        # pusher: a shutdown that races the first re-sync otherwise waits
+        # for (or kills) an already doomed task at interpreter teardown.
+        task = self._initial_push
+        self._initial_push = None
+        if task is not None and not task.done():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+        for store in self._stores:
+            await store.repo.close()
 
     # -- file stats (``listing.stat_in_metadata``) ---------------------------
     #

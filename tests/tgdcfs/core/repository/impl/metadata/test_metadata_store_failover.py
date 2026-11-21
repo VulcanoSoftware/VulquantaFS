@@ -38,6 +38,13 @@ from tgdcfs.errors import TechnicalError
 from .test_gitlab_tree import FakeGitlab, gitlab_config
 
 
+async def settled_initial_push(layer) -> None:
+    """Wait for the background push init() scheduled before asserting."""
+    initial = layer._initial_push
+    assert initial is not None
+    await initial
+
+
 @pytest.fixture(autouse=True)
 def stub_timestamp_store():
     """Keep the date cache out of these tests: a real store would start
@@ -149,6 +156,7 @@ class TestFailoverAtBoot:
         )
 
         await layer.init()
+        await settled_initial_push(layer)
 
         # The mirror served the tree the primary could not.
         assert layer.metadata is not None
@@ -187,6 +195,7 @@ class TestFailoverAtBoot:
         )
 
         await layer.init()
+        await settled_initial_push(layer)
 
         assert layer.metadata is not None
         assert layer.metadata.dir.find_files() == []
@@ -242,6 +251,7 @@ class TestOutageStaysUsable:
         started = time.monotonic()
         try:
             await layer.init()
+            await settled_initial_push(layer)
             boot = time.monotonic() - started
 
             assert layer.metadata is not None

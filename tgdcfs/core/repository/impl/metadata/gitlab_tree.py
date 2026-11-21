@@ -393,8 +393,49 @@ class GitlabRepository:
         )
 
     def _paginated(self, path: str, params: dict) -> List[dict]:
-        items: List[dict] = []
-        page = 1
+        response = self._request(
+            "GET", path, params=dict(params, page=1, per_page=PER_PAGE)
+        )
+        first = self._json(response)
+        items: List[dict] = first if isinstance(first, list) else []
+        next_page = response.headers.get("X-Next-Page", "").strip()
+        if not next_page or len(items) < PER_PAGE:
+            return items
+        total_pages = response.headers.get("X-Total-Pages", "").strip()
+        if (
+            total_pages.isdigit()
+            and 1 < int(total_pages) <= MAX_HISTORY_PAGES
+            and self._blob_fetch_concurrency > 1
+        ):
+            # The rest of the listing is fetched concurrently: the
+            # recursive listing of a grown metadata repository paginates
+            # into hundreds of GETs, and at one page per round trip it
+            # lined the whole boot behind a quarter hour of them. GitLab
+            # reports the total page count, so every page can be asked
+            # for at once; each request still waits out a 429 like any
+            # other, and a rate limiter makes the pool crawl instead of
+            # fail.
+            pages = range(2, int(total_pages) + 1)
+            workers = min(self._blob_fetch_concurrency, len(pages))
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                fetched = pool.map(
+                    lambda page: self._json(
+                        self._request(
+                            "GET",
+                            path,
+                            params=dict(params, page=page, per_page=PER_PAGE),
+                        )
+                    ),
+                    pages,
+                )
+                items.extend(
+                    item
+                    for batch in fetched
+                    if isinstance(batch, list)
+                    for item in batch
+                )
+            return items
+        page = int(next_page)
         while True:
             response = self._request(
                 "GET", path, params=dict(params, page=page, per_page=PER_PAGE)

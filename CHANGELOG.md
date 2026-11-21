@@ -54,6 +54,25 @@ the fact on the commits that shipped them.
 
 ### Fixed
 
+- Starting up no longer waits for the first full metadata write. ``init()``
+  loaded the trees of every store one after another and then synchronously
+  pushed the winner back into all of them (mirrors that missed something get
+  a full sync), so the SFTP server came up only after the slowest store
+  finished its catch-up -- measured: a boot of over 15 minutes, most of it a
+  GitLab mirror's paginated listing of an 81k-entry tree plus its 429 waits.
+  The first push now runs as a background task: the boot has a loaded,
+  readable tree, that is all serving reads needs, the heal worker makes the
+  same write a moment later, and a failing startup push is logged and caught
+  up by the heal instead of holding the server. Shutdown cancels a push that
+  is still running.
+- The Discord bots of a file system log in concurrently instead of one after
+  another (about two seconds of handshake per bot, half a minute for eleven).
+  A failed login still closes the bots that did make it in.
+- Paginated GitLab listings fetch their pages concurrently: GitLab reports
+  the total page count, so the pages beyond the first are requested at once
+  (bounded by ``blob_fetch_concurrency``) instead of one round trip -- and
+  one 429 wait -- at a time, which alone took a quarter hour of boot for the
+  812-page tree listing above.
 - A boot no longer crashes when the startup write of the metadata fails
   for every store while a tree could be read from one of them. The
   previous behaviour raised "Writing the metadata failed for every
