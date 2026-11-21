@@ -30,7 +30,6 @@ server.
 * WebDAV and SFTP servers over private Telegram and Discord channels
 * Unlimited file sizes: large files are chunked into parts but appear as a
   single file, with live streaming of videos
-* Infinite versioning of files and folders
 * Optional at-rest encryption (AES-256-GCM), invisible to clients
 * Optional RAID-1-style channel redundancy with automatic failover
 * Optional local disk cache with write-back uploads and multi-source
