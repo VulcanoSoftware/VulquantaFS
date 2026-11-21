@@ -35,7 +35,11 @@ jobs:
       uses: actions/cache@v5
       with:
         path: .venv
-        key: venv-${{ runner.os }}-${{ matrix.python-version }}-${{ hashFiles('**/poetry.lock') }}
+        # -v2: the previous cache entry predates the rebrand and is missing
+        # the pytest console script; a restore in that state fails
+        # 'poetry run pytest' with "Command not found" because poetry sees
+        # the venv as in sync. The new key forces one clean install.
+        key: venv-v2-${{ runner.os }}-${{ matrix.python-version }}-${{ hashFiles('**/poetry.lock') }}
         
     - name: Install dependencies
       if: steps.cached-poetry-dependencies.outputs.cache-hit != 'true'
@@ -57,7 +61,7 @@ jobs:
         VULQUANTAFS_DATA_DIR: .
         VULQUANTAFS_CONFIG_FILE: config-test.yaml
       run: |
-        poetry run pytest --cov --cov-branch --cov-report=xml
+        poetry run python -m pytest --cov --cov-branch --cov-report=xml
 
     # Only where it ran before this workflow was widened to all branches, so a
     # coverage upload cannot redden a feature branch.
