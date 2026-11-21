@@ -11,8 +11,10 @@ it unchanged.
 import asyncio
 import base64
 import hashlib
+import io
 import json
 import pathlib
+import tarfile
 import threading
 import time
 from datetime import datetime, timezone
@@ -64,8 +66,12 @@ class FakeResponse:
         self.status_code = status
         self._body = body
         self.headers = headers or {}
-        self.text = body if isinstance(body, str) else json.dumps(body)
-        self.content = self.text.encode()
+        if isinstance(body, bytes):
+            self.text = ""
+            self.content = body
+        else:
+            self.text = body if isinstance(body, str) else json.dumps(body)
+            self.content = self.text.encode()
 
     def json(self):
         return json.loads(self.text) if self.text else {}
@@ -98,6 +104,11 @@ class FakeGitlab:
         self.branch_files: Dict[str, Dict[str, str]] = {}
         self.branch_heads: Dict[str, str] = {}
         self.requests: List[tuple] = []
+        # A status the archive export answers with instead of the tarball
+        # (and raw bytes it answers with instead of a real export), so the
+        # paginated fallback can be exercised on demand.
+        self.archive_status: Optional[int] = None
+        self.archive_body: Optional[bytes] = None
         if seed and self.default_branch is not None:
             self.commit(
                 self.default_branch,
@@ -232,6 +243,12 @@ class FakeGitlab:
             return 200, {"commit": {"id": self._resolve_ref(branch)}}
         if rest == "repository/tree":
             return 200, self._tree(params)
+        if rest == "repository/archive.tar.gz":
+            if self.archive_status is not None:
+                return self.archive_status, {"message": "archive unavailable"}
+            if self.archive_body is not None:
+                return 200, self.archive_body
+            return 200, self._archive_targz(params.get("sha"))
         if rest == "repository/commits":
             if method == "POST":
                 branch = body["branch"]
@@ -266,6 +283,21 @@ class FakeGitlab:
             path = rest[len("repository/files/") :]
             return self._files_api(method, path, params, body)
         raise _NotFound()
+
+    def _archive_targz(self, ref: str) -> bytes:
+        """The tar.gz export GitLab answers the archive request with: one
+        root directory named for the project and sha, every file below it."""
+        files = self._files_for(ref)
+        prefix = f"tgdcfs-{self._resolve_ref(ref)}"
+        raw = io.BytesIO()
+        with tarfile.open(fileobj=raw, mode="w:gz") as archive:
+            for path in sorted(files):
+                data = self.blobs[files[path]].encode()
+                info = tarfile.TarInfo(f"{prefix}/{path}")
+                info.size = len(data)
+                info.mode = 0o644
+                archive.addfile(info, io.BytesIO(data))
+        return raw.getvalue()
 
     def _tree(self, params) -> list:
         files = self._files_for(params["ref"])
@@ -558,6 +590,9 @@ class TestFacade:
                 },
             ],
         )
+        # The archive export is switched off here: the paginated walk is
+        # what this tests; the export has its own class.
+        gitlab.archive_status = 503
         facade = GitlabRepository(gitlab_config())
 
         tree = facade.get_git_tree("main", recursive=True)
@@ -586,11 +621,10 @@ class TestFacade:
         assert len(tree.tree) == 250
 
     async def test_the_pages_beyond_the_first_are_fetched_concurrently(self, gitlab):
-        """The boot reads every store: a grown repository's recursive
-        listing paginates into hundreds of GETs, and one page per round
-        trip lined the whole startup up behind a quarter hour of them.
-        GitLab reports the page count, so the remaining pages go out
-        together and the entry order still matches the walk."""
+        """The paginated walk of a grown repository fetches its pages
+        together: GitLab reports the page count, so the remaining pages
+        go out concurrently."""
+        gitlab.archive_status = 503
         gitlab.commit(
             "main",
             "seed",
@@ -622,6 +656,7 @@ class TestFacade:
         concurrently dispatched page retries its own 429."""
         gitlab = RateLimitGitlab(limited=3)
         _route_session(monkeypatch, gitlab)
+        gitlab.archive_status = 503
         gitlab.commit(
             "main",
             "seed",
@@ -643,8 +678,9 @@ class TestFacade:
         assert len(tree.tree) == 250
         assert {e.path for e in tree.tree} == {f"f{i}.123" for i in range(250)}
         # The three refusals each cost the request that drew them one
-        # retry, wherever in the flight of pages they landed.
-        assert gitlab.attempts - before == 7
+        # retry, wherever in the flight of pages they landed; the refused
+        # archive export costs its one attempt before the walk starts.
+        assert gitlab.attempts - before == 8
 
     async def test_a_missing_branch_is_a_404(self, gitlab):
         facade = GitlabRepository(gitlab_config())
@@ -809,11 +845,17 @@ class TestFacade:
             ],
         )
 
-    def tree_gets(self, gitlab, start: int) -> int:
+    def full_listing_gets(self, gitlab, start: int) -> int:
+        """Every request the whole-tree listing paid: the archive export
+        when it served, the paginated walk when it fell back."""
         return sum(
             1
             for method, url, _, _ in gitlab.requests[start:]
-            if method == "GET" and url.endswith("repository/tree")
+            if method == "GET"
+            and (
+                url.endswith("repository/tree")
+                or url.endswith("repository/archive.tar.gz")
+            )
         )
 
     async def test_a_second_diff_serves_the_branch_from_the_cache(self, gitlab):
@@ -835,7 +877,7 @@ class TestFacade:
 
         assert [a["action"] for a in pending.actions] == ["create"]
         assert pending.actions[0]["file_path"] == "new.5"
-        assert self.tree_gets(gitlab, before) == 0
+        assert self.full_listing_gets(gitlab, before) == 0
 
     async def test_the_cache_stays_current_through_the_facades_commits(self, gitlab):
         self.seed_files(gitlab, 1)
@@ -848,7 +890,7 @@ class TestFacade:
 
         facade.create_git_tree([element], base_tree=base_commit.tree)
         # The first diff listed the branch once.
-        assert self.tree_gets(gitlab, before) == 1
+        assert self.full_listing_gets(gitlab, before) == 1
         facade.create_git_commit(
             "add", facade.create_git_tree([element], base_tree=base_commit.tree), []
         )
@@ -859,7 +901,7 @@ class TestFacade:
         pending = facade.create_git_tree([], base_tree=base_commit.tree)
 
         assert pending.actions == []
-        assert self.tree_gets(gitlab, before) == 0
+        assert self.full_listing_gets(gitlab, before) == 0
 
     async def test_a_write_from_outside_invalidates_the_cache(self, gitlab):
         """A commit that did not land through this repository (the mirrored
@@ -892,7 +934,7 @@ class TestFacade:
         # The head no longer matches the cache, so the diff re-listed the
         # branch and keeps both the facade's own path and the foreign one.
         assert pending.actions == []
-        assert self.tree_gets(gitlab, before) > 0
+        assert self.full_listing_gets(gitlab, before) > 0
 
     async def test_a_files_api_write_folds_into_the_cache(self, gitlab):
         gitlab.commit("main", "first", [])
@@ -909,7 +951,7 @@ class TestFacade:
 
         # The cache knows the file, so the delete diff reads no listing.
         assert pending.actions == [{"action": "delete", "file_path": "fresh.9"}]
-        assert self.tree_gets(gitlab, before) == 0
+        assert self.full_listing_gets(gitlab, before) == 0
 
         facade.delete_file("fresh.9", "remove it", "", "main")
         pending = facade.create_git_tree([], base_tree=base_commit.tree)
@@ -929,7 +971,7 @@ class TestFacade:
         tree = facade.get_git_tree(head, recursive=True)
 
         assert len(tree.tree) == 2
-        assert self.tree_gets(gitlab, before) == 0
+        assert self.full_listing_gets(gitlab, before) == 0
 
 
 class TestGitlabTreeStore:
@@ -1599,6 +1641,19 @@ def tree_gets(gitlab, start: int) -> int:
     )
 
 
+def full_listing_gets(gitlab, start: int) -> int:
+    """Every request the whole-tree listing paid: the archive export when
+    it served, the paginated walk when it fell back."""
+    return sum(
+        1
+        for method, url, _, _ in gitlab.requests[start:]
+        if method == "GET"
+        and (
+            url.endswith("repository/tree") or url.endswith("repository/archive.tar.gz")
+        )
+    )
+
+
 def _commit_file_creation(gitlab, path: str, message: str = "seed") -> None:
     gitlab.commit(
         "main",
@@ -1678,6 +1733,88 @@ def snapshot_path(tmp_path) -> pathlib.Path:
 def snapshot_head(tmp_path) -> Optional[str]:
     data = json.loads(snapshot_path(tmp_path).read_text())
     return data["head"]
+
+
+class TestArchiveListing:
+    """The cold listing of the whole branch is one archive export instead
+    of the paginated walk; on a rate-limited store the walk was a 429
+    wave per handful of pages, where the export is one request."""
+
+    async def test_a_cold_listing_costs_one_export_and_no_tree_gets(self, gitlab):
+        seed_n_files(gitlab, 5)
+        facade = GitlabRepository(gitlab_config())
+
+        tree = facade.get_git_tree("main", recursive=True)
+
+        assert {e.path for e in tree.tree} == {f"f{n}.1" for n in range(5)}
+        assert tree_gets(gitlab, 0) == 0
+        assert (
+            len(
+                [
+                    r
+                    for r in gitlab.requests
+                    if r[1].endswith("repository/archive.tar.gz")
+                ]
+            )
+            == 1
+        )
+
+    async def test_the_archive_answers_the_same_entries_as_the_walk(self, gitlab):
+        """Whatever the listing walked before, the export reports the
+        same: every blob with its git object id (the fake's paginated
+        walk omits the tree rows a real recursive listing carries; the
+        export does include them, and the tree ids carry no meaning
+        towards GitLab's own API)."""
+        gitlab.commit(
+            "main",
+            "seed",
+            [
+                {"action": "create", "file_path": p, "content": c, "encoding": "text"}
+                for p, c in {
+                    "docs/readme.42": "hello",
+                    "docs/.gitkeep": "",
+                    "plain.1": "x",
+                }.items()
+            ],
+        )
+        facade = GitlabRepository(gitlab_config())
+        archived = {
+            e.path: e
+            for e in facade.get_git_tree("main", recursive=True).tree
+            if e.type == "blob"
+        }
+        gitlab.archive_status = 503
+        walked = {
+            e.path: e
+            for e in GitlabRepository(gitlab_config())
+            .get_git_tree("main", recursive=True)
+            .tree
+            if e.type == "blob"
+        }
+
+        assert set(archived) == set(walked)
+        for path, entry in archived.items():
+            assert entry.sha == walked[path].sha
+
+    async def test_a_refused_export_falls_back_to_the_walk(self, gitlab):
+        seed_n_files(gitlab, 5)
+        gitlab.archive_status = 503
+        facade = GitlabRepository(gitlab_config())
+
+        tree = facade.get_git_tree("main", recursive=True)
+
+        assert {e.path for e in tree.tree} == {f"f{n}.1" for n in range(5)}
+        assert tree_gets(gitlab, 0) == 1
+
+    async def test_a_corrupt_export_falls_back_to_the_walk(self, gitlab):
+        seed_n_files(gitlab, 2)
+        gitlab.archive_body = b"not a tarball"
+        facade = GitlabRepository(gitlab_config())
+
+        tree = facade.get_git_tree("main", recursive=True)
+
+        assert {e.path for e in tree.tree} == {"f0.1", "f1.1"}
+        assert tree_gets(gitlab, 0) == 1
 
 
 class TestHeadProbe:

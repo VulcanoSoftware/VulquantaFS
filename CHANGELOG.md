@@ -54,6 +54,18 @@ the fact on the commits that shipped them.
 
 ### Fixed
 
+- A GitLab metadata store's cold listing of the whole metadata tree -- the
+  first boot of an installation, the read after the branch moved -- is now
+  one request instead of one GET per hundred entries: the facade asks for
+  the branch's `repository/archive.tar.gz` export and translates it back
+  into the tree entries the paginated `repository/tree` listing used to
+  walk, every blob's git object id computed from its exported content. A
+  grown repository paginated into hundreds of GETs, and on a rate-limited
+  instance those arrived in 429-wave after 429-wave -- a boot log showed
+  five minutes of `attempt 1/2/3 of 5` on `GET /repository/tree` alone. If
+  the export does not answer (a restrictive proxy, an export error, a
+  corrupt tarball), the facade logs once and lists paginated, exactly like
+  before.
 - Starting up now reads only the metadata store that holds the most recent
   tree instead of reading every store. Git stores date their tree with
   their branch head, and that head is two small GETs away -- so the boot
