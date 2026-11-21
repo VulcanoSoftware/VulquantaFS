@@ -44,7 +44,9 @@ workflow solves this:
 3. The same script rewrites the GitHub Pages URLs of the deployed web
    frontend — the site itself, the config generator and the
    getting-started guide — from the upstream Pages site to the fork's
-   own (`https://<fork-owner>.github.io/vulquantafs/`).
+   own (`https://<fork-owner>.github.io/<fork>/`, under the fork
+   repository's exact name -- GitHub Pages does not serve an
+   all-lowercase spelling).
 4. When the result differs from what is committed, the workflow commits it
    with `[skip ci]`, so it cannot run against its own commits.
 
@@ -124,9 +126,10 @@ it, coverage uploads are skipped on branches where they are not required
 * **GitHub Pages itself** must be enabled once per fork: under
   *Settings → Pages*, set the source to *GitHub Actions*. After that the
   "Deploy site to GitHub Pages" workflow (`gh-pages.yml`) publishes the
-  Next.js web frontend at `https://<fork-owner>.github.io/vulquantafs/` and,
+  Next.js web frontend at `https://<fork-owner>.github.io/<fork>/` (under
+  the fork repository's exact name) and,
   under `docs/` in the same artifact, the Docusaurus documentation at
-  `https://<fork-owner>.github.io/vulquantafs/docs/`. Both read the fork's own
+  `https://<fork-owner>.github.io/<fork>/docs/`. Both read the fork's own
   coordinates from `github.repository`, so nothing in
   `docusaurus/docusaurus.config.ts` has to be edited.
 

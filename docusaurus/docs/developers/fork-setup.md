@@ -67,7 +67,9 @@ workflow solves this:
    because Docker Hub namespaces are lowercase).
 3. The same script repoints the GitHub Pages URLs and the Docker Hub link
    in the README from the upstream to the fork's own
-   (`https://<fork-owner>.github.io/vulquantafs/`). The web frontend is not
+   (`https://<fork-owner>.github.io/<fork>/`, under the fork repository's
+   exact name -- the lowercase spelling of a renamed repository is a 404).
+   The web frontend is not
    rewritten: it resolves its own Docker images and Pages links at build
    time (see above).
 4. When the result differs from what is committed, the workflow commits it
@@ -149,9 +151,10 @@ it, coverage uploads are skipped on branches where they are not required
 * **GitHub Pages itself** must be enabled once per fork: under
   *Settings → Pages*, set the source to *GitHub Actions*. After that the
   "Deploy site to GitHub Pages" workflow (`gh-pages.yml`) publishes the
-  Next.js web frontend at `https://<fork-owner>.github.io/vulquantafs/` and,
+  Next.js web frontend at `https://<fork-owner>.github.io/<fork>/` (under
+  the fork repository's exact name) and,
   under `docs/` in the same artifact, the Docusaurus documentation at
-  `https://<fork-owner>.github.io/vulquantafs/docs/`. Both read the fork's own
+  `https://<fork-owner>.github.io/<fork>/docs/`. Both read the fork's own
   coordinates from `github.repository`, so nothing in
   `docusaurus/docusaurus.config.ts` has to be edited.
 

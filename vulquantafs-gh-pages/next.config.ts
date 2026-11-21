@@ -17,8 +17,13 @@ const dockerHubNamespace = (
 const nextConfig: NextConfig = {
   output: "export",
   trailingSlash: true,
-  basePath: "/vulquantafs",
-  assetPrefix: "/vulquantafs",
+  // GitHub Pages serves the site under the repository's exact name,
+  // capitals included: the site for vecstack-prog/VulquantaFS answers at
+  // /VulquantaFS/, and the all-lowercase spelling is a plain 404. The
+  // base path therefore follows the repository name as written in
+  // GITHUB_REPOSITORY, like the Pages URL below.
+  basePath: `/${repo}`,
+  assetPrefix: `/${repo}`,
   images: {
     loader: "custom",
     loaderFile: "image-loader.js",
@@ -29,8 +34,7 @@ const nextConfig: NextConfig = {
   env: {
     NEXT_PUBLIC_DOCKERHUB_IMAGE: `${dockerHubNamespace}/vulquantafs`,
     NEXT_PUBLIC_GHCR_IMAGE: `ghcr.io/${owner}/${repo}/vulquantafs`.toLowerCase(),
-    NEXT_PUBLIC_PAGES_URL:
-      `https://${owner}.github.io/${repo}`.toLowerCase(),
+    NEXT_PUBLIC_PAGES_URL: `https://${owner.toLowerCase()}.github.io/${repo}`,
   },
 };
 
