@@ -11,6 +11,7 @@ from typing import Iterable, NamedTuple, Optional, Sequence, Set, cast
 
 from github import Github, GithubException, GithubRetry, InputGitTreeElement
 from github.ContentFile import ContentFile
+from github.GitCommit import GitCommit
 from github.Repository import Repository
 
 from tgdcfs.config import GithubRepoConfig, expand_path
@@ -34,8 +35,10 @@ from .gh_directory import (
     DROP_COMMIT_ATTEMPTS,
     DROP_FLUSH_BATCH,
     DROP_FLUSH_INTERVAL,
+    TREE_OVERLAY_ACTION_LIMIT,
     GithubConfig,
     GithubDirectory,
+    commit_tree_overlay,
 )
 from .stats_file import STATS_COMMIT_PREFIX, STATS_FILE_NAME
 
@@ -453,32 +456,24 @@ class GithubRepoMetadataRepository(IMetaDataRepository):
             )
             if not creates and not deletes:
                 return
-            elements = [
+            overlay = [
                 # The content creates the blob server side; an element that
                 # also carries a sha (even null) is rejected with a 422.
                 InputGitTreeElement(path=path, mode="100644", type="blob", content="")
                 for path in creates
             ]
-            elements += [
-                InputGitTreeElement(path=path, mode=mode, type="blob", sha=sha)
-                for path, (sha, mode) in sorted(current.items())
-                if path not in set(deletes)
+            overlay += [
+                InputGitTreeElement(path=path, mode="100644", type="blob", sha=None)
+                for path in deletes
             ]
-            new_tree = repo.create_git_tree(elements)
-            commit = repo.create_git_commit(
-                f"Sync TGDCFS metadata tree ({len(creates)} created, "
-                f"{len(deletes)} deleted)",
-                new_tree,
-                [base_commit],
-            )
             try:
-                ref.edit(commit.sha)
-                logger.info(
-                    f"Synced the metadata tree to {self._ghc.repo_name}@"
-                    f"{self._ghc.commit}: {len(creates)} created, "
-                    f"{len(deletes)} deleted"
+                commit_tree_overlay(
+                    repo,
+                    self._ghc.commit,
+                    overlay,
+                    f"Sync TGDCFS metadata tree ({len(creates)} created, "
+                    f"{len(deletes)} deleted)",
                 )
-                return
             except GithubException as ex:
                 if attempt + 1 == SYNC_COMMIT_ATTEMPTS:
                     raise
@@ -486,25 +481,55 @@ class GithubRepoMetadataRepository(IMetaDataRepository):
                     f"Branch {self._ghc.commit} moved while syncing the "
                     f"metadata tree ({ex.status}), retrying"
                 )
+                continue
+            logger.info(
+                f"Synced the metadata tree to {self._ghc.repo_name}@"
+                f"{self._ghc.commit}: {len(creates)} created, "
+                f"{len(deletes)} deleted"
+            )
+            return
 
     def _initial_sync_commit(self, desired_blobs: Set[str]) -> None:
-        """First commit on a branch that does not exist yet."""
+        """First commit on a branch that does not exist yet.
+
+        The desired blobs are committed as content-only creates in chunks
+        of at most ``TREE_OVERLAY_ACTION_LIMIT`` elements chained by base
+        tree: one request naming a whole metadata tree refused with an
+        "input too large" 422 once the repository outgrew it.
+        """
         repo = self._ghc.repo
-        elements = [
-            # See _sync_tree_commit: content must go alone.
-            InputGitTreeElement(path=path, mode="100644", type="blob", content="")
-            for path in sorted(desired_blobs)
-        ]
-        new_tree = repo.create_git_tree(elements)
-        commit = repo.create_git_commit(
-            f"Sync TGDCFS metadata tree ({len(desired_blobs)} created)",
-            new_tree,
-            [],
-        )
-        repo.create_git_ref(f"refs/heads/{self._ghc.commit}", commit.sha)
+        paths = sorted(desired_blobs)
+        chunks = [
+            paths[i : i + TREE_OVERLAY_ACTION_LIMIT]
+            for i in range(0, len(paths), TREE_OVERLAY_ACTION_LIMIT)
+        ] or [[]]
+        parent: Optional[GitCommit] = None
+        head = ""
+        for number, chunk in enumerate(chunks, start=1):
+            elements = [
+                InputGitTreeElement(path=path, mode="100644", type="blob", content="")
+                for path in chunk
+            ]
+            tree = (
+                repo.create_git_tree(elements)
+                if parent is None
+                else repo.create_git_tree(elements, base_tree=parent.tree)
+            )
+            message = (
+                f"Sync TGDCFS metadata tree ({len(paths)} created)"
+                if len(chunks) == 1
+                else f"Sync TGDCFS metadata tree ({len(paths)} created) "
+                f"({number}/{len(chunks)})"
+            )
+            commit = repo.create_git_commit(
+                message, tree, [] if parent is None else [parent]
+            )
+            head = commit.sha
+            parent = commit
+        repo.create_git_ref(f"refs/heads/{self._ghc.commit}", head)
         logger.info(
             f"Created {self._ghc.repo_name}@{self._ghc.commit} with the "
-            f"synced metadata tree ({len(desired_blobs)} blobs)"
+            f"synced metadata tree ({len(paths)} blobs)"
         )
 
     # -- file stats (``listing.stat_in_metadata``) -------------------------

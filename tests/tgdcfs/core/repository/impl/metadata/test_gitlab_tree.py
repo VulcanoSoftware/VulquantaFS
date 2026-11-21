@@ -24,6 +24,7 @@ from github import GithubException, InputGitTreeElement
 from tgdcfs.config import GitlabRepoConfig
 from tgdcfs.core.model import TGFSDirectory, TGFSMetadata
 from tgdcfs.core.repository.impl.metadata import breaker as breaker_mod
+from tgdcfs.core.repository.impl.metadata import gitlab_tree as gitlab_tree_mod
 from tgdcfs.core.repository.impl.metadata.breaker import (
     StoreCircuitBreaker,
     StoreUnreachable,
@@ -32,18 +33,15 @@ from tgdcfs.core.repository.impl.metadata.breaker import (
 from tgdcfs.core.repository.impl.metadata.github_repo.gh_directory import (
     GithubDirectory,
 )
-from tgdcfs.core.repository.impl.metadata import gitlab_tree as gitlab_tree_mod
 from tgdcfs.core.repository.impl.metadata.gitlab_tree import (
     GitlabRepository,
     GitlabTreeRepoMetadataRepository,
 )
 from tgdcfs.core.repository.interface import IMetaDataRepository
 from tgdcfs.crypto.metadata_blob import (
-    decrypt_metadata_blob,
     derive_metadata_blob_key,
     encrypt_metadata_blob,
 )
-from tgdcfs.errors import NoStoredMetadata, TechnicalError
 
 PER_PAGE = 100
 
@@ -125,7 +123,7 @@ class FakeGitlab:
             kind = action["action"]
             if kind == "delete":
                 if path not in files:
-                    raise _Conflict(f"A file with this name does not exist")
+                    raise _Conflict("A file with this name does not exist")
                 del files[path]
             else:
                 if kind == "create" and path in files:
@@ -133,7 +131,7 @@ class FakeGitlab:
                         f"A file with the same name already exists in {branch}"
                     )
                 if kind == "update" and path not in files:
-                    raise _Conflict(f"A file with this name does not exist")
+                    raise _Conflict("A file with this name does not exist")
                 content = action["content"]
                 if action.get("encoding") == "base64":
                     content = base64.b64decode(content).decode()
@@ -715,6 +713,147 @@ class TestFacade:
         assert fake.default_branch == "main"
         assert fake.file_content("main", "hello.txt") == "world"
 
+    # -- the branch cache -------------------------------------------------------
+
+    def seed_files(self, gitlab, count: int) -> None:
+        gitlab.commit(
+            "main",
+            "seed",
+            [
+                {
+                    "action": "create",
+                    "file_path": f"f{n}.1",
+                    "content": "",
+                    "encoding": "text",
+                }
+                for n in range(count)
+            ],
+        )
+
+    def tree_gets(self, gitlab, start: int) -> int:
+        return sum(
+            1
+            for method, url, _, _ in gitlab.requests[start:]
+            if method == "GET" and url.endswith("repository/tree")
+        )
+
+    async def test_a_second_diff_serves_the_branch_from_the_cache(self, gitlab):
+        """The diff of a commit reads the branch once; before, every
+        overlay commit -- each file drop, each stats commit -- paid the
+        whole paginated listing again, hundreds of GETs on a grown
+        repository."""
+        self.seed_files(gitlab, 150)
+        facade = GitlabRepository(gitlab_config())
+        base_commit = facade.get_git_commit(facade.get_git_ref("heads/main").object.sha)
+        facade.get_git_tree("main", recursive=True)
+
+        before = len(gitlab.requests)
+        pending = facade.create_git_tree(
+            [InputGitTreeElement(path="new.5", mode="100644", type="blob", content="")],
+            base_tree=base_commit.tree,
+        )
+        facade.create_git_commit("add", pending, [])
+
+        assert [a["action"] for a in pending.actions] == ["create"]
+        assert pending.actions[0]["file_path"] == "new.5"
+        assert self.tree_gets(gitlab, before) == 0
+
+    async def test_the_cache_stays_current_through_the_facades_commits(
+        self, gitlab
+    ):
+        self.seed_files(gitlab, 1)
+        facade = GitlabRepository(gitlab_config())
+        base_commit = facade.get_git_commit(facade.get_git_ref("heads/main").object.sha)
+        element = InputGitTreeElement(
+            path="new.5", mode="100644", type="blob", content=""
+        )
+        before = len(gitlab.requests)
+
+        facade.create_git_tree([element], base_tree=base_commit.tree)
+        # The first diff listed the branch once.
+        assert self.tree_gets(gitlab, before) == 1
+        facade.create_git_commit(
+            "add", facade.create_git_tree([element], base_tree=base_commit.tree), []
+        )
+        before = len(gitlab.requests)
+
+        # The landed commit is in the cache: a diff of everything-but-the
+        # current state keeps the path alive, without ever re-listing.
+        pending = facade.create_git_tree([], base_tree=base_commit.tree)
+
+        assert pending.actions == []
+        assert self.tree_gets(gitlab, before) == 0
+
+    async def test_a_write_from_outside_invalidates_the_cache(self, gitlab):
+        """A commit that did not land through this repository (the mirrored
+        twin, the user) makes the cached listing stale."""
+        self.seed_files(gitlab, 2)
+        facade = GitlabRepository(gitlab_config())
+        base_commit = facade.get_git_commit(facade.get_git_ref("heads/main").object.sha)
+        element = InputGitTreeElement(
+            path="new.5", mode="100644", type="blob", content=""
+        )
+        facade.create_git_commit(
+            "add", facade.create_git_tree([element], base_tree=base_commit.tree), []
+        )
+        gitlab.commit(
+            "main",
+            "outside",
+            [
+                {
+                    "action": "create",
+                    "file_path": "outside.1",
+                    "content": "",
+                    "encoding": "text",
+                }
+            ],
+        )
+        before = len(gitlab.requests)
+
+        pending = facade.create_git_tree([], base_tree=base_commit.tree)
+
+        # The head no longer matches the cache, so the diff re-listed the
+        # branch and keeps both the facade's own path and the foreign one.
+        assert pending.actions == []
+        assert self.tree_gets(gitlab, before) > 0
+
+    async def test_a_files_api_write_folds_into_the_cache(self, gitlab):
+        gitlab.commit("main", "first", [])
+        facade = GitlabRepository(gitlab_config())
+        facade.get_git_tree("main", recursive=True)
+        before = len(gitlab.requests)
+
+        facade.create_file("fresh.9", "write it", "payload", "main")
+        base_commit = facade.get_git_commit(facade.get_git_ref("heads/main").object.sha)
+        pending = facade.create_git_tree(
+            [InputGitTreeElement(path="fresh.9", mode="100644", type="blob", sha=None)],
+            base_tree=base_commit.tree,
+        )
+
+        # The cache knows the file, so the delete diff reads no listing.
+        assert pending.actions == [{"action": "delete", "file_path": "fresh.9"}]
+        assert self.tree_gets(gitlab, before) == 0
+
+        facade.delete_file("fresh.9", "remove it", "", "main")
+        pending = facade.create_git_tree([], base_tree=base_commit.tree)
+
+        # The delete followed too: the file is gone from the cache.
+        assert pending.actions == []
+
+    async def test_a_tree_read_at_the_cached_head_is_served_from_the_cache(
+        self, gitlab
+    ):
+        self.seed_files(gitlab, 2)
+        facade = GitlabRepository(gitlab_config())
+        head = gitlab.branch_heads["main"]
+        facade.get_git_tree("main", recursive=True)
+        before = len(gitlab.requests)
+
+        tree = facade.get_git_tree(head, recursive=True)
+
+        assert len(tree.tree) == 2
+        assert self.tree_gets(gitlab, before) == 0
+
 
 class TestGitlabTreeStore:
     def repository(self, gitlab, config=None, name_key=None, blob_key=None):
@@ -982,7 +1121,9 @@ class TestRateLimitRetries:
         tree = repo.get_git_tree("main", recursive=True)
 
         assert tree.truncated is False
-        assert fake.attempts == 3
+        # The head check that validates the branch cache is a request
+        # like the listing, and is rate limited alongside it.
+        assert fake.attempts == 4
 
     async def test_the_retry_honours_the_prescribed_wait(
         self, monkeypatch, rate_limited_gitlab

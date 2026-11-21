@@ -4,7 +4,7 @@ import logging
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
-from typing import Callable, Optional, Set, TypeVar
+from typing import Callable, Optional, Sequence, Set, TypeVar
 
 import requests
 from github import Github, InputGitTreeElement
@@ -32,6 +32,55 @@ PUT_RETRY_DELAY = 1.5
 # reference is given up on.
 DEFERRED_PUT_ATTEMPTS = 10
 DEFERRED_PUT_RETRY_DELAY = 5
+
+# GitHub refuses a tree whose request carries a whole repository: the
+# rewrites sent every blob as an element and large metadata repositories
+# came back "Sorry, your request timed out.  It's likely that your input
+# was too large to process" (422) -- or landed after tens of minutes. An
+# overlay commit only names the delta on top of the base tree, and a
+# single one never carries more than this many elements; a bigger delta
+# arrives as several commits chained by base tree.
+TREE_OVERLAY_ACTION_LIMIT = 1000
+
+
+def commit_tree_overlay(
+    repo: Repository,
+    branch: str,
+    overlay: Sequence[InputGitTreeElement],
+    message: str,
+) -> str:
+    """Land ``overlay`` on top of the branch's current tree; move the branch once.
+
+    A tree element only overlays the base tree it carries: an element with
+    content or a sha adds or replaces its path, one with neither (``sha=None``)
+    removes it. Only the delta travels, in commits of at most
+    ``TREE_OVERLAY_ACTION_LIMIT`` elements chained by base tree -- so the
+    request bodies stay small however large the repository, and a chunk
+    that did not land leaves the branch as it was. Blocking; raises when
+    a commit or the final ref update fails, which callers treat like any
+    failed commit (retried, or the store goes stale).
+
+    Returns the sha the branch was moved to.
+    """
+    ref = repo.get_git_ref(f"heads/{branch}")
+    first_base = repo.get_git_commit(ref.object.sha)
+    chunks = [
+        list(overlay[i : i + TREE_OVERLAY_ACTION_LIMIT])
+        for i in range(0, len(overlay), TREE_OVERLAY_ACTION_LIMIT)
+    ] or [[]]
+    commit = first_base
+    for number, chunk in enumerate(chunks, start=1):
+        tree = repo.create_git_tree(
+            chunk, base_tree=first_base.tree if commit is first_base else commit.tree
+        )
+        chunk_message = (
+            message if len(chunks) == 1 else f"{message} ({number}/{len(chunks)})"
+        )
+        commit = repo.create_git_commit(
+            chunk_message, tree, [] if commit is first_base else [commit]
+        )
+    ref.edit(commit.sha)
+    return commit.sha
 
 # Deleting a file reference used to wait on two API calls on the writer
 # thread (read the blob's sha, commit its deletion), so a 20k-file folder
@@ -349,44 +398,55 @@ class GithubDirectory(TGFSDirectory):
             raise
 
     def _move_github_directory(self, old_prefix: str, new_prefix: str) -> None:
-        """Re-path this directory's subtree in a single commit.
+        """Re-path this directory's subtree in a commit that names only the
+        moved entries.
 
         The Contents API has no rename, and deleting plus re-creating every
         blob would lose the git history the timestamps are restored from, so
-        rewrite the tree with the affected blobs moved to their new paths --
-        the same Git Data API round-trip ``_delete_github_directory`` uses.
+        the affected blobs are re-homed: an overlay commit that removes each
+        old path (``sha=None``) and re-adds it, same blob sha, under the new
+        prefix. The blobs the move does not touch stay where they are (the
+        commit overlays the branch's current tree) -- the whole-tree rewrite
+        a single request used to carry refused with "your input was too
+        large" once the repository outgrew it.
         """
         try:
-            ref = self._ghc.repo.get_git_ref(f"heads/{self._ghc.commit}")
-            base_commit = self._ghc.repo.get_git_commit(ref.object.sha)
+            base_commit = self._ghc.repo.get_git_commit(
+                self._ghc.repo.get_git_ref(f"heads/{self._ghc.commit}").object.sha
+            )
             tree = self._ghc.repo.get_git_tree(base_commit.tree.sha, recursive=True)
 
-            elements: list[InputGitTreeElement] = []
+            overlay: list[InputGitTreeElement] = []
             moved = 0
             for entry in tree.tree:
                 if entry.type != "blob":
                     continue
                 path = entry.path
                 if path == old_prefix or path.startswith(old_prefix + "/"):
-                    path = new_prefix + path[len(old_prefix) :]
-                    moved += 1
-                elements.append(
-                    InputGitTreeElement(
-                        path=path,
-                        mode=entry.mode,
-                        type="blob",
-                        sha=entry.sha,
+                    overlay.append(
+                        InputGitTreeElement(
+                            path=path, mode="100644", type="blob", sha=None
+                        )
                     )
-                )
+                    overlay.append(
+                        InputGitTreeElement(
+                            path=new_prefix + path[len(old_prefix) :],
+                            mode=entry.mode,
+                            type="blob",
+                            sha=entry.sha,
+                        )
+                    )
+                    moved += 1
 
             if moved == 0:
                 return
 
-            new_tree = self._ghc.repo.create_git_tree(elements)
-            new_commit = self._ghc.repo.create_git_commit(
-                f"Move directory {old_prefix} to {new_prefix}", new_tree, [base_commit]
+            commit_tree_overlay(
+                self._ghc.repo,
+                self._ghc.commit,
+                overlay,
+                f"Move directory {old_prefix} to {new_prefix}",
             )
-            ref.edit(new_commit.sha)
             logger.info(
                 f"Moved {moved} object(s) from {old_prefix} to {new_prefix} "
                 f"in {self._ghc.repo_name}"
@@ -587,50 +647,48 @@ class GithubDirectory(TGFSDirectory):
             )
 
     def _delete_github_directory(self) -> None:
-        """Remove this directory and everything beneath it in one commit.
+        """Remove this directory and everything beneath it in a commit
+        that names only the removed paths.
 
         ``delete_file`` can only remove a single file — it returns HTTP 422
         on a subtree — so a per-entry delete cannot recurse into
         subdirectories (their nested ``.gitkeep`` and files would survive).
-        Instead we rewrite the git tree without any blob under this
-        directory's path, dropping arbitrarily-nested content atomically in
-        a single commit via the Git Data API.
+        The subtree's paths are removed by an overlay commit whose element
+        carries ``sha=None``, dropping arbitrarily-nested content while
+        everything outside the prefix stays untouched; one that took the
+        whole tree as its elements refused with "your input was too
+        large" once the repository outgrew a single request.
         """
         prefix = self._github_path
         if not prefix:
             return  # guard: never wipe the whole repo via the root
         try:
-            ref = self._ghc.repo.get_git_ref(f"heads/{self._ghc.commit}")
-            base_commit = self._ghc.repo.get_git_commit(ref.object.sha)
+            base_commit = self._ghc.repo.get_git_commit(
+                self._ghc.repo.get_git_ref(f"heads/{self._ghc.commit}").object.sha
+            )
             tree = self._ghc.repo.get_git_tree(base_commit.tree.sha, recursive=True)
 
-            kept: list[InputGitTreeElement] = []
-            removed = 0
-            for entry in tree.tree:
-                if entry.type != "blob":
-                    continue
-                if entry.path == prefix or entry.path.startswith(prefix + "/"):
-                    removed += 1
-                    continue
-                kept.append(
-                    InputGitTreeElement(
-                        path=entry.path,
-                        mode=entry.mode,
-                        type="blob",
-                        sha=entry.sha,
-                    )
-                )
-
-            if removed == 0:
+            removed = [
+                entry.path
+                for entry in tree.tree
+                if entry.type == "blob"
+                and (entry.path == prefix or entry.path.startswith(prefix + "/"))
+            ]
+            if not removed:
                 return
 
-            new_tree = self._ghc.repo.create_git_tree(kept)
-            new_commit = self._ghc.repo.create_git_commit(
-                f"Delete directory {prefix}", new_tree, [base_commit]
+            overlay = [
+                InputGitTreeElement(path=path, mode="100644", type="blob", sha=None)
+                for path in removed
+            ]
+            commit_tree_overlay(
+                self._ghc.repo,
+                self._ghc.commit,
+                overlay,
+                f"Delete directory {prefix}",
             )
-            ref.edit(new_commit.sha)
             logger.info(
-                f"Deleted {removed} object(s) under {prefix} "
+                f"Deleted {len(removed)} object(s) under {prefix} "
                 f"from {self._ghc.repo_name}"
             )
         except Exception as ex:
