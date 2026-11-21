@@ -1651,7 +1651,7 @@ class TestPushFullSync:
         assert bases[1] is commits[0].tree
         assert bases[2] is commits[1].tree
         commit_calls = mock_ghc.repo.create_git_commit.call_args_list
-        assert commit_calls[0][0][2] == []
+        assert commit_calls[0][0][2] == [base_commit]
         assert commit_calls[1][0][2] == [commits[0]]
         assert commit_calls[2][0][2] == [commits[1]]
         ref.edit.assert_called_once_with(commits[-1].sha)

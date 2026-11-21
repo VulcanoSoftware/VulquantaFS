@@ -1173,15 +1173,11 @@ MetadataPushMode = Literal["coalesced", "inline"]
 class MetadataPushConfig:
     """How metadata mutations reach the metadata stores.
 
-    A file operation pushes the metadata tree once it is done. A bulk
-    operation (a folder delete over SFTP, where the protocol names one
-    file at a time) thus pushes once per file, and each push re-syncs the
-    whole tree to a mirror -- the cost that makes deleting a big folder
-    crawl. ``mode: coalesced`` waits ``window_ms`` before it writes and
-    collapses the pushes that arrived meanwhile into one attempt; the
-    waiting callers are released when the write covering them is done.
-    A push failure is logged, as with a background write, instead of
-    failing an operation whose local changes are already real.
+    ``mode: coalesced`` waits ``window_ms`` to merge overlapping pushes.
+    The waiting callers are released when the write covering them is
+    done. Eligible metadata-only SFTP removals use a local journal and
+    batch their remote writes separately, so sequential requests can
+    also be batched. ``mode: inline`` opts out of both behaviours.
 
     ``parallel_stores`` writes the tree to the primary and the mirrors at
     the same time instead of one store after another: the write lasts as

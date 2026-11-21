@@ -41,7 +41,7 @@ import asyncio
 import logging
 import time
 from dataclasses import dataclass
-from typing import Iterable, List, Optional, Sequence, Set
+from typing import AsyncIterator, Iterable, List, Optional, Sequence, Set
 
 from tgdcfs.core.model import TGFSDirectory, TGFSMetadata
 from tgdcfs.core.repository.interface import IMetaDataRepository
@@ -66,6 +66,7 @@ EMPTY_METADATA_ERRORS = (NoPinnedMessage, NoStoredMetadata)
 # is newer by more than this much -- otherwise the primary keeps the
 # lead, and calm operation never flips the source of truth.
 PRIMARY_FRESHNESS_WINDOW_SECONDS = 60.0
+LOAD_HEDGE_SECONDS = 1.0
 
 
 @dataclass
@@ -105,6 +106,7 @@ class ReplicatedMetadataRepository(IMetaDataRepository):
         self._skipped: dict[str, str] = {}
         # The boot's first push, once init() has run; see init().
         self._initial_push: Optional[asyncio.Task] = None
+        self._writes = asyncio.Lock()
         super().__init__()
         # Read as a plain attribute by the API layer, so it is copied from
         # the primary instead of forwarded dynamically.
@@ -220,22 +222,18 @@ class ReplicatedMetadataRepository(IMetaDataRepository):
                     loaded.add(store.key)
 
         failed_dated_read = False
-        while candidates:
-            winner, tree = self._freshest(candidates)
-            if winner.key in loaded:
-                break
-            try:
-                tree = await winner.repo.get()
-            except EMPTY_METADATA_ERRORS:
-                self._stale.add(winner.key)
-                empty_store = empty_store or winner
-            except Exception as ex:
-                failed(winner, ex)
+        selected: Optional[tuple[MetadataStore, TGFSMetadata]] = None
+        async for candidate, loaded_tree in self._read_candidates(candidates, loaded):
+            if isinstance(loaded_tree, EMPTY_METADATA_ERRORS):
+                self._stale.add(candidate.key)
+                empty_store = empty_store or candidate
+            elif isinstance(loaded_tree, Exception):
+                failed(candidate, loaded_tree)
                 failed_dated_read = True
             else:
-                break
-            candidates = [(s, t) for s, t in candidates if s is not winner]
-        else:
+                selected = candidate, loaded_tree
+
+        if selected is None:
             if empty_store is not None and not failed_dated_read:
                 if failures:
                     logger.warning(
@@ -251,14 +249,56 @@ class ReplicatedMetadataRepository(IMetaDataRepository):
                 "No metadata store could be read: " + "; ".join(failures)
             ) from first_error
 
+        winner, tree = selected
         for store, _ in candidates:
-            if store is not winner:
+            if store is not winner and store.key not in self._stale:
                 self._stale.add(store.key)
                 logger.info(
                     f"Metadata store {winner.key} holds the most recent "
                     f"metadata tree; store {store.key} will be re-synced"
                 )
         return tree
+
+    async def _read_candidates(
+        self,
+        candidates: Sequence[tuple[MetadataStore, TGFSMetadata]],
+        loaded: Set[str],
+    ) -> AsyncIterator[tuple[MetadataStore, TGFSMetadata | Exception]]:
+        """Keep the freshness order, but give a slow load a warm fallback."""
+        remaining = list(candidates)
+        reads: dict[str, asyncio.Task[TGFSMetadata]] = {}
+        try:
+            while remaining:
+                winner, tree = self._freshest(remaining)
+                remaining = [(s, t) for s, t in remaining if s is not winner]
+                if winner.key in loaded:
+                    yield winner, tree
+                    return
+                task = reads.get(winner.key)
+                if task is None:
+                    task = reads[winner.key] = asyncio.create_task(winner.repo.get())
+                if remaining and len(reads) == 1:
+                    fallback, _ = self._freshest(remaining)
+                    if fallback.key not in loaded:
+                        done, _ = await asyncio.wait({task}, timeout=LOAD_HEDGE_SECONDS)
+                        if not done:
+                            reads[fallback.key] = asyncio.create_task(
+                                fallback.repo.get()
+                            )
+                try:
+                    tree = await task
+                except Exception as ex:
+                    yield winner, ex
+                else:
+                    yield winner, tree
+                    return
+                finally:
+                    reads.pop(winner.key, None)
+        finally:
+            for task in reads.values():
+                task.cancel()
+            if reads:
+                await asyncio.gather(*reads.values(), return_exceptions=True)
 
     def _freshest(
         self,
@@ -292,6 +332,18 @@ class ReplicatedMetadataRepository(IMetaDataRepository):
     # -- writing ---------------------------------------------------------------
 
     async def push(self) -> None:
+        async with self._writes:
+            await self._push()
+
+    async def push_removals(self) -> None:
+        async with self._writes:
+            await self._push(all_full=True)
+            if stale := self.stale_stores():
+                # A stale mirror can be the only readable copy at a later
+                # boot. Keep the journal until it has the removals as well.
+                raise TechnicalError("Waiting for metadata stores: " + ", ".join(stale))
+
+    async def _push(self, all_full: bool = False) -> None:
         if not self.metadata:
             raise MetadataNotInitialized()
         self._stamp_revision()
@@ -309,7 +361,7 @@ class ReplicatedMetadataRepository(IMetaDataRepository):
         # everything it missed while it was unavailable has to land before
         # the next mutation goes through incrementally.
         def full_for(store: MetadataStore, index: int) -> bool:
-            return index > 0 or store.key in self._stale
+            return all_full or index > 0 or store.key in self._stale
 
         if self._concurrent_stores and len(self._stores) > 1:
             results.extend(
@@ -387,6 +439,12 @@ class ReplicatedMetadataRepository(IMetaDataRepository):
         compaction and the like), so the heal worker covers single-store
         and replicated file systems alike.
         """
+        if self._initial_push is not None and not self._initial_push.done():
+            return
+        async with self._writes:
+            await self._heal()
+
+    async def _heal(self) -> None:
         if not self.metadata:
             return
         for store in self._stores:

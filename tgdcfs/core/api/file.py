@@ -53,6 +53,7 @@ class FileApi:
         written_gaps_only: bool = False,
         stat_api: Optional[FileStatApi] = None,
         cleanup_local_versions: bool = True,
+        has_cached_versions: Optional[Callable[[], bool]] = None,
     ):
         self._metadata_api = metadata_api
         self._file_desc_api = file_desc_api
@@ -60,6 +61,7 @@ class FileApi:
         self._mirror_group = mirror_group
         self._inline_mirroring = inline_mirroring
         self._cleanup_local_versions = cleanup_local_versions
+        self._has_cached_versions = has_cached_versions
         # Called after a file's content changed and the metadata is
         # pushed; the replication queue hooks in here for
         # ``sync: background``.
@@ -224,10 +226,8 @@ class FileApi:
         contribute nothing: their messages are shared and must stay.
         ``version_ids`` collects the ids of the versions that go with them.
         """
-        if not (
-            self._message_api.deletes_on_remove
-            or (self._mirror_group and self._mirror_group.deletes_on_remove)
-            or (version_ids is not None and self._cleanup_local_versions)
+        if not self._deletes_backend_messages() and not (
+            version_ids is not None and self._cleanup_local_versions
         ):
             # A metadata-only delete needs neither a scan for shared
             # descriptors nor any descriptor reads from the backends.
@@ -247,6 +247,11 @@ class FileApi:
             for channel_key, channel_ids in fr_mirror_ids.items():
                 mirror_ids.setdefault(channel_key, []).extend(channel_ids)
         return ids, mirror_ids
+
+    def _deletes_backend_messages(self) -> bool:
+        return self._message_api.deletes_on_remove or (
+            self._mirror_group is not None and self._mirror_group.deletes_on_remove
+        )
 
     def _owning_store(self, version: TGFSFileVersion) -> Optional[IStore]:
         """The store whose channel ``version.message_ids`` live in.
@@ -454,12 +459,30 @@ class FileApi:
         await self.stats.refresh(fr, resp.fd)
         return resp.fd
 
-    async def rm(self, fr: TGFSFileRef, version_id: Optional[str] = None) -> None:
+    async def rm(
+        self,
+        fr: TGFSFileRef,
+        version_id: Optional[str] = None,
+        defer_metadata: bool = False,
+    ) -> None:
         if not version_id:
             version_ids: List[str] = []
-            message_ids, mirror_ids = await self.collect_deletable_message_ids(
-                [fr], version_ids if self._cleanup_local_versions else None
+            clean_cache = self._cleanup_local_versions and (
+                self._has_cached_versions is None or self._has_cached_versions()
             )
+            message_ids, mirror_ids = await self.collect_deletable_message_ids(
+                [fr], version_ids if clean_cache else None
+            )
+            if (
+                defer_metadata
+                and not self._deletes_backend_messages()
+                and fr.owned_by(self._store_key)
+                and self._metadata_api.defer_removal(fr)
+            ):
+                self.stats.changed(fr.location, pushed=True)
+                if version_ids:
+                    await self._file_desc_api.forget_versions(version_ids)
+                return
             await fr.delete_async()
             await self._metadata_api.push()
             self.stats.changed(fr.location, pushed=True)

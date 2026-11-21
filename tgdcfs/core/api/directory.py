@@ -54,6 +54,7 @@ class DirectoryApi:
         The subtree keeps referring to the same Telegram messages, so nothing
         is uploaded and, crucially, nothing is deleted from the channel.
         """
+        await self.__metadata_api.flush_removals()
         directory.move_to(to_parent, name)
         await self.__metadata_api.push()
         return directory
