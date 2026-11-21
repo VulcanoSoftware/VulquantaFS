@@ -7,10 +7,6 @@
 [![Docker](https://img.shields.io/badge/docker-%230db7ed.svg?style=for-the-badge&logo=docker&logoColor=white)](https://hub.docker.com/r/vecstack-prog/vulquantafs)
 <!-- badges-end -->
 
-> **Fork note.** Nothing in this repository's workflows or badges is
-> hard-coded to an owner. Docker images publish under
-> `${{ github.repository_owner }}`, and the "Sync README badges" workflow
-
 <div align="center">
 
 # VulquantaFS
