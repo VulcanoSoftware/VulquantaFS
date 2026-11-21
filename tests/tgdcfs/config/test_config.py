@@ -1,6 +1,7 @@
 import pytest
 
 from tgdcfs.config import (
+    BotConfig,
     CacheConfig,
     Config,
     GithubRepoConfig,
@@ -18,6 +19,22 @@ from tgdcfs.config import (
     WebDAVConfig,
     _env_with_legacy_fallback,
 )
+
+
+@pytest.mark.parametrize("value", [0, -1, float("inf"), float("nan")])
+def test_telegram_bot_login_timeout_must_be_finite_and_positive(value):
+    with pytest.raises(ValueError, match="login_timeout_s"):
+        BotConfig.from_dict({"session_file": "bot.session", "login_timeout_s": value})
+
+
+def test_telegram_bot_login_timeout_defaults_to_twenty_and_can_be_changed():
+    assert BotConfig.from_dict({"session_file": "bot.session"}).login_timeout_s == 20
+    assert (
+        BotConfig.from_dict(
+            {"session_file": "bot.session", "login_timeout_s": 5.5}
+        ).login_timeout_s
+        == 5.5
+    )
 
 
 class TestWebDAVConfig:
@@ -156,6 +173,9 @@ class TestSFTPConfig:
         assert config.authorized_keys_dir is None
         assert config.upload_buffer_dir is None
         assert config.upload_buffer_size_mb == SFTPConfig.DEFAULT_UPLOAD_BUFFER_SIZE_MB
+        assert (
+            config.fast_readdir_min_files == SFTPConfig.DEFAULT_FAST_READDIR_MIN_FILES
+        )
 
     def test_full_block(self):
         config = SFTPConfig.from_dict(
@@ -167,6 +187,7 @@ class TestSFTPConfig:
                 "authorized_keys_dir": "keys/authorized",
                 "upload_buffer_size_mb": 8,
                 "upload_buffer_dir": "spool",
+                "fast_readdir_min_files": 0,
             }
         )
 
@@ -179,6 +200,7 @@ class TestSFTPConfig:
         assert config.upload_buffer_size_mb == 8
         assert config.upload_buffer_size_bytes == 8 * 1024 * 1024
         assert config.upload_buffer_dir is not None
+        assert config.fast_readdir_min_files == 0
 
     @pytest.mark.parametrize("port", [0, 65536, -1])
     def test_rejects_invalid_port(self, port):
@@ -188,6 +210,10 @@ class TestSFTPConfig:
     def test_rejects_negative_buffer_size(self):
         with pytest.raises(ValueError):
             SFTPConfig.from_dict({"upload_buffer_size_mb": -1})
+
+    def test_rejects_negative_fast_readdir_threshold(self):
+        with pytest.raises(ValueError, match="fast_readdir_min_files"):
+            SFTPConfig.from_dict({"fast_readdir_min_files": -1})
 
 
 class TestCacheConfig:

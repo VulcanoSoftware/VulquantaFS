@@ -127,6 +127,10 @@ class IMetaDataRepository(metaclass=ABCMeta):
         """
         await self.push()
 
+    async def push_removals(self) -> None:
+        """Persist journaled removals, which bypass incremental writes."""
+        await self.push_full()
+
     @abstractmethod
     async def get(self) -> TGFSMetadata:
         pass

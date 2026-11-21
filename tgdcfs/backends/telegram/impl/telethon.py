@@ -54,6 +54,8 @@ logger = logging.getLogger(__name__)
 # at a multiple of its own size never straddles one, hence every download
 # starts at such an offset and the bytes before the wanted one are dropped.
 DOWNLOAD_REQUEST_SIZE = MAX_CHUNK_SIZE
+EXTRA_CONNECTION_WARMUP_SECONDS = 5.0
+STARTUP_DISCONNECT_SECONDS = 2.0
 T = TypeVar("T")
 
 
@@ -529,6 +531,16 @@ class Session:
             f.write(session_string)
 
 
+async def _disconnect_after_startup_failure(client: TelegramClient) -> None:
+    try:
+        async with asyncio.timeout(STARTUP_DISCONNECT_SECONDS):
+            await client.disconnect()
+    except Exception as ex:
+        logger.warning(
+            "Telegram startup connection cleanup failed (%s)", type(ex).__name__
+        )
+
+
 async def open_extra_connections(
     config: Config, client: TelegramClient
 ) -> List[TelegramClient]:
@@ -546,22 +558,36 @@ async def open_extra_connections(
 
     session_string = client.session.save()  # type: ignore[attr-defined]
     connections: List[TelegramClient] = []
-    for i in range(extra):
-        try:
-            connection = _RPCOnlyTelegramClient(
-                StringSession(session_string),
-                config.telegram.api_id,
-                config.telegram.api_hash,
-                receive_updates=False,
-            )
-            await connection.connect()
-            connections.append(connection)
-        except Exception as ex:
-            logger.warning(
-                f"Could not open connection {i + 2} of {extra + 1} for this "
-                f"session ({ex}); continuing with {len(connections) + 1}"
-            )
-            break
+    pending: TelegramClient | None = None
+    try:
+        # One budget for the entire optional pool, not one per connection.
+        async with asyncio.timeout(EXTRA_CONNECTION_WARMUP_SECONDS):
+            for _ in range(extra):
+                pending = _RPCOnlyTelegramClient(
+                    StringSession(session_string),
+                    config.telegram.api_id,
+                    config.telegram.api_hash,
+                    receive_updates=False,
+                )
+                await pending.connect()
+                connections.append(pending)
+                pending = None
+    except asyncio.CancelledError:
+        if pending is not None:
+            connections.append(pending)
+        await asyncio.gather(
+            *(_disconnect_after_startup_failure(c) for c in connections),
+        )
+        raise
+    except Exception as ex:
+        logger.warning(
+            "Telegram optional connections: opened %s of %s extras (%s); continuing",
+            len(connections),
+            extra,
+            type(ex).__name__,
+        )
+        if pending is not None:
+            await _disconnect_after_startup_failure(pending)
 
     if connections:
         logger.info(f"Opened {len(connections) + 1} connections for this session")
@@ -614,32 +640,74 @@ async def login_as_bots(config: Config) -> List[TelegramClient]:
     api_hash = config.telegram.api_hash
 
     bot_tokens = config.telegram.bot.tokens or [config.telegram.bot.token]
+    timeout = config.telegram.bot.login_timeout_s
+    logger.info("Telegram: logging in %s bot(s) via Telethon", len(bot_tokens))
+    connected: List[TelegramClient] = []
 
-    async def login(token: str) -> TelegramClient:
+    async def login(token: str) -> TelegramClient | None:
         bot_id, _ = token.split(":")
 
         session = Session(
             os.path.join(config.telegram.bot.session_file, f"{bot_id}.session")
         )
 
-        if sess := session.get():
-            client = _RPCOnlyTelegramClient(
-                sess, api_id, api_hash, receive_updates=False
+        sess = session.get()
+        client = _RPCOnlyTelegramClient(
+            sess if sess is not None else StringSession(),
+            api_id,
+            api_hash,
+            receive_updates=False,
+        )
+        try:
+            async with asyncio.timeout(timeout):
+                # Bound the auth-key exchange, data-centre migration, and
+                # first RPC, not just the network connect.
+                await client.connect()
+                if sess is None:
+                    await client.start(bot_token=token)  # type: ignore
+                    session.save_multibot(client.session.save())  # type: ignore
+                me = await client.get_me()
+        except (TimeoutError, ConnectionError) as ex:
+            logger.warning(
+                "Telegram bot %s not ready (%s; login budget %gs); excluding it from startup",
+                bot_id,
+                type(ex).__name__,
+                timeout,
             )
-            await client.connect()
-        else:
-            client = _RPCOnlyTelegramClient(
-                StringSession(), api_id, api_hash, receive_updates=False
-            )
-            await client.connect()
-            await client.start(bot_token=token)  # type: ignore
-            session.save_multibot(client.session.save())  # type: ignore
+            await _disconnect_after_startup_failure(client)
+            return None
+        except (Exception, asyncio.CancelledError):
+            await _disconnect_after_startup_failure(client)
+            raise
 
-        if (me := await client.get_me()) and isinstance(me, tlt.User) and me.username:
+        if isinstance(me, tlt.User) and me.username:
             logger.info(f"logged in as @{me.username}")
         else:
             logger.warning("logged in as bot, but no username found")
 
+        connected.append(client)
         return client
 
-    return await asyncio.gather(*(login(token) for token in bot_tokens))
+    try:
+        results = await asyncio.gather(
+            *(login(token) for token in bot_tokens), return_exceptions=True
+        )
+    except asyncio.CancelledError:
+        await asyncio.gather(*(_disconnect_after_startup_failure(c) for c in connected))
+        raise
+    clients: List[TelegramClient] = []
+    failure: BaseException | None = None
+    for result in results:
+        if isinstance(result, BaseException):
+            failure = failure or result
+        elif result is not None:
+            clients.append(result)
+    if failure is not None:
+        await asyncio.gather(*(_disconnect_after_startup_failure(c) for c in clients))
+        raise failure
+    if not clients:
+        raise TechnicalError(
+            "None of the configured Telegram bots could log in; check the connection or session"
+        )
+    logger.info("Telegram: %s/%s bot(s) ready", len(clients), len(bot_tokens))
+    return clients

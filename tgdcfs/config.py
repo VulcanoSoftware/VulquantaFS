@@ -1,4 +1,5 @@
 import logging
+import math
 import os
 from dataclasses import dataclass, field
 from enum import Enum
@@ -465,6 +466,10 @@ class SFTPConfig:
     likes; the buffer takes it, in memory first and on disk beyond
     ``upload_buffer_size_mb``. A gap that no write ever covers is
     zero-filled when the client closes the file.
+
+    ``fast_readdir_min_files`` lets SFTP list large folders from metadata
+    alone. Files without stored stats are listed without size or dates,
+    which a client can still request with STAT/LSTAT. Zero disables it.
     """
 
     enabled: bool
@@ -480,6 +485,9 @@ class SFTPConfig:
     DEFAULT_HOST_KEY_FILE = "sftp_host_key"
     DEFAULT_UPLOAD_BUFFER_SIZE_MB = 64
     DEFAULT_MAX_AHEAD_GAP_MB = 1024
+    DEFAULT_FAST_READDIR_MIN_FILES = 256
+
+    fast_readdir_min_files: int = DEFAULT_FAST_READDIR_MIN_FILES
 
     @property
     def upload_buffer_size_bytes(self) -> int:
@@ -513,6 +521,15 @@ class SFTPConfig:
                 f"sftp.max_ahead_gap_mb must be positive, got {max_ahead_gap_mb}"
             )
 
+        fast_readdir_min_files = int(
+            data.get("fast_readdir_min_files", cls.DEFAULT_FAST_READDIR_MIN_FILES)
+        )
+        if fast_readdir_min_files < 0:
+            raise ValueError(
+                "sftp.fast_readdir_min_files must not be negative, "
+                f"got {fast_readdir_min_files}"
+            )
+
         return cls(
             enabled=bool(data.get("enabled", False)),
             host=str(data.get("host", "0.0.0.0")),  # noqa: S104
@@ -532,6 +549,7 @@ class SFTPConfig:
                 else None
             ),
             max_ahead_gap_mb=max_ahead_gap_mb,
+            fast_readdir_min_files=fast_readdir_min_files,
         )
 
 
@@ -924,13 +942,18 @@ class BotConfig:
     token: str
     session_file: str
     tokens: List[str] = field(default_factory=list)
+    login_timeout_s: float = 20.0
 
     @classmethod
     def from_dict(cls, data: dict) -> "BotConfig":
+        timeout = float(data.get("login_timeout_s", 20.0))
+        if not math.isfinite(timeout) or timeout <= 0:
+            raise ValueError("Telegram bot login_timeout_s must be a positive number")
         return cls(
             token=data.get("token", ""),
             tokens=data.get("tokens", []),
             session_file=expand_path(data["session_file"]),
+            login_timeout_s=timeout,
         )
 
 
@@ -1173,15 +1196,11 @@ MetadataPushMode = Literal["coalesced", "inline"]
 class MetadataPushConfig:
     """How metadata mutations reach the metadata stores.
 
-    A file operation pushes the metadata tree once it is done. A bulk
-    operation (a folder delete over SFTP, where the protocol names one
-    file at a time) thus pushes once per file, and each push re-syncs the
-    whole tree to a mirror -- the cost that makes deleting a big folder
-    crawl. ``mode: coalesced`` waits ``window_ms`` before it writes and
-    collapses the pushes that arrived meanwhile into one attempt; the
-    waiting callers are released when the write covering them is done.
-    A push failure is logged, as with a background write, instead of
-    failing an operation whose local changes are already real.
+    ``mode: coalesced`` waits ``window_ms`` to merge overlapping pushes.
+    The waiting callers are released when the write covering them is
+    done. Eligible metadata-only SFTP removals use a local journal and
+    batch their remote writes separately, so sequential requests can
+    also be batched. ``mode: inline`` opts out of both behaviours.
 
     ``parallel_stores`` writes the tree to the primary and the mirrors at
     the same time instead of one store after another: the write lasts as

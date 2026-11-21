@@ -9,10 +9,11 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import Iterable, NamedTuple, Optional, Sequence, Set, cast
 
-from github import Github, GithubException, GithubRetry, InputGitTreeElement
+from github import Github, GithubException, InputGitTreeElement
 from github.ContentFile import ContentFile
 from github.GitCommit import GitCommit
 from github.Repository import Repository
+from urllib3.util import Retry
 
 from tgdcfs.config import GithubRepoConfig, expand_path
 from tgdcfs.core.model import FileStat, TGFSDirectory, TGFSFileRef, TGFSMetadata
@@ -67,6 +68,7 @@ class _HeadCommit(NamedTuple):
 STATS_COMMIT_ATTEMPTS = 3
 # How often the full-tree sync commit is retried when the branch moved.
 SYNC_COMMIT_ATTEMPTS = 3
+GITHUB_PAGE_SIZE = 100
 
 
 def _blob_sha(content: str) -> str:
@@ -88,7 +90,13 @@ class GithubRepoMetadataRepository(IMetaDataRepository):
         super().__init__()
         self._stats_loads: dict[int, asyncio.Future[bool]] = {}
 
-        gh = Github(config.access_token, retry=GithubRetry(total=1))
+        # Keep bounded connection retries, but don't sleep through GitHub
+        # rate limits on the single metadata writer or the SFTP event loop.
+        gh = Github(
+            config.access_token,
+            per_page=GITHUB_PAGE_SIZE,
+            retry=Retry(total=1, status=0, respect_retry_after_header=False),
+        )
         # Injectable for a store that speaks the PyGithub surface without
         # being GitHub (the GitLab tree mirror); the default client talks
         # to GitHub itself. The lazy flag keeps the resolution request out
@@ -276,52 +284,47 @@ class GithubRepoMetadataRepository(IMetaDataRepository):
     async def maintain(self) -> None:
         if self._ghc.squash_history_max_commits <= 0:
             return
-        await self._ghc.write(self._compact_history)
+        # History inspection does not write. Do not queue it ahead of
+        # deletes on the single writer thread.
+        head = await asyncio.to_thread(self._compaction_candidate)
+        if head is not None:
+            async with self._ghc.lock:
+                await self._ghc.write(self._compact_history, head)
 
-    def _compact_history(self) -> None:
-        """Rewrite the branch as one orphan commit carrying its whole
-        current state, when its history grew past the configured limit.
-
-        Every deleted blob stays on the backend's disk for as long as a
-        commit references it. The orphan commit (no parents, the same
-        shape the initial sync commit uses) leaves the old history with
-        no ref pointing at it, so the backend's garbage collection can
-        reclaim the deleted blobs. Blocking; raises when the compaction
-        cannot be done safely.
-        """
+    def _compaction_candidate(self) -> Optional[str]:
+        """Check only the page that would contain the first excess commit."""
         repo = self._ghc.repo
-        limit = self._ghc.squash_history_max_commits
+        page, offset = divmod(self._ghc.squash_history_max_commits, GITHUB_PAGE_SIZE)
         try:
-            commits: list = list(repo.get_commits(sha=self._ghc.commit)[: limit + 1])
+            head = repo.get_git_ref(f"heads/{self._ghc.commit}").object.sha
+            commits = repo.get_commits(sha=head).get_page(page)
         except GithubException as ex:
-            if getattr(ex, "status", None) == 404:
-                return
+            if ex.status in (404, 409):
+                return None
             raise
-        if len(commits) <= limit:
+        return head if len(commits) > offset else None
+
+    def _compact_history(self, head: str) -> None:
+        """Reuse the complete immutable tree of the checked branch head."""
+        repo = self._ghc.repo
+        ref_name = f"heads/{self._ghc.commit}"
+        ref = repo.get_git_ref(ref_name)
+        if ref.object.sha != head:
             return
-        ref = repo.get_git_ref(f"heads/{self._ghc.commit}")
-        base_commit = repo.get_git_commit(ref.object.sha)
-        tree = repo.get_git_tree(base_commit.tree.sha, recursive=True)
-        if tree.truncated:
-            raise TechnicalError(
-                f"The tree of {self._ghc.repo_name}@{self._ghc.commit} is "
-                f"truncated; the metadata history cannot be squashed safely"
-            )
-        elements = [
-            InputGitTreeElement(path=e.path, mode=e.mode, type="blob", sha=e.sha)
-            for e in tree.tree
-            if e.type == "blob"
-        ]
-        new_tree = repo.create_git_tree(elements)
+        base_commit = repo.get_git_commit(head)
         commit = repo.create_git_commit(
-            f"Compact metadata history ({len(commits)} commits squashed)",
-            new_tree,
+            "Compact metadata history",
+            base_commit.tree,
             [],
         )
+        # Skip the rewrite if another writer already published a new head.
+        # The ref API offers no compare-and-swap for this forced update.
+        if repo.get_git_ref(ref_name).object.sha != head:
+            return
         ref.edit(commit.sha, force=True)
         logger.info(
             f"Compacted the metadata history of {self._ghc.repo_name}@"
-            f"{self._ghc.commit}: squashed {len(commits)} commits into one"
+            f"{self._ghc.commit} into one commit"
         )
 
     # -- full-tree sync (``push_full``) -------------------------------------
@@ -408,7 +411,7 @@ class GithubRepoMetadataRepository(IMetaDataRepository):
     def _is_managed_blob(path: str) -> bool:
         """Whether the sync may delete this blob: file references (``name.id``
         -- the same shape the loader parses) and ``.gitkeep`` placeholders.
-        Anything else in the repo (stats files, a README) is left alone."""
+        Stats files have their own retention rule; foreign blobs are left alone."""
         segment = path.rsplit("/", 1)[-1]
         if segment == ".gitkeep":
             return True
@@ -458,10 +461,23 @@ class GithubRepoMetadataRepository(IMetaDataRepository):
                     e.path: (e.sha, e.mode) for e in tree.tree if e.type == "blob"
                 }
             creates = sorted(desired_blobs - set(current))
+            desired_sorted = sorted(desired_blobs)
+
+            def stale_stats(path: str) -> bool:
+                parent, _, filename = path.rpartition("/")
+                if not parent or filename != STATS_FILE_NAME:
+                    return False
+                prefix = parent + "/"
+                index = bisect.bisect_left(desired_sorted, prefix)
+                return index == len(desired_sorted) or not desired_sorted[
+                    index
+                ].startswith(prefix)
+
             deletes = sorted(
                 path
                 for path in current
-                if path not in desired_blobs and self._is_managed_blob(path)
+                if path not in desired_blobs
+                and (self._is_managed_blob(path) or stale_stats(path))
             )
             if not creates and not deletes:
                 return
@@ -624,16 +640,18 @@ class GithubRepoMetadataRepository(IMetaDataRepository):
                 changes.append((directory, content))
 
         if changes:
-            # Paths and contents are fixed here, on the event loop; the
-            # thread only talks to GitHub.
-            writes = [(d.stats_path, content) for d, content in changes]
-            # Same writer thread as the file references: both commit on the
-            # branch, and two at once is what made the stats ref update fail
-            # with "not a fast forward".
-            await self._ghc.write(self._commit_stats, writes)
-            for directory, content in changes:
-                directory.stats_sha = None if content is None else _blob_sha(content)
-                directory.stats_loaded = True
+            async with self._ghc.lock:
+                # RMDIR may have completed while this write was queued.
+                # A stats blob must never recreate a detached directory.
+                attached = [(d, content) for d, content in changes if d.is_attached()]
+                if attached:
+                    writes = [(d.stats_path, content) for d, content in attached]
+                    await self._ghc.write(self._commit_stats, writes)
+                    for directory, content in attached:
+                        directory.stats_sha = (
+                            None if content is None else _blob_sha(content)
+                        )
+                        directory.stats_loaded = True
 
         if unreadable:
             raise TechnicalError(
@@ -710,7 +728,7 @@ class GithubRepoMetadataRepository(IMetaDataRepository):
                 return metadata
         # Off the loop too: with a large repo the walk is a request per
         # directory. The structure is built fresh, so nothing is shared.
-        root_dir = await asyncio.to_thread(self._build_directory_structure)
+        root_dir = await asyncio.to_thread(self._load_directory_at, head)
         metadata = TGFSMetadata(dir=root_dir)
         # The replicated layer compares stores by this date: the branch head
         # is when this copy was written last. A store that proves dead later
@@ -776,21 +794,24 @@ class GithubRepoMetadataRepository(IMetaDataRepository):
             return None
         return _HeadCommit(sha, date.timestamp())
 
-    def _build_directory_structure(self) -> GithubDirectory:
+    def _load_directory_at(self, head: Optional[_HeadCommit]) -> GithubDirectory:
+        return self._build_directory_structure()
+
+    def _build_directory_structure(self, ref: Optional[str] = None) -> GithubDirectory:
         root = GithubDirectory(
             self._ghc, name="root", parent=None, children=[], files=[]
         )
         self._restore_root_timestamps(root)
 
         try:
-            entries = self._read_tree()
+            entries = self._read_tree(ref) if ref is not None else self._read_tree()
             if entries is not None:
                 self._build_from_tree(entries, root)
             else:
                 contents = self._ghc.repo.get_contents("", ref=self._ghc.commit)
                 self._process_contents(contents, root)
         except GithubException as ex:
-            if ex.status in (404, 409):
+            if ref is None and ex.status in (404, 409):
                 # An empty repository, or the branch does not exist yet:
                 # there is no tree, which is how every installation starts.
                 logger.warning(
@@ -813,7 +834,7 @@ class GithubRepoMetadataRepository(IMetaDataRepository):
 
         return root
 
-    def _read_tree(self) -> Optional[Sequence[_TreeEntry]]:
+    def _read_tree(self, ref: Optional[str] = None) -> Optional[Sequence[_TreeEntry]]:
         """The whole repo tree in one request, or ``None`` if it is unusable.
 
         ``get_contents`` lists exactly one directory, so walking the tree with
@@ -828,7 +849,7 @@ class GithubRepoMetadataRepository(IMetaDataRepository):
         then read one directory at a time instead.
         """
         try:
-            tree = self._ghc.repo.get_git_tree(self._ghc.commit, recursive=True)
+            tree = self._ghc.repo.get_git_tree(ref or self._ghc.commit, recursive=True)
             if not tree.truncated:
                 return [_TreeEntry(e.path, e.type, e.sha) for e in tree.tree]
             logger.warning(

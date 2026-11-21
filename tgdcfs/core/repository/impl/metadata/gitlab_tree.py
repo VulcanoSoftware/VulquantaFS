@@ -23,7 +23,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
-from typing import Any, Dict, List, NamedTuple, Optional, Sequence, cast
+from typing import Any, Dict, Iterable, List, NamedTuple, Optional, Sequence, cast
 from urllib.parse import quote
 
 import requests
@@ -39,9 +39,16 @@ from tgdcfs.core.repository.impl.metadata.breaker import (
 )
 from tgdcfs.core.repository.impl.metadata.github_repo import (
     GithubRepoMetadataRepository,
+    _HeadCommit,
+)
+from tgdcfs.core.repository.impl.metadata.github_repo import (
+    _TreeEntry as _MetadataTreeEntry,
 )
 from tgdcfs.core.repository.impl.metadata.github_repo.dir_timestamps import (
     STATS_COMMIT_SCAN_LIMIT,
+)
+from tgdcfs.core.repository.impl.metadata.github_repo.gh_directory import (
+    GithubDirectory,
 )
 from tgdcfs.crypto.metadata_blob import decrypt_metadata_blob
 from tgdcfs.errors import NoStoredMetadata, TechnicalError
@@ -78,6 +85,9 @@ GITALY_DEADLINE_MARKERS = ("Stream removed", "Deadline Exceeded")
 # large file system has to arrive as several ordinary commits, or GitLab
 # kills the operation on its own deadline.
 GITLAB_COMMIT_ACTION_LIMIT = 500
+# On a cold cache a handful of exact path lookups is cheaper than a
+# full recursive scan. Large overlays still benefit from the complete cache.
+POINT_LOOKUP_LIMIT = 8
 
 # GitLab answers 429 when the access token runs into its usage quota. A
 # full-tree sync fires many requests in a burst and one 429 used to fail
@@ -213,13 +223,15 @@ class GitlabRepository:
     """The subset of PyGithub's ``Repository`` the tree-mirror metadata
     store uses, served from the GitLab REST API."""
 
-    def __init__(self, config: GitlabRepoConfig):
+    def __init__(self, config: GitlabRepoConfig, *, wait_on_rate_limit: bool = True):
         self._base_url = config.base_url.rstrip("/")
         self._project = quote(config.repo, safe="")
         self._branch = config.branch
         self._token = config.access_token
         self._blob_fetch_concurrency = config.blob_fetch_concurrency
+        self._wait_on_rate_limit = wait_on_rate_limit
         self._local = threading.local()
+        self._pause_lock = threading.Lock()
         # The moment (clock monotonic) until no request of this project may
         # be sent, because a 429 prescribed a wait. Every caller -- the
         # retries of its own request and any parallel worker of a listing
@@ -242,6 +254,9 @@ class GitlabRepository:
         # invalidates the cache (one re-read) silently.
         self._cached_head: Optional[str] = None
         self._cached_blobs: Optional[Dict[str, _TreeEntry]] = None
+        # A retry of a rate-limited full sync can resume an immutable tree
+        # instead of spending the next quota window on the very same pages.
+        self._tree_scan: Optional[tuple[str, List[dict], int, str]] = None
         # Set when ``get_git_ref`` answered 404: the next commit creates
         # the branch, which needs a start point (see ``_post_commit``).
         self._branch_missing = False
@@ -261,8 +276,13 @@ class GitlabRepository:
         head = self._branch_head()
         if self._cached_head == head and self._cached_blobs is not None:
             return self._cached_blobs
+        return self._load_tree_at(head)
+
+    def _load_tree_at(self, head: str) -> Dict[str, _TreeEntry]:
+        # Pin every page to one immutable revision, even if another writer
+        # moves the branch mid-listing. Never cache a partial listing.
         items = self._paginated(
-            "/repository/tree", {"ref": self._branch, "recursive": "true"}
+            "/repository/tree", {"ref": head, "recursive": "true"}, resume_key=head
         )
         entries = [
             _TreeEntry(
@@ -276,9 +296,9 @@ class GitlabRepository:
         for entry in entries:
             if entry.type == "tree":
                 self._tree_paths[entry.sha] = entry.path
-        self._cached_blobs = {entry.path: entry for entry in entries}
-        self._cached_head = head
-        return self._cached_blobs
+        cached = {entry.path: entry for entry in entries}
+        self._cached_blobs, self._cached_head = cached, head
+        return cached
 
     def _cache_actions(self, actions: List[dict], head: str) -> None:
         """Fold a commit that just landed through ``_post_commit`` into the
@@ -348,9 +368,8 @@ class GitlabRepository:
     def _publish_pause(self, wait: float) -> None:
         """Make every later request of this project wait out ``wait``
         seconds before it sends, keeping the longest pause asked for."""
-        until = time.monotonic() + wait
-        if until > self._paused_until:
-            self._paused_until = until
+        with self._pause_lock:
+            self._paused_until = max(self._paused_until, time.monotonic() + wait)
 
     def _request(
         self,
@@ -376,8 +395,12 @@ class GitlabRepository:
                 timeout=REQUEST_TIMEOUT_SECONDS,
             )
 
-        attempts = RATE_LIMIT_RETRIES if retry_rate_limit else 1
-        self._hold_off()
+        wait_on_limit = retry_rate_limit and self._wait_on_rate_limit
+        attempts = RATE_LIMIT_RETRIES if wait_on_limit else 1
+        if wait_on_limit:
+            self._hold_off()
+        elif self._paused_until > time.monotonic():
+            raise GithubException(429, {"message": "GitLab rate-limit cooldown active"})
         response = send()
         for attempt in range(attempts - 1):
             if response.status_code != 429:
@@ -394,6 +417,15 @@ class GitlabRepository:
             self._publish_pause(wait)
             time.sleep(wait)
             response = send()
+        if response.status_code == 429:
+            # Keep the full server-specified cooldown for fail-fast callers:
+            # they don't sleep, but won't restart the same scan every push.
+            if not wait_on_limit:
+                try:
+                    wait = max(1.0, int(response.headers.get("Retry-After", "")))
+                except (TypeError, ValueError):
+                    wait = self._rate_limit_wait(response, 0)
+                self._publish_pause(wait)
         if response.status_code >= 400:
             data = _error_data(response)
             if _is_gitaly_deadline(data):
@@ -421,62 +453,86 @@ class GitlabRepository:
             params={"ref_name": self._branch, "per_page": 1},
         )
 
-    def _paginated(self, path: str, params: dict) -> List[dict]:
-        response = self._request(
-            "GET", path, params=dict(params, page=1, per_page=PER_PAGE)
-        )
-        first = self._json(response)
-        items: List[dict] = first if isinstance(first, list) else []
-        next_page = response.headers.get("X-Next-Page", "").strip()
-        if not next_page or len(items) < PER_PAGE:
+    def _paginated(
+        self, path: str, params: dict, *, resume_key: Optional[str] = None
+    ) -> List[dict]:
+        checkpoint = self._tree_scan if resume_key is not None else None
+        if checkpoint is not None and checkpoint[0] == resume_key:
+            _, items, page, total_pages = checkpoint
+        else:
+            if resume_key is not None:
+                self._tree_scan = None
+            response = self._request(
+                "GET", path, params=dict(params, page=1, per_page=PER_PAGE)
+            )
+            first = self._json(response)
+            if resume_key is not None and not isinstance(first, list):
+                raise TechnicalError("GitLab returned an invalid tree page")
+            items = first if isinstance(first, list) else []
+            next_page = response.headers.get("X-Next-Page", "").strip()
+            if not next_page:
+                return items
+            total_pages = response.headers.get("X-Total-Pages", "").strip()
+            page = int(next_page)
+
+        def remember(next_page: int) -> None:
+            if resume_key is not None:
+                self._tree_scan = (resume_key, items, next_page, total_pages)
+
+        def complete() -> List[dict]:
+            if resume_key is not None:
+                self._tree_scan = None
             return items
-        total_pages = response.headers.get("X-Total-Pages", "").strip()
+
+        remember(page)
         if (
             total_pages.isdigit()
-            and 1 < int(total_pages) <= MAX_HISTORY_PAGES
+            and page <= int(total_pages) <= MAX_HISTORY_PAGES
             and self._blob_fetch_concurrency > 1
         ):
             # The rest of the listing is fetched concurrently: the
             # recursive listing of a grown metadata repository paginates
             # into hundreds of GETs, and at one page per round trip it
             # lined the whole boot behind a quarter hour of them. GitLab
-            # reports the total page count, so every page can be asked
-            # for at once; each request still waits out a 429 like any
-            # other, and a rate limiter makes the pool crawl instead of
-            # fail.
-            pages = range(2, int(total_pages) + 1)
+            # reports the total page count, so bounded batches can be
+            # fetched in parallel and still assembled in page order.
+            pages = range(page, int(total_pages) + 1)
             workers = min(self._blob_fetch_concurrency, len(pages))
+
+            def fetch(page: int) -> Any:
+                return self._json(
+                    self._request(
+                        "GET", path, params=dict(params, page=page, per_page=PER_PAGE)
+                    )
+                )
+
             with ThreadPoolExecutor(max_workers=workers) as pool:
-                fetched = pool.map(
-                    lambda page: self._json(
-                        self._request(
-                            "GET",
-                            path,
-                            params=dict(params, page=page, per_page=PER_PAGE),
-                        )
-                    ),
-                    pages,
-                )
-                items.extend(
-                    item
-                    for batch in fetched
-                    if isinstance(batch, list)
-                    for item in batch
-                )
-            return items
-        page = int(next_page)
+                # Submit only one wave at a time. A 429 aborts the scan
+                # without queueing the entire rest of the repository.
+                for offset in range(0, len(pages), workers):
+                    for batch in pool.map(fetch, pages[offset : offset + workers]):
+                        if isinstance(batch, list):
+                            items.extend(batch)
+                        elif resume_key is not None:
+                            raise TechnicalError("GitLab returned an invalid tree page")
+                        page += 1
+                        remember(page)
+            return complete()
         while True:
             response = self._request(
                 "GET", path, params=dict(params, page=page, per_page=PER_PAGE)
             )
             batch = self._json(response)
             if not isinstance(batch, list):
+                if resume_key is not None:
+                    raise TechnicalError("GitLab returned an invalid tree page")
                 return items if items else []
             items.extend(batch)
             next_page = response.headers.get("X-Next-Page", "").strip()
-            if not next_page or len(batch) < PER_PAGE:
-                return items
+            if not next_page:
+                return complete()
             page = int(next_page)
+            remember(page)
 
     # -- project and branch state ---------------------------------------------
 
@@ -591,6 +647,11 @@ class GitlabRepository:
         # commit sha or branch name goes through as the ref directly.
         params: Dict[str, Any] = {"ref": sha}
         path = self._tree_paths.get(sha)
+        if recursive and not path:
+            # Full-sync listings use the commit id rather than the branch
+            # name. Populate the same cache either way, so preparing the
+            # overlay and later writes don't fetch all those pages again.
+            return _Tree(list(self._load_tree_at(sha).values()))
         if path:
             params["ref"] = self._branch
             params["path"] = path
@@ -772,6 +833,76 @@ class GitlabRepository:
         )
         self._cache_file_write(path, b"", deleted=True)
 
+    def delete_subtree(self, path: str, keep_parent: bool) -> int:
+        """Remove only files under a pinned path, not the whole repo tree."""
+        head = self._branch_head()
+        cached = self._cached_blobs if self._cached_head == head else None
+        prefix = path + "/"
+        if cached is not None:
+            paths = [
+                entry.path
+                for entry in cached.values()
+                if entry.type == "blob" and entry.path.startswith(prefix)
+            ]
+        else:
+            self._invalidate_tree_cache()
+            try:
+                items = self._paginated(
+                    "/repository/tree",
+                    {"ref": head, "path": path, "recursive": "true"},
+                    resume_key=f"{head}:{path}",
+                )
+            except GithubException as ex:
+                if ex.status == 404:
+                    return 0
+                raise
+            paths = [
+                item["path"]
+                for item in items
+                if item["type"] == "blob" and item["path"].startswith(prefix)
+            ]
+        if not paths:
+            return 0
+
+        actions = [{"action": "delete", "file_path": item} for item in sorted(paths)]
+        if keep_parent:
+            marker = path.rsplit("/", 1)[0] + "/.gitkeep"
+            if not (
+                marker in cached
+                if cached is not None
+                else self._read_blob_paths([marker], head)
+            ):
+                actions.insert(
+                    0,
+                    {
+                        "action": "create",
+                        "file_path": marker,
+                        "encoding": "text",
+                        "content": "",
+                    },
+                )
+        try:
+            for offset in range(0, len(actions), GITLAB_COMMIT_ACTION_LIMIT):
+                if self._branch_head() != head:
+                    raise GithubException(
+                        409, {"message": "Metadata branch moved"}, None
+                    )
+                chunk = actions[offset : offset + GITLAB_COMMIT_ACTION_LIMIT]
+                head = self._post_commit(f"Delete directory {path}", chunk)
+                self._cache_actions(chunk, head)
+        except Exception:
+            self._invalidate_tree_cache()
+            raise
+        # Cached directory entries are not maintained by file-action commits.
+        # Drop the removed tree entries, or they can reappear when read back.
+        if cached is not None:
+            for entry in list(cached.values()):
+                if entry.type == "tree" and (
+                    entry.path == path or entry.path.startswith(path + "/")
+                ):
+                    cached.pop(entry.path, None)
+        return len(paths)
+
     def create_git_tree(
         self,
         elements: Sequence[InputGitTreeElement],
@@ -792,19 +923,40 @@ class GitlabRepository:
                 identity.get("sha"),
                 identity.get("content"),
             )
+        if base_tree is not None and not desired:
+            return _PendingTree([])
 
         try:
-            entries = self._branch_entries()
+            head = getattr(base_tree, "sha", None)
+            if (
+                head
+                and self._cached_head != head
+                and 0 < len(desired) <= POINT_LOOKUP_LIMIT
+            ):
+                self._invalidate_tree_cache()
+                current = self._read_blob_paths(desired, head)
+            else:
+                if not head:
+                    entries = self._branch_entries()
+                elif self._cached_head == head and self._cached_blobs is not None:
+                    entries = self._cached_blobs
+                else:
+                    entries = self._load_tree_at(head)
+                # For overlays, only touched paths matter. In particular,
+                # never rebuild an O(tree size) dictionary for one delete.
+                paths = desired if base_tree is not None else entries
+                current = {
+                    path: entries[path].sha
+                    for path in paths
+                    if path in entries and entries[path].type == "blob"
+                }
         except GithubException as ex:
             if ex.status != 404:
                 raise
             # The branch does not exist yet (a fresh repository); the
             # desired tree is the whole state, nothing to diff against.
             self._branch_missing = True
-            entries = {}
-        current = {
-            path: entry.sha for path, entry in entries.items() if entry.type == "blob"
-        }
+            current = {}
 
         # GitLab commits by content: every blob the branch does not hold
         # yet travels with its action, so the diff has to read those blobs
@@ -864,6 +1016,24 @@ class GitlabRepository:
                 if path not in desired
             )
         return _PendingTree(actions)
+
+    def _read_blob_paths(self, paths: Iterable[str], head: str) -> Dict[str, str]:
+        blobs = {}
+        for path in paths:
+            try:
+                data = self._json(
+                    self._request(
+                        "GET",
+                        f"/repository/files/{quote(path, safe='')}",
+                        params={"ref": head},
+                    )
+                )
+            except GithubException as ex:
+                if ex.status != 404:
+                    raise
+            else:
+                blobs[path] = data["blob_id"]
+        return blobs
 
     def _fetch_blobs(self, shas: set) -> Dict[str, str]:
         """The base64 content of the named blobs, fetched concurrently.
@@ -1169,7 +1339,7 @@ class GitlabTreeRepoMetadataRepository(GithubRepoMetadataRepository):
         name_key: Optional[bytes] = None,
         blob_key: Optional[bytes] = None,
     ):
-        raw = GitlabRepository(config)
+        raw = GitlabRepository(config, wait_on_rate_limit=False)
         # Like its GitHub sibling, behind a fail-fast wrapper: GitLab that
         # cannot do the work (a hung storage backend, a dead connection)
         # costs the full request timeout per call, and the replicated layer
@@ -1198,6 +1368,7 @@ class GitlabTreeRepoMetadataRepository(GithubRepoMetadataRepository):
             name_key=name_key,
             repo=cast(Repository, self._gitlab),
         )
+        self._ghc.delete_subtree = self._gitlab.delete_subtree
 
     async def close(self) -> None:
         self._gitlab_breaker.stop()
@@ -1231,15 +1402,18 @@ class GitlabTreeRepoMetadataRepository(GithubRepoMetadataRepository):
                 retry_rate_limit=False,
             )
         )
-        sha = head["commit"]["id"]
-        commit = facade._json(
-            facade._request(
-                "GET",
-                f"/repository/commits/{quote(sha, safe='')}",
-                retry_rate_limit=False,
-            )
-        )
+        commit = head["commit"]
+        sha = commit["id"]
         date = _parse_date(commit.get("committed_date"))
+        if date is None:
+            commit = facade._json(
+                facade._request(
+                    "GET",
+                    f"/repository/commits/{quote(sha, safe='')}",
+                    retry_rate_limit=False,
+                )
+            )
+            date = _parse_date(commit.get("committed_date"))
         if date is None:
             raise TechnicalError(
                 f"The branch head of {self._ghc.repo_name}@{branch} "
@@ -1278,11 +1452,26 @@ class GitlabTreeRepoMetadataRepository(GithubRepoMetadataRepository):
                 return self.metadata
         return metadata
 
+    def _load_directory_at(self, head: Optional[_HeadCommit]) -> GithubDirectory:
+        return self._build_directory_structure(head.sha if head else None)
+
+    def _read_tree(self, ref: Optional[str] = None) -> Sequence[_MetadataTreeEntry]:
+        # GitLab pagination is already exhaustive. In particular, a 429
+        # is not a truncated GitHub response: retrying via the contents
+        # API hits the very same GitLab endpoint and rate limit.
+        tree = self._gitlab.get_git_tree(ref or self._ghc.commit, recursive=True)
+        return [_MetadataTreeEntry(*entry) for entry in tree.tree]
+
     async def push_full(self) -> None:
         await super().push_full()
         await self._remove_document()
 
-    def _compact_history(self) -> None:
+    async def maintain(self) -> None:
+        if self._ghc.squash_history_max_commits > 0:
+            async with self._ghc.lock:
+                await self._ghc.write(self._compact_gitlab_history)
+
+    def _compact_gitlab_history(self) -> None:
         """The GitLab form of the history squash: the facade force-commits
         the branch's current state onto its oldest ancestor, since the
         commits API cannot create a parentless commit."""
@@ -1305,6 +1494,16 @@ class GitlabTreeRepoMetadataRepository(GithubRepoMetadataRepository):
             return await asyncio.to_thread(
                 self._gitlab.get_file_text, self._document_path
             )
+        except GithubException as ex:
+            if ex.status == 429:
+                # An unreadable legacy document is not an empty tree.
+                raise
+            logger.warning(
+                "Could not read GitLab metadata document %s: %s",
+                self._document_path,
+                ex,
+            )
+            return None
         except Exception as ex:
             # A document that cannot be read must not shadow a tree that
             # simply is empty; the next push re-syncs the repo anyway.
@@ -1317,12 +1516,12 @@ class GitlabTreeRepoMetadataRepository(GithubRepoMetadataRepository):
     async def _remove_document(self) -> None:
         if self._document_removed:
             return
-        self._document_removed = True
         try:
             exists = (
                 await asyncio.to_thread(self._gitlab.get_file_text, self._document_path)
             ) is not None
             if not exists:
+                self._document_removed = True
                 return
             await asyncio.to_thread(
                 self._gitlab.delete_file,
@@ -1332,6 +1531,7 @@ class GitlabTreeRepoMetadataRepository(GithubRepoMetadataRepository):
                 "",
                 self._ghc.commit,
             )
+            self._document_removed = True
             logger.info(
                 f"Removed the migrated metadata document {self._document_path} "
                 f"from {self._ghc.repo_name}@{self._ghc.commit}"

@@ -8,7 +8,11 @@ that covers its change; push failures are logged, not raised.
 
 import asyncio
 
+import pytest
+
 from tgdcfs.core.api.metadata import MetaDataApi
+from tgdcfs.core.api.removal_journal import RemovalJournal
+from tgdcfs.core.model import TGFSDirectory, TGFSMetadata
 from tgdcfs.core.repository.interface import IMetaDataRepository
 from tgdcfs.errors import NoStoredMetadata, TechnicalError
 
@@ -56,6 +60,41 @@ class GatedRepo(CountingRepo):
         self.release.clear()
         if self.fail is not None:
             raise self.fail
+
+
+async def test_removals_replay_from_a_stale_remote_after_restart(tmp_path):
+    class Repo(CountingRepo):
+        async def get(self):
+            root = TGFSDirectory.root_dir()
+            root.create_file_ref("one", 11)
+            root.create_file_ref("two", 22)
+            root.create_file_ref("recreated", 99)
+            return TGFSMetadata(root)
+
+    path = str(tmp_path / "removes.sqlite3")
+    first = RemovalJournal(path, b"key")
+    root = TGFSDirectory.root_dir()
+    first.add(root.create_file_ref("one", 11))
+    first.add(root.create_file_ref("two", 22))
+    first.add(root.create_file_ref("recreated", 33))
+    first.close()  # no remote sync took place before the previous exit
+
+    repo = Repo()
+    journal = RemovalJournal(path, b"key")
+    api = MetaDataApi(repo, push_mode="inline", removal_journal=journal)
+    await api.init()
+    root = api.get_root_directory()
+    assert [ref.name for ref in root.find_files()] == ["recreated"]
+    assert not api.defer_removal(root.find_file("recreated"))
+    repo.fail = TechnicalError("unavailable")
+    with pytest.raises(TechnicalError, match="unavailable"):
+        await api.flush_removals()
+    assert len(journal.load()[1]) == 3
+
+    repo.fail = None
+    await api.flush_removals()
+    assert journal.load() == (0, set())
+    await api.close()
 
 
 async def test_inline_mode_pushes_directly():

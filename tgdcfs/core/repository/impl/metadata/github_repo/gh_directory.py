@@ -12,6 +12,11 @@ from github.Repository import Repository
 
 from tgdcfs.core.model import TGFSDirectory, TGFSFileRef
 from tgdcfs.crypto.path_names import encrypt_path_name
+from tgdcfs.errors import (
+    DirectoryIsNotEmpty,
+    FileOrDirectoryDoesNotExist,
+    TechnicalError,
+)
 from tgdcfs.utils.time import FIRST_DAY_OF_EPOCH
 
 from ..breaker import StoreUnreachable
@@ -70,15 +75,13 @@ def commit_tree_overlay(
     ] or [[]]
     commit = first_base
     for number, chunk in enumerate(chunks, start=1):
-        tree = repo.create_git_tree(
-            chunk, base_tree=first_base.tree if commit is first_base else commit.tree
-        )
+        tree = repo.create_git_tree(chunk, base_tree=commit.tree)
         chunk_message = (
             message if len(chunks) == 1 else f"{message} ({number}/{len(chunks)})"
         )
-        commit = repo.create_git_commit(
-            chunk_message, tree, [] if commit is first_base else [commit]
-        )
+        # Preserve the original head as an ancestor. An orphan first chunk
+        # makes the final ref update a non-fast-forward on GitHub.
+        commit = repo.create_git_commit(chunk_message, tree, [commit])
     ref.edit(commit.sha)
     return commit.sha
 
@@ -143,10 +146,15 @@ class GithubConfig:
         repr=False,
     )
     pending_drops_since: float = 0.0
-    # PyGithub is synchronous: a write sleeps through GitHub's rate limits
-    # and retries for as long as it takes, and on the event loop that froze
-    # every other request (uploads timed out in FileZilla after 20 s of
-    # silence while a 20k-file upload was throttled). The writes run on this
+    # GitLab commits file actions rather than native Git tree overlays.
+    delete_subtree: Optional[Callable[[str, bool], int]] = field(
+        default=None, compare=False, repr=False
+    )
+    removing_directory: Optional["GithubDirectory"] = field(
+        default=None, compare=False, repr=False
+    )
+    # PyGithub is synchronous: a slow write on the event loop freezes
+    # every other request. The writes run on this
     # one thread instead. One thread, because every write is a commit on the
     # same branch: two at once only race each other into 409/422 conflicts.
     writer: ThreadPoolExecutor = field(
@@ -196,6 +204,7 @@ class GithubDirectory(TGFSDirectory):
 
         super().__init__(name, parent, children or [], files or [])
         self._ghc = ghc
+        self._removed = False
         # Whether THIS directory is stored under an encrypted name in the
         # repo. New directories follow the configured key; directories loaded
         # from the repo carry whatever form they were found in, so encrypted
@@ -332,6 +341,7 @@ class GithubDirectory(TGFSDirectory):
         return res
 
     def create_dir(self, name: str) -> "GithubDirectory":
+        self._require_not_removing()
         child = super().create_dir(name)
 
         # Create directory in GitHub by creating a placeholder file. The new
@@ -371,14 +381,114 @@ class GithubDirectory(TGFSDirectory):
         return github_child
 
     def delete(self) -> None:
+        self._require_no_removing_descendant()
         if self.parent:
             # Remove all files and subdirectories from GitHub
             self._delete_github_directory()
         super().delete()
 
+    async def delete_empty_async(self) -> None:
+        # Finish the in-memory change even if the SFTP connection closes
+        # while the thread is committing the removal.
+        operation = asyncio.create_task(self._delete_empty_on_writer())
+        try:
+            await asyncio.shield(operation)
+        except asyncio.CancelledError:
+            operation.add_done_callback(self._log_cancelled_removal)
+            raise
+
+    @staticmethod
+    def _log_cancelled_removal(operation: asyncio.Task[None]) -> None:
+        if not operation.cancelled() and (error := operation.exception()) is not None:
+            logger.warning(
+                "Directory removal failed after the client disconnected: %s", error
+            )
+
+    async def _delete_empty_on_writer(self) -> None:
+        async with self._ghc.lock:
+            if not self.is_attached():
+                raise FileOrDirectoryDoesNotExist(self.absolute_path)
+            if self.find_dirs() or self.find_files():
+                raise DirectoryIsNotEmpty(self.absolute_path)
+            if self.parent is None:
+                super().delete()
+                return
+            parent = self.parent
+            keep_parent = (
+                parent.parent is not None
+                and not parent.find_files()
+                and len(parent.find_dirs()) == 1
+            )
+            self._ghc.removing_directory = self
+            try:
+                path = self._github_path
+                await self._ghc.write(
+                    self._commit_empty_directory_removal, path, keep_parent
+                )
+                prefix = path + "/"
+                self._ghc.pending_drops.difference_update(
+                    {p for p in self._ghc.pending_drops if p.startswith(prefix)}
+                )
+                if not self._ghc.pending_drops:
+                    self._ghc.pending_drops_since = 0.0
+                super().delete()
+                self._removed = True
+            finally:
+                self._ghc.removing_directory = None
+
+    def _require_not_removing(self) -> None:
+        if self._removed:
+            raise FileOrDirectoryDoesNotExist(self.absolute_path)
+        if self._ghc.removing_directory is self:
+            raise TechnicalError("The directory is being removed; retry the operation")
+
+    def _require_no_removing_descendant(self) -> None:
+        active = self._ghc.removing_directory
+        if active is not None and (self is active or self.is_ancestor_of(active)):
+            raise TechnicalError("A directory is being removed; retry the operation")
+
+    def attach_file_ref(self, name: str, fd_message_id: int) -> TGFSFileRef:
+        self._require_not_removing()
+        return super().attach_file_ref(name, fd_message_id)
+
+    def _commit_empty_directory_removal(self, path: str, keep_parent: bool) -> None:
+        delete_subtree = self._ghc.delete_subtree
+        if delete_subtree is not None:
+            delete_subtree(path, keep_parent)
+            return
+        repo = self._ghc.repo
+        ref = repo.get_git_ref(f"heads/{self._ghc.commit}")
+        base = repo.get_git_commit(ref.object.sha)
+        # Walk only the ancestors in this immutable Git tree. One subtree
+        # deletion removes stale file refs and stats without listing them.
+        current = base.tree.sha
+        parts = path.split("/")
+        for name in parts:
+            tree = repo.get_git_tree(current)
+            if tree.truncated:
+                raise TechnicalError("Cannot safely remove from a truncated Git tree")
+            entry = next((e for e in tree.tree if e.path == name), None)
+            if entry is None:
+                return
+            if entry.type != "tree":
+                raise TechnicalError(f"Expected a Git directory at {path}")
+            current = entry.sha
+        elements = [InputGitTreeElement(path, "040000", "tree", sha=None)]
+        if keep_parent and not any(e.path == ".gitkeep" for e in tree.tree):
+            marker = self.join_path(*parts[:-1], ".gitkeep")
+            elements.append(InputGitTreeElement(marker, "100644", "blob", content=""))
+        new_tree = repo.create_git_tree(elements, base_tree=base.tree)
+        commit = repo.create_git_commit(f"Delete directory {path}", new_tree, [base])
+        # No force: a writer that changed the head since the scoped read
+        # wins, rather than having its changes erased by this rmdir.
+        ref.edit(commit.sha)
+
     def move_to(
         self, new_parent: TGFSDirectory, new_name: Optional[str] = None
     ) -> None:
+        self._require_no_removing_descendant()
+        if isinstance(new_parent, GithubDirectory):
+            new_parent._require_not_removing()
         old_parent, old_name = self.parent, self.name
         old_prefix = self._github_path
         super().move_to(new_parent, new_name)

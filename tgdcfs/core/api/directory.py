@@ -2,7 +2,7 @@ from typing import List, Optional
 
 from tgdcfs.backends.base import IStore
 from tgdcfs.core.model import TGFSDirectory, TGFSFileRef
-from tgdcfs.errors import DirectoryIsNotEmpty, FileOrDirectoryDoesNotExist
+from tgdcfs.errors import FileOrDirectoryDoesNotExist
 
 from .file import FileApi
 from .metadata import MetaDataApi
@@ -39,9 +39,8 @@ class DirectoryApi:
         raise FileOrDirectoryDoesNotExist(file_name)
 
     async def rm_empty(self, directory: TGFSDirectory) -> None:
-        if directory.find_dirs() or directory.find_files():
-            raise DirectoryIsNotEmpty(directory.absolute_path)
-        await self.rm_dangerously(directory)
+        await directory.delete_empty_async()
+        await self.__metadata_api.push()
 
     async def move(
         self,
@@ -54,6 +53,7 @@ class DirectoryApi:
         The subtree keeps referring to the same Telegram messages, so nothing
         is uploaded and, crucially, nothing is deleted from the channel.
         """
+        await self.__metadata_api.flush_removals()
         directory.move_to(to_parent, name)
         await self.__metadata_api.push()
         return directory

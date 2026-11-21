@@ -19,6 +19,7 @@ backends:
     api_hash: "0123456789abcdef0123456789abcdef"
     bot:
       session_file: bot.session
+      login_timeout_s: 20  # Telethon: time limit for each bot at startup
       tokens:
         - "123456789:ABCdefGHIjklMNOpqrsTUVwxyZ"
     delete_messages_on_remove: false
@@ -90,6 +91,7 @@ tgdcfs:
     # upload_buffer_size_mb: 64
     # upload_buffer_dir: ""
     # max_ahead_gap_mb: 1024
+    # fast_readdir_min_files: 256
 
   encryption:
     enabled: true
@@ -127,6 +129,7 @@ The `telegram` block can be left out for a Discord-only setup (no store may then
   - `api_id` *(int)*: Telegram API App ID from [my.telegram.org](https://my.telegram.org).
   - `api_hash` *(string)*: Telegram API App Hash.
   - `bot.tokens` *(list of strings)*: Telegram Bot tokens from [@BotFather](https://t.me/BotFather). Providing multiple tokens distributes download/upload operations across tokens.
+  - `bot.login_timeout_s` *(number, default `20`)*: Telethon login deadline for each bot, including the first Telegram RPC. A bot that times out or cannot connect is logged and left out until restart; at least one bot must log in. This setting does not apply to Pyrogram or interactive user logins.
   - `bot.session_file` *(string)*: Telethon session file for the bot, relative to `TGDCFS_DATA_DIR` (default: `bot.session`).
   - `lib` *(pyrogram | telethon)*: MTProto client library used by the Telegram backend (default: `telethon`).
   - `account` *(optional object)*: A regular Telegram user account in addition to the bots, with `session_file` (relative to `TGDCFS_DATA_DIR`), `used_to_upload` and `used_to_download` flags. Parts above the bot limit (up to 4,194,304,000 bytes) are only uploaded when this account has `used_to_upload: true` and Telegram Premium.
@@ -169,7 +172,7 @@ Defines top-level virtual directories exposed via WebDAV/SFTP:
 - `allow_shared_store` *(bool, default `false`)*: Allow a store that is the primary of one file system to also be a mirror of another. A store can never be the primary of two file systems, with or without this flag.
 - `metadata` *(object)*: `type` is `pinned_message` (default) or `github_repo` (which then requires a `github_repo` block). A `github_repo` block takes `tree_fetch_concurrency` (int, default `8`), a `gitlab_repo` block `blob_fetch_concurrency` (int, default `8`): how many blobs a full-tree sync reads in parallel. A git-backed store (tree layout) also takes `squash_history_max_commits` (int, default `0`): once the branch's commit history grows past this many commits, the periodic heal rewrites it into a single commit that carries the branch's whole current state. Git backends keep every deleted blob alive for as long as a commit references it, so an unbounded history grows the repository's storage use forever; the squash drops those old references so the backend's garbage collection can reclaim them. `0` keeps every commit. Works for both a GitHub and a GitLab store, primary or mirror, and with a single primary store as only the metadata store.
 - `metadata_push` *(object)*: How a mutation reaches the metadata stores.
-  - `mode` *(coalesced, default | inline)*: `coalesced` waits `window_ms` and merges the pushes of all operations that arrived meanwhile into one write, so a folder deleted file by file pays one mirror sync instead of one per file; a failed coalesced push is logged and caught up by the heal. `inline` hands every push straight to the stores and fails the operation with them, the behaviour of older releases.
+  - `mode` *(coalesced, default | inline)*: `coalesced` groups overlapping metadata writes during `window_ms`; missed writes are retried by the heal worker. For SFTP file removal with Git-backed or explicitly replicated metadata, when no file backend physically deletes messages, TGDCFS instead acknowledges each removal once it is journaled in the local data directory. It syncs those removals to the metadata stores in batches and replays unflushed removals after restart. Keep that data directory on a persistent volume. Deletions have not reached another server or volume until the stores sync. `inline` waits for a remote metadata push and disables new journaled acknowledgements. Physical deletion settings are unchanged.
   - `window_ms` *(int, default `300`)*: How long a coalesced push groups requests before it writes; `0` pushes right away, still merging operations that run at the same moment.
   - `parallel_stores` *(bool, default `true`)*: Write the primary and the mirrors at the same time; the write lasts as long as the slowest store instead of the sum of all of them.
 
@@ -192,6 +195,7 @@ Main application parameters:
   - `upload_buffer_size_mb` *(int, default `64`)*: How much of an incoming upload may sit ahead of the streamed position in memory before it spills over to `upload_buffer_dir`. Uploads stream straight into the cloud channel; the buffer only absorbs writes that run ahead.
   - `upload_buffer_dir` *(optional)*: Spill directory for the upload buffer (the system temp directory when empty).
   - `max_ahead_gap_mb` *(int, default `1024`)*: How far ahead of the streamed position a single write may jump before the upload fails. Within that bound writes may arrive in any order; a gap no write ever fills is zero-filled when the client closes the file.
+  - `fast_readdir_min_files` *(int, default `256`)*: In directories with at least this many files, SFTP lists names and types without fetching each file's missing size and timestamps from storage. Known values are still sent; `STAT`/`LSTAT` can fetch the exact values. Set to `0` for clients that require exact attributes in every listing.
 - **`encryption`**: Client-side AES-256-GCM settings (see [Security & At-Rest Encryption](./encryption.md)).
 - **`cache`** (off unless `enabled: true`): Local disk cache configuration (see [Local Cache & Performance Tuning](./cache-and-performance.md)).
 - **`listing`**: Folder listing behaviour (see [Local Cache & Performance Tuning](./cache-and-performance.md)).

@@ -1180,6 +1180,7 @@ class TestLoginAsBots:
         config.telegram.bot = mocker.Mock(spec=BotConfig)
         config.telegram.bot.session_file = "/path/to/bots"
         config.telegram.bot.tokens = ["123:token1", "456:token2"]
+        config.telegram.bot.login_timeout_s = 20
         config.telegram.bot.token = None  # Using tokens list
         return config
 
@@ -1193,6 +1194,7 @@ class TestLoginAsBots:
         config.telegram.bot.session_file = "/path/to/bots"
         config.telegram.bot.tokens = None
         config.telegram.bot.token = "789:single_token"
+        config.telegram.bot.login_timeout_s = 20
         return config
 
     @pytest.mark.asyncio
@@ -1209,8 +1211,6 @@ class TestLoginAsBots:
         MockTelegramClient = mocker.patch(
             "tgdcfs.backends.telegram.impl.telethon._RPCOnlyTelegramClient"
         )
-        mock_gather = mocker.patch("asyncio.gather")
-
         mock_session_instances = [mocker.Mock(), mocker.Mock()]
         MockSession.side_effect = mock_session_instances
 
@@ -1227,16 +1227,6 @@ class TestLoginAsBots:
             client.session = mocker.Mock()
             client.session.save.return_value = f"session_string_{i}"
             mock_session_instances[i].save_multibot = mocker.Mock()
-
-        # Mock gather to return the result after executing the coroutines
-        async def mock_gather_func(*coroutines):
-            # Execute each coroutine and collect results
-            results = []
-            for coro in coroutines:
-                results.append(await coro)
-            return results
-
-        mock_gather.side_effect = mock_gather_func
 
         result = await login_as_bots(mock_config)
 
@@ -1261,8 +1251,6 @@ class TestLoginAsBots:
         MockTelegramClient = mocker.patch(
             "tgdcfs.backends.telegram.impl.telethon._RPCOnlyTelegramClient"
         )
-        mock_gather = mocker.patch("asyncio.gather")
-
         mock_session_instance = mocker.Mock()
         MockSession.return_value = mock_session_instance
         mock_session_instance.get.return_value = None
@@ -1274,16 +1262,6 @@ class TestLoginAsBots:
         mock_client.session = mocker.Mock()
         mock_client.session.save.return_value = "session_string"
         mock_session_instance.save_multibot = mocker.Mock()
-
-        # Mock gather to return the result after executing the coroutines
-        async def mock_gather_func(*coroutines):
-            # Execute each coroutine and collect results
-            results = []
-            for coro in coroutines:
-                results.append(await coro)
-            return results
-
-        mock_gather.side_effect = mock_gather_func
 
         result = await login_as_bots(mock_config_single_token)
 
@@ -1304,8 +1282,6 @@ class TestLoginAsBots:
         MockTelegramClient = mocker.patch(
             "tgdcfs.backends.telegram.impl.telethon._RPCOnlyTelegramClient"
         )
-        mock_gather = mocker.patch("asyncio.gather")
-
         mock_session_instance = mocker.Mock()
         MockSession.return_value = mock_session_instance
         mock_session_instance.get.return_value = existing_session
@@ -1314,16 +1290,6 @@ class TestLoginAsBots:
         mock_client.connect = mocker.AsyncMock()
         mock_client.start = mocker.AsyncMock()  # Should not be called
         mock_client.get_me = mocker.AsyncMock(return_value=mock_user)
-
-        # Mock gather to return the result after executing the coroutines
-        async def mock_gather_func(*coroutines):
-            # Execute each coroutine and collect results
-            results = []
-            for coro in coroutines:
-                results.append(await coro)
-            return results
-
-        mock_gather.side_effect = mock_gather_func
 
         result = await login_as_bots(mock_config_single_token)
 
@@ -1344,7 +1310,6 @@ class TestLoginAsBots:
         MockTelegramClient = mocker.patch(
             "tgdcfs.backends.telegram.impl.telethon._RPCOnlyTelegramClient"
         )
-        mock_gather = mocker.patch("asyncio.gather")
         mock_logger = mocker.patch("tgdcfs.backends.telegram.impl.telethon.logger")
 
         mock_session_instance = mocker.Mock()
@@ -1359,22 +1324,79 @@ class TestLoginAsBots:
         mock_client.session.save.return_value = "session_string"
         mock_session_instance.save_multibot = mocker.Mock()
 
-        # Mock gather to return the result after executing the coroutines
-        async def mock_gather_func(*coroutines):
-            # Execute each coroutine and collect results
-            results = []
-            for coro in coroutines:
-                results.append(await coro)
-            return results
-
-        mock_gather.side_effect = mock_gather_func
-
         result = await login_as_bots(mock_config_single_token)
 
         mock_logger.warning.assert_called_once_with(
             "logged in as bot, but no username found"
         )
         assert result[0] == mock_client
+
+    @pytest.mark.parametrize("blocked_call", ["connect", "get_me"])
+    async def test_stalled_bot_does_not_stop_a_healthy_one(
+        self, mock_config, mocker, caplog, blocked_call
+    ):
+        mock_config.telegram.bot.login_timeout_s = 0.05
+        mocker.patch("tgdcfs.backends.telegram.impl.telethon.Session")
+        blocked, ready = [mocker.AsyncMock(spec=TelegramClient) for _ in range(2)]
+        mocker.patch(
+            "tgdcfs.backends.telegram.impl.telethon._RPCOnlyTelegramClient",
+            side_effect=[blocked, ready],
+        )
+        cancelled = asyncio.Event()
+
+        async def stall():
+            try:
+                await asyncio.Future()
+            finally:
+                cancelled.set()
+
+        getattr(blocked, blocked_call).side_effect = stall
+        blocked.disconnect = mocker.AsyncMock()
+
+        async with asyncio.timeout(1):
+            assert await login_as_bots(mock_config) == [ready]
+
+        assert cancelled.is_set()
+        blocked.disconnect.assert_awaited_once()
+        ready.get_me.assert_awaited_once()
+        assert "Telegram bot 123 not ready (TimeoutError" in caplog.text
+        assert "token1" not in caplog.text
+
+    async def test_no_healthy_bot_fails_explicitly(
+        self, mock_config_single_token, mocker
+    ):
+        mocker.patch("tgdcfs.backends.telegram.impl.telethon.Session")
+        offline = mocker.AsyncMock(spec=TelegramClient)
+        offline.connect.side_effect = ConnectionError("handshake failed")
+        offline.disconnect = mocker.AsyncMock()
+        mocker.patch(
+            "tgdcfs.backends.telegram.impl.telethon._RPCOnlyTelegramClient",
+            return_value=offline,
+        )
+
+        with pytest.raises(
+            TechnicalError, match="None of the configured Telegram bots"
+        ):
+            await login_as_bots(mock_config_single_token)
+
+        offline.disconnect.assert_awaited_once()
+
+    async def test_invalid_bot_credentials_are_not_hidden(self, mock_config, mocker):
+        mocker.patch("tgdcfs.backends.telegram.impl.telethon.Session")
+        invalid, ready = [mocker.AsyncMock(spec=TelegramClient) for _ in range(2)]
+        invalid.connect.side_effect = ValueError("invalid session")
+        invalid.disconnect = mocker.AsyncMock()
+        ready.disconnect = mocker.AsyncMock()
+        mocker.patch(
+            "tgdcfs.backends.telegram.impl.telethon._RPCOnlyTelegramClient",
+            side_effect=[invalid, ready],
+        )
+
+        with pytest.raises(ValueError, match="invalid session"):
+            await login_as_bots(mock_config)
+
+        invalid.disconnect.assert_awaited_once()
+        ready.disconnect.assert_awaited_once()
 
 
 class TestConnectionPool:
@@ -1501,6 +1523,7 @@ class TestOpenExtraConnections:
 
         def build(*_args, **_kwargs):
             connection = mocker.AsyncMock(spec=TelegramClient)
+            connection.disconnect = mocker.AsyncMock()
             if len(opened) == 1:
                 connection.connect.side_effect = OSError("no route to host")
             opened.append(connection)
@@ -1514,6 +1537,35 @@ class TestOpenExtraConnections:
         extra = await open_extra_connections(config, client)
 
         assert len(extra) == 1
+
+    async def test_hanging_optional_connection_does_not_block_startup(
+        self, mocker, config
+    ):
+        self._pool_size(mocker, 4)
+        mocker.patch(
+            "tgdcfs.backends.telegram.impl.telethon.EXTRA_CONNECTION_WARMUP_SECONDS",
+            0.05,
+        )
+        client = mocker.MagicMock()
+        client.session.save.return_value = "session-string"
+        mocker.patch("tgdcfs.backends.telegram.impl.telethon.StringSession")
+        ready, blocked = [mocker.AsyncMock(spec=TelegramClient) for _ in range(2)]
+
+        async def stall():
+            await asyncio.Future()
+
+        blocked.connect.side_effect = stall
+        blocked.disconnect = mocker.AsyncMock()
+        built = mocker.patch(
+            "tgdcfs.backends.telegram.impl.telethon._RPCOnlyTelegramClient",
+            side_effect=[ready, blocked],
+        )
+
+        async with asyncio.timeout(1):
+            assert await open_extra_connections(config, client) == [ready]
+
+        blocked.disconnect.assert_awaited_once()
+        assert built.call_count == 2
 
 
 @pytest.mark.asyncio

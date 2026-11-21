@@ -41,7 +41,7 @@ from tgdcfs.core.repository.impl.metadata.gitlab_tree import (
     GitlabTreeRepoMetadataRepository,
 )
 from tgdcfs.core.repository.interface import IMetaDataRepository
-from tgdcfs.errors import NoStoredMetadata
+from tgdcfs.errors import NoStoredMetadata, TechnicalError
 from tgdcfs.crypto.metadata_blob import (
     derive_metadata_blob_key,
     encrypt_metadata_blob,
@@ -346,7 +346,7 @@ class FakeGitlab:
     def _files_api(self, method, path, params, body):
         branch = (body or {}).get("branch") or params.get("ref")
         if method == "GET":
-            sha = self.branch_files.get(branch, {}).get(path)
+            sha = self._files_for(branch).get(path)
             if sha is None:
                 return 404, {"message": "404 File Not Found"}
             return 200, {
@@ -743,6 +743,7 @@ class TestFacade:
         facade = GitlabRepository(gitlab_config())
         ref = facade.get_git_ref("heads/main")
         base_commit = facade.get_git_commit(ref.object.sha)
+        before = len(gitlab.requests)
         pending = facade.create_git_tree(
             [
                 InputGitTreeElement(
@@ -754,6 +755,7 @@ class TestFacade:
         facade.create_git_commit("drop the stats", pending, [base_commit])
 
         assert gitlab.file_content("main", "sub/.tgdcfsstats.json") is None
+        assert self.tree_gets(gitlab, before) == 0
 
     async def test_a_delete_element_of_a_missing_file_is_a_noop(self, gitlab):
         gitlab.commit("main", "first", [])
@@ -841,24 +843,17 @@ class TestFacade:
         self.seed_files(gitlab, 1)
         facade = GitlabRepository(gitlab_config())
         base_commit = facade.get_git_commit(facade.get_git_ref("heads/main").object.sha)
+        facade.get_git_tree(base_commit.sha, recursive=True)
         element = InputGitTreeElement(
             path="new.5", mode="100644", type="blob", content=""
         )
         before = len(gitlab.requests)
 
-        facade.create_git_tree([element], base_tree=base_commit.tree)
-        # The first diff listed the branch once.
-        assert self.tree_gets(gitlab, before) == 1
-        facade.create_git_commit(
+        commit = facade.create_git_commit(
             "add", facade.create_git_tree([element], base_tree=base_commit.tree), []
         )
-        before = len(gitlab.requests)
-
-        # The landed commit is in the cache: a diff of everything-but-the
-        # current state keeps the path alive, without ever re-listing.
-        pending = facade.create_git_tree([], base_tree=base_commit.tree)
-
-        assert pending.actions == []
+        listing = facade.get_git_tree(commit.sha, recursive=True)
+        assert {entry.path for entry in listing.tree} == {"f0.1", "new.5"}
         assert self.tree_gets(gitlab, before) == 0
 
     async def test_a_write_from_outside_invalidates_the_cache(self, gitlab):
@@ -867,6 +862,7 @@ class TestFacade:
         seed_n_files(gitlab, 2)
         facade = GitlabRepository(gitlab_config())
         base_commit = facade.get_git_commit(facade.get_git_ref("heads/main").object.sha)
+        facade.get_git_tree(base_commit.sha, recursive=True)
         element = InputGitTreeElement(
             path="new.5", mode="100644", type="blob", content=""
         )
@@ -887,11 +883,15 @@ class TestFacade:
         )
         before = len(gitlab.requests)
 
-        pending = facade.create_git_tree([], base_tree=base_commit.tree)
-
-        # The head no longer matches the cache, so the diff re-listed the
+        listing = facade.get_git_tree("main", recursive=True)
+        # The head no longer matches the cache, so the facade re-listed the
         # branch and keeps both the facade's own path and the foreign one.
-        assert pending.actions == []
+        assert {entry.path for entry in listing.tree} == {
+            "f0.1",
+            "f1.1",
+            "new.5",
+            "outside.1",
+        }
         assert self.tree_gets(gitlab, before) > 0
 
     async def test_a_files_api_write_folds_into_the_cache(self, gitlab):
@@ -1362,6 +1362,50 @@ def commit_posts(fake: FakeGitlab) -> List[dict]:
     ]
 
 
+@pytest.mark.parametrize("warm_cache", [False, True])
+async def test_gitlab_rmdir_limits_reads_and_deletes_to_the_subtree(
+    monkeypatch, warm_cache
+):
+    fake = FakeGitlab()
+    target_paths = ["parent/batch/file.1", "parent/batch/old/.tgdcfsstats.json"]
+    fake.commit(
+        "main",
+        "seed",
+        [
+            {"action": "create", "file_path": path, "content": "", "encoding": "text"}
+            for path in target_paths + ["parent/batch-other/file.2"]
+        ],
+    )
+    facade = _routed(monkeypatch, fake)
+    head = fake.branch_heads["main"]
+    if warm_cache:
+        facade.get_git_tree("main", recursive=True)
+    fake.requests.clear()
+    monkeypatch.setattr(gitlab_tree_mod, "GITLAB_COMMIT_ACTION_LIMIT", 2)
+
+    assert facade.delete_subtree("parent/batch", keep_parent=True) == len(target_paths)
+
+    expected = {"parent/batch-other/file.2", "parent/.gitkeep"}
+    assert fake.branch_files["main"].keys() == expected
+    assert [len(body["actions"]) for body in commit_posts(fake)] == [2, 1]
+    probes = [
+        params
+        for method, url, params, _ in fake.requests
+        if method == "GET" and url.endswith("/repository/tree")
+    ]
+    if warm_cache:
+        assert probes == []
+    else:
+        assert len(probes) == 1
+        assert probes[0]["path"] == "parent/batch"
+        assert probes[0]["ref"] == head
+    assert {
+        entry.path
+        for entry in facade.get_git_tree("main", recursive=True).tree
+        if entry.type == "blob"
+    } == expected
+
+
 class TestParallelBlobFetch:
     """``create_git_tree`` needs the content of every blob the branch
     does not hold at its path (a tree rewrite that moved it there); the
@@ -1748,3 +1792,41 @@ class TestSharedBackoff:
         thread.join(timeout=10)
         assert results and results[0].status_code == 200
         assert sent_at[0] - started >= 1.4
+
+    async def test_live_store_aborts_and_resumes_a_rate_limited_tree(self, monkeypatch):
+        class LimitedTree(FakeGitlab):
+            limited = True
+
+            def handle(self, method, url, params, body):
+                if url.endswith("/repository/tree") and params.get("page") == 2:
+                    if self.limited:
+                        return FakeResponse(
+                            429, {"message": "Limited"}, {"Retry-After": "60"}
+                        )
+                return super().handle(method, url, params, body)
+
+        fake = LimitedTree()
+        _route_session(monkeypatch, fake)
+        seed_n_files(fake, 220)
+        store = GitlabTreeRepoMetadataRepository(gitlab_config())
+        raw = store._gitlab._inner
+
+        with pytest.raises(TechnicalError, match="429"):
+            await asyncio.wait_for(store.get(), timeout=2)
+        assert raw._cached_blobs is None
+        sent = len(fake.requests)
+        with pytest.raises(GithubException, match="cooldown"):
+            raw.get_branch("main")
+        assert len(fake.requests) == sent
+
+        fake.limited = False
+        raw._paused_until = 0
+        metadata = await store.get()
+        assert len(metadata.dir.find_files()) == 220
+        pages = [
+            params["page"]
+            for _, url, params, _ in fake.requests
+            if url.endswith("/repository/tree")
+        ]
+        assert pages.count(1) == 1
+        assert set(pages) == {1, 2, 3}

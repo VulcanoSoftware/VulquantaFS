@@ -1,5 +1,6 @@
 """Logins and store construction for the Telegram backend."""
 
+import asyncio
 import logging
 
 from tgdcfs.config import Config, StoreConfig
@@ -34,13 +35,16 @@ async def login(config: Config) -> TDLibApi:
             await telethon.open_extra_connections(config, account_client),
         )
 
-    bots = []
-    for bot in await telethon.login_as_bots(config):
-        bots.append(
-            telethon.TelethonAPI(
-                bot, await telethon.open_extra_connections(config, bot)
-            )
-        )
+    clients = await telethon.login_as_bots(config)
+    if config.tgdcfs.transfer.connection_pool_size > 1:
+        logger.info("Telegram: warming up optional transfer connections")
+    extras = await asyncio.gather(
+        *(telethon.open_extra_connections(config, bot) for bot in clients)
+    )
+    bots = [
+        telethon.TelethonAPI(bot, pool)
+        for bot, pool in zip(clients, extras, strict=True)
+    ]
 
     return TDLibApi(account=account, bots=bots)
 

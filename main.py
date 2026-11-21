@@ -33,12 +33,20 @@ from tgdcfs.utils.message_cache import set_message_cache_size
 async def create_store_factory(config: Config) -> StoreFactory:
     """Log in to every backend the config uses and return the factory
     that turns a store config into a live store."""
-    tdlib_api = (
-        await telegram.login(config) if config.uses_backend["telegram"] else None
-    )
-    discord_bots = (
-        await discord.login(config) if config.uses_backend["discord"] else None
-    )
+
+    async def login_telegram():
+        return await telegram.login(config) if config.uses_backend["telegram"] else None
+
+    async def login_discord():
+        return await discord.login(config) if config.uses_backend["discord"] else None
+
+    # The providers are independent: Discord doesn't need to wait for
+    # Telegram's handshakes (or its data-center redirects).
+    async with asyncio.TaskGroup() as logins:
+        tg = logins.create_task(login_telegram())
+        dc = logins.create_task(login_discord())
+    tdlib_api, discord_bots = tg.result(), dc.result()
+    logging.getLogger(__name__).info("Storage backend logins complete")
 
     async def create_store(store_cfg: StoreConfig) -> IStore:
         if store_cfg.backend == "telegram" and tdlib_api is not None:
@@ -68,6 +76,7 @@ async def create_clients(
 
     clients: Clients = {}
     for filesystem in config.filesystems.values():
+        logging.getLogger(__name__).info("Initializing filesystem %s", filesystem.name)
         clients[filesystem.name] = await Client.create(
             filesystem,
             config,

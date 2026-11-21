@@ -72,6 +72,8 @@ class FakeChannel:
 
 
 class FakeTelegramStore:
+    deletes_on_remove = True
+
     def __init__(self, channel: FakeChannel) -> None:
         self.channel = channel
         self.key = "tg:fake"

@@ -533,10 +533,14 @@ class DiscordStore(IStore):
 
     # -- bookkeeping -------------------------------------------------------
 
+    @property
+    def deletes_on_remove(self) -> bool:
+        return self._delete_on_remove
+
     async def delete_messages(
         self, message_ids: Iterable[int], force: bool = False
     ) -> None:
-        if not force and not self._delete_on_remove:
+        if not force and not self.deletes_on_remove:
             return
         unique = list({mid for mid in message_ids if mid > 0})
         if not unique:

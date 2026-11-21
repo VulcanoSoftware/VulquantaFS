@@ -151,6 +151,53 @@ class TestConstruction:
 
 
 class TestLoad:
+    @pytest.mark.parametrize("fail_primary", [True, False])
+    async def test_reads_fallback_while_preferred_store_is_slow(
+        self, monkeypatch, fail_primary
+    ):
+        monkeypatch.setattr(
+            "tgdcfs.core.repository.impl.metadata.replicated.LOAD_HEDGE_SECONDS", 0
+        )
+        fallback_ready = asyncio.Event()
+        primary_tree, fallback_tree = tree("primary"), tree("fallback")
+        primary_tree.revision = fallback_tree.revision = 100.0
+
+        class Primary(FakeMetadataRepo):
+            async def get(self):
+                await fallback_ready.wait()
+                if fail_primary:
+                    raise TechnicalError("rate limited")
+                return await super().get()
+
+        class Mirror(FakeMetadataRepo):
+            async def get(self):
+                result = await super().get()
+                fallback_ready.set()
+                return result
+
+        layer = replicated(
+            Primary("primary", primary_tree, revision_hint=100.0),
+            Mirror("fallback", fallback_tree, revision_hint=100.0),
+        )
+        result = await asyncio.wait_for(layer.get(), timeout=2)
+        assert result is (fallback_tree if fail_primary else primary_tree)
+
+    async def test_journal_sync_needs_every_store_and_pushes_full_primary(self):
+        primary = FakeMetadataRepo("primary")
+        mirror = FakeMetadataRepo("mirror", push_full_error=TechnicalError("429"))
+        layer = replicated(primary, mirror)
+        layer.metadata = tree("docs")
+
+        with pytest.raises(TechnicalError, match="Waiting for metadata stores: mirror"):
+            await layer.push_removals()
+        assert primary.push_calls == 0
+        assert primary.push_full_calls == 1
+        assert layer.stale_stores() == ["mirror"]
+
+        mirror.push_full_error = None
+        await layer.push_removals()
+        assert not layer.stale_stores()
+
     async def test_the_primary_serves_the_tree(self):
         primary_tree, mirror_tree = tree("primary"), tree("mirror")
         primary = FakeMetadataRepo("primary", primary_tree)
@@ -651,7 +698,7 @@ class TestProbedLoad:
         assert mirror.get_calls == 0
         assert layer.stale_stores() == ["mirror", "primary"]
 
-    async def test_a_failing_winning_read_falls_back_to_the_full_load(self):
+    async def test_a_failing_winning_read_is_not_repeated(self):
         class ProbeDateableButBrokenRead(FakeMetadataRepo):
             """A store whose probe answers while its read is broken."""
 
@@ -674,10 +721,21 @@ class TestProbedLoad:
         assert layer.metadata is not None
         assert layer.metadata.dir.find_dir("primary") is not None
         assert primary.get_calls == 1
-        assert mirror.get_calls == 2
-        # The full read decided again, from every store: the failed one is
-        # stale like it always was, the primary keeps serving.
+        assert mirror.get_calls == 1
         assert layer.stale_stores() == ["mirror"]
+
+    async def test_a_newer_document_does_not_trigger_an_older_git_tree_load(self):
+        primary = FakeMetadataRepo("primary", tree("old"), revision_hint=10)
+        newer = tree("new")
+        newer.revision = 1000
+        mirror = FakeMetadataRepo("mirror", newer)
+        layer = replicated(primary, mirror)
+
+        await layer.init()
+
+        assert layer.metadata is newer
+        assert primary.get_calls == 0
+        assert mirror.get_calls == 1
 
 
 class TestHeal:
@@ -722,7 +780,7 @@ class TestHeal:
         assert layer.stale_stores() == ["mirror"]
         assert mirror.stored is None
 
-    async def test_heal_maintains_the_healthy_stores_only(self):
+    async def test_maintenance_skips_stale_stores(self):
         primary = FakeMetadataRepo("primary")
         stale = FakeMetadataRepo("stale", push_full_error=TechnicalError("down"))
         layer = replicated(primary, stale)
@@ -731,6 +789,8 @@ class TestHeal:
         assert layer.stale_stores() == ["stale"]
 
         await layer.heal()
+        assert primary.maintain_calls == 0
+        await layer.maintain()
 
         assert primary.maintain_calls == 1
         assert stale.maintain_calls == 0
@@ -743,6 +803,7 @@ class TestHeal:
         layer.metadata = tree("a")
 
         await layer.heal()
+        await layer.maintain()
 
         assert layer.stale_stores() == []
 
