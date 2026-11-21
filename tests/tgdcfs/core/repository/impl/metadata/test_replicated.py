@@ -42,6 +42,8 @@ class FakeMetadataRepo(IMetaDataRepository):
         push_full_error: Exception | None = None,
         push_writes_stats: bool = False,
         maintain_error: Exception | None = None,
+        revision_hint: float | None = None,
+        probe_error: Exception | None = None,
     ):
         super().__init__()
         self.name = name
@@ -52,6 +54,10 @@ class FakeMetadataRepo(IMetaDataRepository):
         self.push_full_error = push_full_error
         self.push_writes_stats = push_writes_stats
         self.maintain_error = maintain_error
+        self.revision_hint = revision_hint
+        self.probe_error = probe_error
+        self.probe_calls = 0
+        self.get_calls = 0
         self.push_calls = 0
         self.push_full_calls = 0
         self.maintain_calls = 0
@@ -60,11 +66,22 @@ class FakeMetadataRepo(IMetaDataRepository):
         self.stats_stored_calls = 0
 
     async def get(self) -> TGFSMetadata:
+        self.get_calls += 1
         if self.get_error is not None:
             raise self.get_error
         if self.empty or self.stored is None:
             raise NoStoredMetadata(self.name)
         return self.stored
+
+    async def head_revision(self) -> float | None:
+        self.probe_calls += 1
+        if self.probe_error is not None:
+            raise self.probe_error
+        if self.get_error is not None:
+            raise self.get_error
+        if self.empty or self.stored is None:
+            raise NoStoredMetadata(self.name)
+        return self.revision_hint
 
     async def push(self) -> None:
         self.push_calls += 1
@@ -93,7 +110,6 @@ class FakeMetadataRepo(IMetaDataRepository):
 
     async def save_stats(self, directories, keep: bool) -> None:
         self.save_stats_calls += 1
-
 
 
 async def settled_initial_push(layer: ReplicatedMetadataRepository) -> None:
@@ -441,11 +457,11 @@ class TestStartupResilience:
         assert layer.metadata is not None
         assert layer.stale_stores() == ["primary"]
         messages = [r.getMessage() for r in caplog.records]
-        assert any("Could not write the metadata tree at startup" in m for m in messages)
+        assert any(
+            "Could not write the metadata tree at startup" in m for m in messages
+        )
 
-    async def test_every_store_failing_the_startup_push_still_boots(
-        self, caplog
-    ):
+    async def test_every_store_failing_the_startup_push_still_boots(self, caplog):
         """The shape of a rate-limited mirror atop a truncated primary:
         the mirror's fresher tree wins the load, both writes fail, and the
         server comes up anyway."""
@@ -467,7 +483,9 @@ class TestStartupResilience:
         assert layer.metadata is mirror_tree
         assert layer.stale_stores() == ["mirror", "primary"]
         messages = [r.getMessage() for r in caplog.records]
-        assert any("Could not write the metadata tree at startup" in m for m in messages)
+        assert any(
+            "Could not write the metadata tree at startup" in m for m in messages
+        )
 
     async def test_a_mirrors_failed_startup_push_does_not_crash_the_boot(self):
         primary = FakeMetadataRepo("primary", tree("primary"))
@@ -539,6 +557,127 @@ class TestStartupResilience:
         assert layer._initial_push is None
         assert primary.push_calls == 0
         primary.release.set()
+
+
+class TestProbedLoad:
+    """The boot decides the winner from the stores' cheap head probes and
+    reads only that one: the losers -- grown, slow, rate-limited -- stay
+    unread instead of every store costing its full listing on every boot."""
+
+    async def test_only_the_winning_store_is_read(self):
+        primary = FakeMetadataRepo(
+            "primary", tree("primary"), revision_hint=1_000_000.0
+        )
+        mirror = FakeMetadataRepo(
+            "mirror", tree("mirror"), revision_hint=1_000_000.0 + 3600.0
+        )
+        layer = replicated(primary, mirror)
+
+        await layer.init()
+
+        assert layer.metadata is not None
+        assert layer.metadata.dir.find_dir("mirror") is not None
+        assert primary.probe_calls == 1
+        assert mirror.probe_calls == 1
+        assert primary.get_calls == 0
+        assert mirror.get_calls == 1
+        assert layer.stale_stores() == ["primary"]
+
+    async def test_a_store_without_a_cheap_answer_defers_to_the_full_load(self):
+        primary = FakeMetadataRepo(
+            "primary", tree("primary"), revision_hint=1_000_000.0
+        )
+        mirror = FakeMetadataRepo("mirror", tree("mirror"), revision_hint=None)
+        layer = replicated(primary, mirror)
+
+        await layer.init()
+
+        assert layer.metadata is not None
+        assert layer.metadata.dir.find_dir("primary") is not None
+        assert primary.get_calls == 1
+        assert mirror.get_calls == 1
+
+    async def test_a_failed_probe_marks_the_store_stale_and_skips_its_read(self):
+        primary = FakeMetadataRepo(
+            "primary", tree("primary"), probe_error=TechnicalError("down")
+        )
+        mirror = FakeMetadataRepo("mirror", tree("mirror"), revision_hint=1_000_000.0)
+        layer = replicated(primary, mirror)
+
+        await layer.init()
+
+        assert layer.metadata is not None
+        assert layer.metadata.dir.find_dir("mirror") is not None
+        assert primary.get_calls == 0
+        assert layer.stale_stores() == ["primary"]
+
+    async def test_an_empty_probed_store_bootstraps_from_the_winner(self):
+        primary = FakeMetadataRepo("primary", empty=True)
+        mirror = FakeMetadataRepo("mirror", tree("mirror"), revision_hint=1_000_000.0)
+        layer = replicated(primary, mirror)
+
+        await layer.init()
+
+        assert layer.metadata is not None
+        assert layer.metadata.dir.find_dir("mirror") is not None
+        assert primary.get_calls == 0
+        assert layer.stale_stores() == ["primary"]
+
+    async def test_every_probed_store_empty_fresh_installation_bootstraps(self):
+        primary = FakeMetadataRepo("primary", empty=True)
+        mirror = FakeMetadataRepo("mirror", empty=True)
+        layer = replicated(primary, mirror)
+
+        await layer.init()
+        await settled_initial_push(layer)
+
+        assert layer.metadata is not None
+        assert layer.metadata.dir.find_files() == []
+        assert layer.metadata.dir.find_dirs() == []
+
+    async def test_every_probe_failing_still_reports_the_read_failure(self):
+        primary = FakeMetadataRepo(
+            "primary", tree("primary"), probe_error=TechnicalError("down")
+        )
+        mirror = FakeMetadataRepo(
+            "mirror", tree("mirror"), probe_error=TechnicalError("down")
+        )
+        layer = replicated(primary, mirror)
+
+        with pytest.raises(TechnicalError):
+            await layer.init()
+
+        assert primary.get_calls == 0
+        assert mirror.get_calls == 0
+        assert layer.stale_stores() == ["mirror", "primary"]
+
+    async def test_a_failing_winning_read_falls_back_to_the_full_load(self):
+        class ProbeDateableButBrokenRead(FakeMetadataRepo):
+            """A store whose probe answers while its read is broken."""
+
+            async def head_revision(self) -> float | None:
+                return self.revision_hint
+
+        primary = FakeMetadataRepo(
+            "primary", tree("primary"), revision_hint=1_000_000.0
+        )
+        mirror = ProbeDateableButBrokenRead(
+            "mirror",
+            tree("mirror"),
+            revision_hint=1_000_000.0 + 3600.0,
+            get_error=TechnicalError("truncated"),
+        )
+        layer = replicated(primary, mirror)
+
+        await layer.init()
+
+        assert layer.metadata is not None
+        assert layer.metadata.dir.find_dir("primary") is not None
+        assert primary.get_calls == 1
+        assert mirror.get_calls == 2
+        # The full read decided again, from every store: the failed one is
+        # stale like it always was, the primary keeps serving.
+        assert layer.stale_stores() == ["mirror"]
 
 
 class TestHeal:

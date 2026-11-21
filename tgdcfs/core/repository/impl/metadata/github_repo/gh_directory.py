@@ -82,6 +82,7 @@ def commit_tree_overlay(
     ref.edit(commit.sha)
     return commit.sha
 
+
 # Deleting a file reference used to wait on two API calls on the writer
 # thread (read the blob's sha, commit its deletion), so a 20k-file folder
 # deleted over SFTP took hours. ``delete_file_ref_async`` only registers

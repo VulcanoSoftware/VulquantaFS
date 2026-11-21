@@ -24,6 +24,7 @@ async def settled_initial_push(client) -> None:
     assert initial is not None
     await initial
 
+
 def config_dict() -> dict:
     return {
         "backends": {

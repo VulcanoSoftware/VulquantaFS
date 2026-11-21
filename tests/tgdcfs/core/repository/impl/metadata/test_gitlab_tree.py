@@ -12,7 +12,10 @@ import asyncio
 import base64
 import hashlib
 import json
+import pathlib
+import threading
 import time
+from datetime import datetime, timezone
 from typing import Dict, List, Optional
 from unittest.mock import Mock, patch
 from urllib.parse import unquote
@@ -38,6 +41,7 @@ from tgdcfs.core.repository.impl.metadata.gitlab_tree import (
     GitlabTreeRepoMetadataRepository,
 )
 from tgdcfs.core.repository.interface import IMetaDataRepository
+from tgdcfs.errors import NoStoredMetadata
 from tgdcfs.crypto.metadata_blob import (
     derive_metadata_blob_key,
     encrypt_metadata_blob,
@@ -72,7 +76,6 @@ async def settled_initial_push(layer) -> None:
     initial = layer._initial_push
     assert initial is not None
     await initial
-
 
 
 class FakeGitlab:
@@ -474,7 +477,9 @@ class RateLimitGitlab(FakeGitlab):
     with 429 (prescribing ``retry_after`` as the wait) before serving
     normally again."""
 
-    def __init__(self, *args, limited: int = 0, retry_after: Optional[str] = "0", **kwargs):
+    def __init__(
+        self, *args, limited: int = 0, retry_after: Optional[str] = "0", **kwargs
+    ):
         super().__init__(*args, **kwargs)
         self.limited = limited
         self.retry_after = retry_after
@@ -487,7 +492,11 @@ class RateLimitGitlab(FakeGitlab):
             return FakeResponse(
                 429,
                 {"message": "Rate limit exceeded"},
-                {"Retry-After": self.retry_after} if self.retry_after is not None else {},
+                (
+                    {"Retry-After": self.retry_after}
+                    if self.retry_after is not None
+                    else {}
+                ),
             )
         return super().handle(method, url, params, body)
 
@@ -828,9 +837,7 @@ class TestFacade:
         assert pending.actions[0]["file_path"] == "new.5"
         assert self.tree_gets(gitlab, before) == 0
 
-    async def test_the_cache_stays_current_through_the_facades_commits(
-        self, gitlab
-    ):
+    async def test_the_cache_stays_current_through_the_facades_commits(self, gitlab):
         self.seed_files(gitlab, 1)
         facade = GitlabRepository(gitlab_config())
         base_commit = facade.get_git_commit(facade.get_git_ref("heads/main").object.sha)
@@ -857,7 +864,7 @@ class TestFacade:
     async def test_a_write_from_outside_invalidates_the_cache(self, gitlab):
         """A commit that did not land through this repository (the mirrored
         twin, the user) makes the cached listing stale."""
-        self.seed_files(gitlab, 2)
+        seed_n_files(gitlab, 2)
         facade = GitlabRepository(gitlab_config())
         base_commit = facade.get_git_commit(facade.get_git_ref("heads/main").object.sha)
         element = InputGitTreeElement(
@@ -913,7 +920,7 @@ class TestFacade:
     async def test_a_tree_read_at_the_cached_head_is_served_from_the_cache(
         self, gitlab
     ):
-        self.seed_files(gitlab, 2)
+        seed_n_files(gitlab, 2)
         facade = GitlabRepository(gitlab_config())
         head = gitlab.branch_heads["main"]
         facade.get_git_tree("main", recursive=True)
@@ -1528,9 +1535,7 @@ class TestHistoryCompaction:
             [{"action": "delete", "file_path": "docs/f1.1"}],
         )
 
-    async def test_a_grown_history_is_force_committed_onto_its_root(
-        self, monkeypatch
-    ):
+    async def test_a_grown_history_is_force_committed_onto_its_root(self, monkeypatch):
         fake = FakeGitlab(seed={})
         self.a_used_branch(fake)
         facade = _routed(monkeypatch, fake)
@@ -1568,3 +1573,178 @@ class TestHistoryCompaction:
 
         assert facade.compact_history("Compact metadata history", 100) == 0
         assert not commit_posts(fake)
+
+
+def seed_n_files(gitlab, count: int) -> None:
+    gitlab.commit(
+        "main",
+        "seed",
+        [
+            {
+                "action": "create",
+                "file_path": f"f{n}.1",
+                "content": "",
+                "encoding": "text",
+            }
+            for n in range(count)
+        ],
+    )
+
+
+def tree_gets(gitlab, start: int) -> int:
+    return sum(
+        1
+        for method, url, _, _ in gitlab.requests[start:]
+        if method == "GET" and url.endswith("repository/tree")
+    )
+
+
+def _commit_file_creation(gitlab, path: str, message: str = "seed") -> None:
+    gitlab.commit(
+        "main",
+        message,
+        [{"action": "create", "file_path": path, "content": "", "encoding": "text"}],
+    )
+
+
+class TestTreeSnapshot:
+    """The boot re-lists the whole tree only when the branch moved: the
+    local snapshot of the last listing serves an unchanged head, which is
+    what kept a rate-limited GitLab holding the boot through its listing."""
+
+    async def test_an_unchanged_head_serves_the_tree_from_the_snapshot(
+        self, gitlab, tmp_path
+    ):
+        seed_n_files(gitlab, 3)
+        first = GitlabTreeRepoMetadataRepository(gitlab_config())
+        first_tree = await first.get()
+        served_revision = first_tree.revision
+        before = len(gitlab.requests)
+
+        second = GitlabTreeRepoMetadataRepository(gitlab_config())
+        metadata = await second.get()
+
+        assert sorted(f.name for f in metadata.dir.find_files()) == [
+            "f0",
+            "f1",
+            "f2",
+        ]
+        assert metadata.revision == served_revision
+        # No listing request crossed the wire for the unchanged head.
+        assert tree_gets(gitlab, before) == 0
+        # The snapshot was re-saved, so the cache stays alive for the
+        # boot after this one.
+        assert snapshot_path(tmp_path).exists()
+
+    async def test_a_moved_head_rebuilds_the_tree(self, gitlab, tmp_path):
+        seed_n_files(gitlab, 2)
+        first = GitlabTreeRepoMetadataRepository(gitlab_config())
+        await first.init()
+        _commit_file_creation(gitlab, "fresh.9", "a later write")
+        before = len(gitlab.requests)
+
+        second = GitlabTreeRepoMetadataRepository(gitlab_config())
+        metadata = await second.get()
+
+        assert metadata.dir.find_file("fresh") is not None
+        assert snapshot_path(tmp_path).exists()
+        assert snapshot_head(tmp_path) == gitlab.branch_heads["main"]
+
+    async def test_a_corrupt_snapshot_is_listed_anew(self, gitlab, tmp_path):
+        seed_n_files(gitlab, 2)
+        first = GitlabTreeRepoMetadataRepository(gitlab_config())
+        await first.init()
+        snapshot_path(tmp_path).write_text("{broken")
+
+        second = GitlabTreeRepoMetadataRepository(gitlab_config())
+        metadata = await second.get()
+
+        assert len(metadata.dir.find_files()) == 2
+
+    async def test_an_empty_repository_saves_no_snapshot(self, gitlab, tmp_path):
+        store = GitlabTreeRepoMetadataRepository(gitlab_config())
+
+        metadata = await store.get()
+
+        assert metadata.dir.find_files() == []
+        assert not snapshot_path(tmp_path).exists()
+
+
+def snapshot_path(tmp_path) -> pathlib.Path:
+    """Where the redirected snapshot store keeps its file for this test."""
+    return tmp_path / "tree-snapshot.json"
+
+
+def snapshot_head(tmp_path) -> Optional[str]:
+    data = json.loads(snapshot_path(tmp_path).read_text())
+    return data["head"]
+
+
+class TestHeadProbe:
+    """The head probe that decides the load's winner costs two requests,
+    none of which may retry a rate limit: one attempt either answers, or
+    the store is skipped instead of the boot waiting out the 429s."""
+
+    async def test_the_probe_answers_the_head_date_in_two_requests(self, gitlab):
+        _commit_file_creation(gitlab, "docs/.gitkeep")
+        store = GitlabTreeRepoMetadataRepository(gitlab_config())
+
+        revision = await store.head_revision()
+
+        assert revision == datetime(2024, 6, 1, tzinfo=timezone.utc).timestamp()
+        assert len(gitlab.requests) == 2
+
+    async def test_a_probe_of_a_missing_branch_reports_an_empty_store(self, gitlab):
+        store = GitlabTreeRepoMetadataRepository(gitlab_config())
+
+        with pytest.raises(NoStoredMetadata):
+            await store.head_revision()
+
+    async def test_the_probe_does_not_retry_a_rate_limited_request(self, monkeypatch):
+        fake = RateLimitGitlab(limited=100, retry_after="30")
+        _routed(monkeypatch, fake)
+        store = GitlabTreeRepoMetadataRepository(gitlab_config())
+
+        with pytest.raises(GithubException) as ex:
+            await store.head_revision()
+
+        assert ex.value.status == 429
+        assert fake.attempts == 1
+
+
+class TestSharedBackoff:
+    """A 429 prescribed wait holds back every request of the project, not
+    just the request that answered it: retries that each burned their own
+    wait budget against the same limiter in parallel kept the limit alive
+    through whole waves of bursts."""
+
+    def test_a_published_pause_holds_back_the_other_sends(self, monkeypatch):
+        repo = GitlabRepository(gitlab_config())
+        sent_at: List[float] = []
+
+        def fake_request(
+            self_session, method, url, params=None, json=None, timeout=None, **kw
+        ):
+            sent_at.append(time.monotonic())
+            return FakeResponse(200, [])
+
+        monkeypatch.setattr(requests.Session, "request", fake_request)
+
+        started = time.monotonic()
+        repo._publish_pause(1.5)
+
+        results: List[requests.Response] = []
+        thread = threading.Thread(
+            target=lambda: results.append(
+                repo._request("GET", "/repository/tree", params={"page": 1})
+            )
+        )
+        thread.start()
+        time.sleep(0.4)
+
+        # Still inside the prescribed wait: not one request was sent.
+        assert sent_at == []
+
+        thread.join(timeout=10)
+        assert results and results[0].status_code == 200
+        assert sent_at[0] - started >= 1.4

@@ -1058,18 +1058,14 @@ class TestGithubDirectory:
 
         elements = mock_ghc.repo.create_git_tree.call_args[0][0]
         idents = [e._identity for e in elements]
-        deleted = {
-            i["path"] for i in idents if "sha" in i and i["sha"] is None
-        }
+        deleted = {i["path"] for i in idents if "sha" in i and i["sha"] is None}
         assert deleted == {
             "src/moving/.gitkeep",
             "src/moving/sub/.gitkeep",
             "src/moving/sub/note.txt.7",
         }
         moved = {
-            i["path"]: i["sha"]
-            for i in idents
-            if "sha" in i and i["sha"] is not None
+            i["path"]: i["sha"] for i in idents if "sha" in i and i["sha"] is not None
         }
         assert moved == {
             "dest/moving/.gitkeep": "src/moving/.gitkeep-sha",
@@ -1700,9 +1696,7 @@ class TestPushFullSync:
         # at all: the delta overlays the branch's current tree, so
         # untouched paths survive without being re-sent.
         created = {i["path"] for i in idents if "content" in i}
-        deleted = {
-            i["path"] for i in idents if "sha" in i and i["sha"] is None
-        }
+        deleted = {i["path"] for i in idents if "sha" in i and i["sha"] is None}
         assert created == {"docs/readme.42"}
         assert deleted == {"docs/oldfile.7", "docs/.gitkeep"}
         assert {"docs/.tgdcfsstats.json", "README.md"}.isdisjoint(
@@ -1938,9 +1932,7 @@ class TestBatchedDeletions:
             mock_github_class, mock_github_config, mock_ghc
         )
         ref = self._wire_commit(mock_ghc)
-        mock_ghc.pending_drops.update(
-            {"dir/b.8", "dir/a.7", "missing.9"}
-        )
+        mock_ghc.pending_drops.update({"dir/b.8", "dir/a.7", "missing.9"})
         mock_ghc.pending_drops_since = time.monotonic() - 10
 
         await repository.push()
@@ -2033,9 +2025,7 @@ class TestBatchedDeletions:
         mock_ghc.pending_drops_since = time.monotonic() - 10
 
         tree = Mock()
-        tree.tree = [
-            Mock(path="docs/readme.42", type="blob", sha="old", mode="100644")
-        ]
+        tree.tree = [Mock(path="docs/readme.42", type="blob", sha="old", mode="100644")]
         tree.truncated = False
         mock_ghc.repo.get_git_tree.return_value = tree
         ref = Mock()

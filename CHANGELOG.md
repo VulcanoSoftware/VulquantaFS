@@ -54,6 +54,31 @@ the fact on the commits that shipped them.
 
 ### Fixed
 
+- Starting up now reads only the metadata store that holds the most recent
+  tree instead of reading every store. Git stores date their tree with
+  their branch head, and that head is two small GETs away -- so the boot
+  probes every store's head first and reads only the winner (the primary
+  preferred on a tie: exactly what reading and comparing every store used
+  to conclude). A store whose probe fails counts as gone for this boot and
+  is marked stale for the heal instead of being read, a store that holds
+  nothing boots the fresh installation as before, and a store that cannot
+  date itself cheaply (a pinned message or a document store) falls back to
+  the unconditional read. A rate-limited GitLab mirror could hold the boot
+  for a first wave of listing retries before anything was served; now one
+  cheap probe either answers or skips the store.
+- A git-backed metadata store keeps a local snapshot of its last tree
+  listing, keyed to the head it was listed at. A boot that sees the same
+  head serves the tree from that snapshot: the listing has not changed, so
+  the hundreds of paginated GETs -- and the 429 waits a slow backend adds
+  to each of them -- are paid only when the branch actually moved. A
+  missing, unreadable or stale snapshot just makes the boot list the tree
+  the old way.
+- The GitLab facade publishes every 429's prescribed wait to all the
+  requests of one project. Requests that each burned their own retry
+  budget against the same limiter at the same moment sustained the limit
+  through wave after wave of bursts; every send now holds off until the
+  longest pause asked for has passed, so a concurrent listing pool that
+  hits the limit crawls instead of storming it.
 - Starting up no longer waits for the first full metadata write. ``init()``
   loaded the trees of every store one after another and then synchronously
   pushed the winner back into all of them (mirrors that missed something get
