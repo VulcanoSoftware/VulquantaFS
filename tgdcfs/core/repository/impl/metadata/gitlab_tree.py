@@ -364,12 +364,15 @@ class GitlabRepository:
         url = f"{self._base_url}/api/v4/projects/{self._project}{path}"
 
         def send() -> requests.Response:
-            return self._session.request(
-                method,
-                url,
-                params=params,
-                json=json_body,
-                timeout=REQUEST_TIMEOUT_SECONDS,
+            return cast(
+                requests.Response,
+                self._session.request(
+                    method,
+                    url,
+                    params=params,
+                    json=json_body,
+                    timeout=REQUEST_TIMEOUT_SECONDS,
+                ),
             )
 
         attempts = RATE_LIMIT_RETRIES if retry_rate_limit else 1
