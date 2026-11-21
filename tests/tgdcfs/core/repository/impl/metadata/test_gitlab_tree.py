@@ -67,6 +67,14 @@ class FakeResponse:
         return json.loads(self.text) if self.text else {}
 
 
+async def settled_initial_push(layer) -> None:
+    """Wait for the background push init() scheduled before asserting."""
+    initial = layer._initial_push
+    assert initial is not None
+    await initial
+
+
+
 class FakeGitlab:
     """An in-memory GitLab project: branches as file dicts, commits as
     (sha, message, date, changed paths, resulting files)."""
@@ -198,6 +206,7 @@ class FakeGitlab:
             more = page * PER_PAGE < len(resp)
             if more:
                 headers["X-Next-Page"] = str(page + 1)
+            headers["X-Total-Pages"] = str(max(1, -(-len(resp) // PER_PAGE)))
             resp = resp[(page - 1) * PER_PAGE : page * PER_PAGE]
         return FakeResponse(status, resp, headers)
 
@@ -566,6 +575,67 @@ class TestFacade:
         tree = facade.get_git_tree("main", recursive=True)
 
         assert len(tree.tree) == 250
+
+    async def test_the_pages_beyond_the_first_are_fetched_concurrently(self, gitlab):
+        """The boot reads every store: a grown repository's recursive
+        listing paginates into hundreds of GETs, and one page per round
+        trip lined the whole startup up behind a quarter hour of them.
+        GitLab reports the page count, so the remaining pages go out
+        together and the entry order still matches the walk."""
+        gitlab.commit(
+            "main",
+            "seed",
+            [
+                {
+                    "action": "create",
+                    "file_path": f"f{i}.123",
+                    "content": "",
+                    "encoding": "text",
+                }
+                for i in range(250)
+            ],
+        )
+        facade = GitlabRepository(gitlab_config())
+
+        tree = facade.get_git_tree("main", recursive=True)
+
+        pages = [
+            params["page"]
+            for _, url, params, _ in gitlab.requests
+            if url.endswith("repository/tree") and params.get("page")
+        ]
+        assert pages == [1, 2, 3]
+        assert len(tree.tree) == 250
+        assert {e.path for e in tree.tree} == {f"f{i}.123" for i in range(250)}
+
+    async def test_a_429_in_the_concurrent_listing_is_waited_out(self, monkeypatch):
+        """A rate limiter makes the pool crawl instead of fail: every
+        concurrently dispatched page retries its own 429."""
+        gitlab = RateLimitGitlab(limited=3)
+        _route_session(monkeypatch, gitlab)
+        gitlab.commit(
+            "main",
+            "seed",
+            [
+                {
+                    "action": "create",
+                    "file_path": f"f{i}.123",
+                    "content": "",
+                    "encoding": "text",
+                }
+                for i in range(250)
+            ],
+        )
+        before = gitlab.attempts
+        facade = GitlabRepository(gitlab_config())
+
+        tree = facade.get_git_tree("main", recursive=True)
+
+        assert len(tree.tree) == 250
+        assert {e.path for e in tree.tree} == {f"f{i}.123" for i in range(250)}
+        # The three refusals each cost the request that drew them one
+        # retry, wherever in the flight of pages they landed.
+        assert gitlab.attempts - before == 7
 
     async def test_a_missing_branch_is_a_404(self, gitlab):
         facade = GitlabRepository(gitlab_config())
@@ -1056,6 +1126,7 @@ class TestGitlabTreeStore:
         )
 
         await layer.init()
+        await settled_initial_push(layer)
 
         # One shared tree object, store-backed for the mirror.
         assert layer.metadata is tree
@@ -1260,6 +1331,7 @@ class TestFailFastGitlabTreeStore:
         )
 
         await layer.init()
+        await settled_initial_push(layer)
         assert layer.stale_stores() == ["gitlab_repo@g/p@main"]
 
         posts = [r for r in gitlab_dead_writes.requests if r[0] == "POST"]

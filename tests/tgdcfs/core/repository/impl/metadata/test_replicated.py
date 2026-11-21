@@ -95,6 +95,14 @@ class FakeMetadataRepo(IMetaDataRepository):
         self.save_stats_calls += 1
 
 
+
+async def settled_initial_push(layer: ReplicatedMetadataRepository) -> None:
+    """Wait for the background push init() scheduled before asserting."""
+    initial = layer._initial_push
+    assert initial is not None
+    await initial
+
+
 def tree(*names: str) -> TGFSMetadata:
     root = TGFSDirectory.root_dir()
     for name in names:
@@ -134,6 +142,7 @@ class TestLoad:
         layer = replicated(primary, mirror)
 
         await layer.init()
+        await settled_initial_push(layer)
 
         assert layer.metadata is primary_tree
         assert primary.stored is primary_tree
@@ -149,6 +158,7 @@ class TestLoad:
         layer = replicated(primary, mirror)
 
         await layer.init()
+        await settled_initial_push(layer)
 
         assert layer.metadata is mirror_tree
         # The push that follows init wrote the mirror's tree back into the
@@ -165,6 +175,7 @@ class TestLoad:
         layer = replicated(primary, mirror)
 
         await layer.init()
+        await settled_initial_push(layer)
 
         assert layer.metadata is not None
         assert layer.metadata.dir.find_dirs() == []
@@ -182,6 +193,7 @@ class TestLoad:
         layer = replicated(primary, mirror)
 
         await layer.init()
+        await settled_initial_push(layer)
 
         assert layer.metadata is not None
         assert primary.stored is layer.metadata
@@ -203,6 +215,7 @@ class TestLoad:
         mirror = FakeMetadataRepo("mirror", tree("mirror"))
         layer = replicated(primary, mirror)
         await layer.init()
+        await settled_initial_push(layer)
 
         primary.get_error = TechnicalError("down")
         result = await layer.get()
@@ -224,6 +237,7 @@ class TestFreshestLoad:
         layer = replicated(primary, mirror)
 
         await layer.init()
+        await settled_initial_push(layer)
 
         assert layer.metadata is mirror_tree
         assert layer.stale_stores() == []
@@ -241,6 +255,7 @@ class TestFreshestLoad:
         layer = replicated(primary, mirror)
 
         await layer.init()
+        await settled_initial_push(layer)
 
         assert layer.metadata is primary_tree
         assert primary.push_calls == 1
@@ -256,6 +271,7 @@ class TestFreshestLoad:
         layer = replicated(primary, mirror)
 
         await layer.init()
+        await settled_initial_push(layer)
 
         assert layer.metadata is primary_tree
         assert mirror.stored is primary_tree
@@ -269,6 +285,7 @@ class TestFreshestLoad:
         )
 
         await layer.init()
+        await settled_initial_push(layer)
 
         assert layer.metadata.dir.find_dirs()[0].name == "primary"
 
@@ -392,10 +409,24 @@ class TestTooLarge:
         assert layer.stale_stores() == []
 
 
+class BlockingPushRepo(FakeMetadataRepo):
+    """A store whose push never finishes until the test releases it."""
+
+    def __init__(self, name: str, stored: TGFSMetadata | None = None):
+        super().__init__(name, stored)
+        self.release = asyncio.Event()
+
+    async def push(self) -> None:
+        self.push_calls += 1
+        await self.release.wait()
+        self.stored = self.metadata
+
+
 class TestStartupResilience:
-    """``init`` loads one tree and pushes it; when every store refuses the
-    write the boot survives: reads run off the loaded tree, the failed
-    stores stay marked stale and the heal worker re-syncs them."""
+    """``init`` loads one tree and pushes it in the background; when every
+    store refuses the write the boot survives: reads run off the loaded
+    tree, the failed stores stay marked stale and the heal worker re-syncs
+    them."""
 
     async def test_a_failed_startup_push_is_logged_not_raised(self, caplog):
         primary = FakeMetadataRepo(
@@ -405,6 +436,7 @@ class TestStartupResilience:
 
         with caplog.at_level(logging.WARNING):
             await layer.init()
+            await settled_initial_push(layer)
 
         assert layer.metadata is not None
         assert layer.stale_stores() == ["primary"]
@@ -430,6 +462,7 @@ class TestStartupResilience:
 
         with caplog.at_level(logging.WARNING):
             await layer.init()
+            await settled_initial_push(layer)
 
         assert layer.metadata is mirror_tree
         assert layer.stale_stores() == ["mirror", "primary"]
@@ -444,10 +477,68 @@ class TestStartupResilience:
         layer = replicated(primary, mirror)
 
         await layer.init()
+        await settled_initial_push(layer)
 
         assert layer.metadata is not None
         assert primary.stored is layer.metadata
         assert layer.stale_stores() == ["mirror"]
+
+    async def test_the_boot_does_not_wait_for_the_startup_push(self):
+        """The awkward shape that took a quarter hour of boot: one slow
+        store holds the tree up while the server could already serve
+        reads. ``init`` returns with the tree loaded and leaves the first
+        push running."""
+        primary = BlockingPushRepo("primary", tree("primary"))
+        mirror = FakeMetadataRepo("mirror", tree("mirror"))
+        layer = replicated(primary, mirror)
+
+        await layer.init()
+
+        assert layer.metadata is not None
+        assert layer._initial_push is not None
+        assert not layer._initial_push.done()
+        assert primary.push_calls == 0
+
+        primary.release.set()
+        await layer._initial_push
+
+        assert layer.stale_stores() == []
+
+    async def test_an_unexpected_startup_push_crash_is_logged(self, caplog):
+        class ExplodingLayer(ReplicatedMetadataRepository):
+            """A crash in the layer itself, outside the per-store writes
+            that already report failure through the stale bookkeeping."""
+
+            async def push(self) -> None:
+                raise RuntimeError("exploded")
+
+        layer = ExplodingLayer(
+            [
+                MetadataStore(
+                    key="primary", repo=FakeMetadataRepo("primary"), primary=True
+                )
+            ]
+        )
+
+        with caplog.at_level(logging.ERROR):
+            await layer.init()
+            await settled_initial_push(layer)
+
+        messages = [r.getMessage() for r in caplog.records]
+        assert any(
+            "The startup push of the metadata stores failed" in m for m in messages
+        )
+
+    async def test_closing_cancels_a_pending_startup_push(self):
+        primary = BlockingPushRepo("primary", tree("primary"))
+        layer = replicated(primary)
+
+        await layer.init()
+        await layer.close()
+
+        assert layer._initial_push is None
+        assert primary.push_calls == 0
+        primary.release.set()
 
 
 class TestHeal:

@@ -86,6 +86,14 @@ async def store_factory(store_cfg):
     )
 
 
+async def settled_initial_push(client) -> None:
+    """Wait for the background full push Client.create schedules."""
+    repo = getattr(client.metadata_api, "_MetaDataApi__metadata_repo")
+    initial = getattr(repo, "_initial_push", None)
+    assert initial is not None
+    await initial
+
+
 async def make_client(
     tmp_path=None,
 ) -> Tuple[Client, FakeStore, FakeStore, ReplicationQueue | None]:
@@ -94,6 +102,7 @@ async def make_client(
     client = await Client.create(
         config.filesystems["media"], config, store_factory, replication=queue
     )
+    await settled_initial_push(client)
     tg = cast(FakeStore, client.store)
     assert client.mirror_group is not None
     dc = cast(FakeStore, client.mirror_group.stores[0].store)
@@ -196,6 +205,7 @@ class TestWriteFailover:
             encryption_cfg=encryption,
             replication=queue,
         )
+        await settled_initial_push(client)
         data = bytes((i // 53) % 251 for i in range(48 * 1024))
         primary_read = asyncio.Event()
         outage = asyncio.Event()
@@ -558,6 +568,7 @@ class TestWriteFailover:
         client = await Client.create(
             config.filesystems["media"], config, stores, replication=queue
         )
+        await settled_initial_push(client)
 
         class NoAuth(asyncssh.SSHServer):
             def begin_auth(self, username: str) -> bool:
@@ -669,6 +680,7 @@ class TestWriteFailover:
             return tg if cfg.backend == "telegram" else dc
 
         client = await Client.create(config.filesystems["media"], config, stores)
+        await settled_initial_push(client)
         tg.fail = set(PRIMARY_DOWN)
 
         class NoAuth(asyncssh.SSHServer):
