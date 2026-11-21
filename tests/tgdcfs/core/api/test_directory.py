@@ -44,12 +44,11 @@ class TestDirectoryApi:
         self, dir_api, mock_metadata_api, mock_file_api, mock_message_api
     ):
         empty_dir = TGFSDirectory.root_dir()
-        mock_file_api.collect_deletable_message_ids.return_value = ([], {})
-
         await dir_api.rm_empty(empty_dir)
 
         mock_metadata_api.push.assert_called_once()
-        mock_message_api.delete_messages.assert_called_once_with([])
+        mock_file_api.collect_deletable_message_ids.assert_not_called()
+        mock_message_api.delete_messages.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_rm_empty_non_empty_raises(self, dir_api):

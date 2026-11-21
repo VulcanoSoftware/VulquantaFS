@@ -228,10 +228,10 @@ class MetaDataApi:
         """
         async with self.__write_lock:
             await self.__metadata_repo.heal()
-            try:
-                await self.__metadata_repo.maintain()
-            except Exception as ex:
-                logger.warning(f"Metadata maintenance failed: {ex}")
+        try:
+            await self.__metadata_repo.maintain()
+        except Exception as ex:
+            logger.warning(f"Metadata maintenance failed: {ex}")
 
     def stale_stores(self) -> List[str]:
         return self.__metadata_repo.stale_stores()

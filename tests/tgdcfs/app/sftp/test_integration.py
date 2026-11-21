@@ -7,17 +7,23 @@ between OPEN, READ/WRITE and CLOSE.
 
 import asyncio
 import datetime
+import threading
+from types import SimpleNamespace
+from unittest.mock import call
 
 import asyncssh
 import pytest
 
 from tests.tgdcfs.app.sftp.mocked_stats import mocked_stats
 from tgdcfs.app.sftp.server import make_server_factory, make_sftp_factory
-from tgdcfs.config import SFTPConfig
+from tgdcfs.config import GithubRepoConfig, SFTPConfig
 from tgdcfs.core import Client
 from tgdcfs.core.api import DirectoryApi, FileApi, MetaDataApi
 from tgdcfs.core.api.removal_journal import RemovalJournal
 from tgdcfs.core.model import TGFSDirectory, TGFSFileDesc, TGFSFileVersion, TGFSMetadata
+from tgdcfs.core.repository.impl.metadata.github_repo import (
+    GithubRepoMetadataRepository,
+)
 from tgdcfs.core.repository.interface import IMetaDataRepository
 from tgdcfs.reqres import UploadableFileMessage
 
@@ -228,6 +234,112 @@ async def test_sequential_remove_does_not_wait_for_remote_mirror(
         await api.close()
 
 
+async def test_rmdir_stays_responsive_and_does_not_wait_for_history(mocker, users):
+    loop = asyncio.get_running_loop()
+    history_started, commit_started = asyncio.Event(), asyncio.Event()
+    release_history, release_commit = threading.Event(), threading.Event()
+    github = mocker.Mock()
+    ref = github.get_git_ref.return_value
+    ref.object.sha = "head"
+    base = github.get_git_commit.return_value
+    base.tree.sha = "root-tree"
+    github.create_git_commit.return_value.sha = "next"
+
+    def blocked(started, release, result=None):
+        loop.call_soon_threadsafe(started.set)
+        assert release.wait(10), "test did not release blocked GitHub request"
+        return result
+
+    github.get_commits.return_value.get_page.side_effect = lambda _: blocked(
+        history_started, release_history, []
+    )
+    ref.edit.side_effect = lambda _: blocked(commit_started, release_commit)
+    github.get_git_tree.side_effect = [
+        SimpleNamespace(
+            truncated=False,
+            tree=[
+                SimpleNamespace(path="parent", type="tree", sha="parent-tree"),
+                SimpleNamespace(path="other", type="tree", sha="other-tree"),
+            ],
+        ),
+        SimpleNamespace(
+            truncated=False,
+            tree=[SimpleNamespace(path="batch", type="tree", sha="huge-tree")],
+        ),
+    ]
+    repo = GithubRepoMetadataRepository(
+        GithubRepoConfig(
+            access_token="unused",
+            repo="test/metadata",
+            commit="main",
+            squash_history_max_commits=100_000,
+        ),
+        repo=github,
+    )
+    root = TGFSDirectory.root_dir()
+    root.create_dir("parent").create_dir("batch")
+    other = root.create_dir("other")
+    other.create_file_ref("live", 1)
+    repo.metadata = TGFSMetadata(root)
+    api = MetaDataApi(repo, push_mode="coalesced", push_window=0)
+    client = build_client(mocker, "notes", FakeChannel())
+    media = mocker.Mock()
+    client.dir_api = DirectoryApi(api, client.file_api, media)
+    config = build_config(mocker, users)
+    mocker.patch(
+        "tgdcfs.app.sftp.server.authenticate",
+        side_effect=lambda username, password: _authenticate(users, username, password),
+    )
+    server = await asyncssh.listen(
+        host="127.0.0.1",
+        port=0,
+        server_factory=make_server_factory(config),
+        server_host_keys=[asyncssh.generate_private_key("ssh-ed25519")],
+        sftp_factory=make_sftp_factory({"notes": client}, config),
+    )
+    heal = asyncio.create_task(api.heal())
+    try:
+        async with asyncio.timeout(5):
+            await history_started.wait()
+            async with await connect(server) as conn:
+                async with conn.start_sftp_client() as sftp:
+                    async with conn.start_sftp_client() as browser:
+                        with pytest.raises(asyncssh.SFTPFailure):
+                            await sftp.rmdir("/notes/other")
+                        removal = asyncio.create_task(sftp.rmdir("/notes/parent/batch"))
+                        try:
+                            await commit_started.wait()
+                            assert "other" in await browser.listdir("/notes")
+                            assert "batch" in await browser.listdir("/notes/parent")
+                        finally:
+                            release_commit.set()
+                            await removal
+                        assert "batch" not in await browser.listdir("/notes/parent")
+                        assert "other" in await browser.listdir("/notes")
+            assert not heal.done()
+    finally:
+        release_history.set()
+        release_commit.set()
+        await heal
+        server.close()
+        await server.wait_closed()
+        await api.close()
+        repo._ghc.writer.shutdown()
+
+    assert github.get_git_tree.call_args_list == [
+        call("root-tree"),
+        call("parent-tree"),
+    ]
+    args, kwargs = github.create_git_tree.call_args
+    assert kwargs == {"base_tree": base.tree}
+    assert [element._identity for element in args[0]] == [
+        {"path": "parent/batch", "mode": "040000", "type": "tree", "sha": None},
+        {"path": "parent/.gitkeep", "mode": "100644", "type": "blob", "content": ""},
+    ]
+    ref.edit.assert_called_once_with("next")
+    assert not media.mock_calls
+
+
 def _authenticate(users, username, password):
     from tgdcfs.auth.user import AdminUser, ReadonlyUser
     from tgdcfs.errors.tgdcfs import LoginFailed
@@ -388,6 +500,8 @@ class TestReadonlyUser:
             async with conn.start_sftp_client() as sftp:
                 with pytest.raises(asyncssh.SFTPPermissionDenied):
                     await sftp.remove("/notes/note.txt")
+                with pytest.raises(asyncssh.SFTPPermissionDenied):
+                    await sftp.rmdir("/notes/sub")
 
 
 class TestConcurrency:

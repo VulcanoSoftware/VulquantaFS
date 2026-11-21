@@ -780,7 +780,7 @@ class TestHeal:
         assert layer.stale_stores() == ["mirror"]
         assert mirror.stored is None
 
-    async def test_heal_maintains_the_healthy_stores_only(self):
+    async def test_maintenance_skips_stale_stores(self):
         primary = FakeMetadataRepo("primary")
         stale = FakeMetadataRepo("stale", push_full_error=TechnicalError("down"))
         layer = replicated(primary, stale)
@@ -789,6 +789,8 @@ class TestHeal:
         assert layer.stale_stores() == ["stale"]
 
         await layer.heal()
+        assert primary.maintain_calls == 0
+        await layer.maintain()
 
         assert primary.maintain_calls == 1
         assert stale.maintain_calls == 0
@@ -801,6 +803,7 @@ class TestHeal:
         layer.metadata = tree("a")
 
         await layer.heal()
+        await layer.maintain()
 
         assert layer.stale_stores() == []
 
