@@ -10,35 +10,26 @@
 > **Fork note.** Nothing in this repository's workflows or badges is
 > hard-coded to an owner. Docker images publish under
 > `${{ github.repository_owner }}`, and the "Sync README badges" workflow
-> rewrites the badges above to the fork's own coordinates on the first
-> push. If your Docker Hub namespace differs from your GitHub username,
-> set the repository variable `DOCKERHUB_NAMESPACE` as described in the
-> [fork setup guide](https://vectrastack2.github.io/vulquantafs/docs/developers/fork-setup/).
+
+<div align="center">
 
 # VulquantaFS
 
-**Telegram and Discord as storage backends behind one WebDAV and SFTP
-server.**
+Telegram and Discord as storage backends behind one WebDAV and SFTP
+server.
 
-VulquantaFS is a copy of [tgfs](https://github.com/Xyvran/tgfs) (taken at
-commit `7464666`) that grows a second storage backend, Discord. Every
-file system has a primary store and optional mirror stores, and a store
-can be a Telegram channel or a Discord channel in either role. The
-technical architecture is described in the
-[architecture overview](https://vectrastack2.github.io/vulquantafs/docs/technical-users/).
+[Documentation](https://vectrastack2.github.io/vulquantafs/docs/) ·
+[Getting started](https://vectrastack2.github.io/vulquantafs/getting-started/) ·
+[Config generator](https://vectrastack2.github.io/vulquantafs/config-generator/) ·
+[Docker Hub](https://hub.docker.com/r/vectrastack2/vulquantafs)
 
-| Page | URL |
-|---|---|
-| **Documentation** | <https://vectrastack2.github.io/vulquantafs/docs/> |
-| **Getting started** | <https://vectrastack2.github.io/vulquantafs/getting-started/> |
-| **Config generator** | <https://vectrastack2.github.io/vulquantafs/config-generator/> |
-| **Docker Hub** | <https://hub.docker.com/r/vecstack-prog/vulquantafs> |
+</div>
 
 ## Features
 
 * WebDAV and SFTP servers over private Telegram and Discord channels
-* Unlimited file sizes: large files are chunked into parts but appear as
-  a single file, with live streaming of videos
+* Unlimited file sizes: large files are chunked into parts but appear as a
+  single file, with live streaming of videos
 * Infinite versioning of files and folders
 * Optional at-rest encryption (AES-256-GCM), invisible to clients
 * Optional RAID-1-style channel redundancy with automatic failover
@@ -48,30 +39,17 @@ technical architecture is described in the
 
 ## Getting started
 
-Create the Telegram app, bots and channels (and optionally the Discord
-bot) with the
-[getting-started guide](https://vectrastack2.github.io/vulquantafs/getting-started/).
-Write your `config.yaml` in the browser with the
-[config generator](https://vectrastack2.github.io/vulquantafs/config-generator/)
-— nothing you type leaves the page. Then run the server: the
-[deployment guide](https://vectrastack2.github.io/vulquantafs/docs/technical-users/deployment/)
-covers Docker, docker-compose, systemd and Kubernetes, and
-[connecting clients](https://vectrastack2.github.io/vulquantafs/docs/users/connecting-clients/)
-lists the tested WebDAV and SFTP apps.
-
-## Coming from tgfs
-
-* The Python package, the Docker image (`<OWNER>/vulquantafs`) and the
-  environment variables are renamed. `TGFS_DATA_DIR` and
-  `TGFS_CONFIG_FILE` still work with a deprecation warning; the new
-  names are `VULQUANTAFS_DATA_DIR` and `VULQUANTAFS_CONFIG_FILE`.
-* The data directory inside the image is `/home/vulquantafs/.vulquantafs`
-  (was `/home/tgfs/.tgfs`), so adjust the volume mount when switching
-  images.
-* A `config.yaml` written for tgfs loads unchanged: the top-level
-  `tgfs:` block is read as `vulquantafs:` with a deprecation warning.
-* The metadata format is unchanged; a channel written by tgfs is served
-  by vulquantafs as is.
+1. Create the Telegram app, bots and channels (and optionally the Discord
+   bot) with the
+   [getting-started guide](https://vectrastack2.github.io/vulquantafs/getting-started/).
+2. Write your `config.yaml` in the browser with the
+   [config generator](https://vectrastack2.github.io/vulquantafs/config-generator/)
+   — nothing you type leaves the page.
+3. Run the server: the
+   [deployment guide](https://vectrastack2.github.io/vulquantafs/docs/technical-users/deployment/)
+   covers Docker, docker-compose, systemd and Kubernetes, and
+   [connecting clients](https://vectrastack2.github.io/vulquantafs/docs/users/connecting-clients/)
+   lists the tested WebDAV and SFTP apps.
 
 ## Documentation
 
@@ -100,6 +78,19 @@ covers the local setup, the test suite, the CI workflows, the release
 process and the preview builds. Releases follow
 [SemVer](https://semver.org/) and are recorded in
 [CHANGELOG.md](CHANGELOG.md) under `[Unreleased]`.
+
+<details>
+<summary>Note for forks</summary>
+
+Nothing in this repository's workflows or badges is hard-coded to an owner.
+Docker images publish under `${{ github.repository_owner }}`, and the
+"Sync README badges" workflow rewrites the badges above to the fork's own
+coordinates on the first push. If your Docker Hub namespace differs from
+your GitHub username, set the repository variable `DOCKERHUB_NAMESPACE` as
+described in the
+[fork setup guide](https://vectrastack2.github.io/vulquantafs/docs/developers/fork-setup/).
+
+</details>
 
 ## Acknowledgements
 
