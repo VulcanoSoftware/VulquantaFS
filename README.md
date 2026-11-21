@@ -91,5 +91,7 @@ described in the
 
 * Many thanks to [WheatCarrier](https://github.com/TheodoreKrypton/tgfs)
   for creating the original tgfs project this repository is built upon.
+* Thanks to [Xyvran](https://github.com/Xyvran/tgdcfs) for the tgdcfs
+  project this repository grew out of.
 * Much of the code in VulquantaFS is taken from
   [dcfs](https://github.com/VulcanoSoftware/dcfs) by VulcanoSoftware.
