@@ -28,7 +28,7 @@ from tgdcfs.crypto.path_names import (
     encrypt_path_name,
     is_encrypted_path_name,
 )
-from tgdcfs.errors import MetadataNotInitialized, TechnicalError
+from tgdcfs.errors import MetadataNotInitialized, NoStoredMetadata, TechnicalError
 
 from .dir_timestamps import DirTimestampStore, cache_file_name
 from .gh_directory import (
@@ -41,6 +41,7 @@ from .gh_directory import (
     commit_tree_overlay,
 )
 from .stats_file import STATS_COMMIT_PREFIX, STATS_FILE_NAME
+from .tree_snapshot import TreeSnapshot, snapshot_file_name
 
 logger = logging.getLogger(__name__)
 
@@ -53,6 +54,13 @@ class _TreeEntry(NamedTuple):
     type: str
     sha: str
     mode: str = "100644"
+
+
+class _HeadCommit(NamedTuple):
+    """The branch head's sha with the Unix epoch of its commit date."""
+
+    sha: str
+    epoch: float
 
 
 # How often a stats commit is retried when the branch moved under it.
@@ -105,6 +113,9 @@ class GithubRepoMetadataRepository(IMetaDataRepository):
             repo=repo,
             branch=config.commit,
             path=expand_path(cache_file_name(config.repo, config.commit)),
+        )
+        self._snapshot = TreeSnapshot(
+            expand_path(snapshot_file_name(config.repo, config.commit))
         )
 
         self._ghc = GithubConfig(
@@ -444,9 +455,7 @@ class GithubRepoMetadataRepository(IMetaDataRepository):
                 }
             else:
                 current = {
-                    e.path: (e.sha, e.mode)
-                    for e in tree.tree
-                    if e.type == "blob"
+                    e.path: (e.sha, e.mode) for e in tree.tree if e.type == "blob"
                 }
             creates = sorted(desired_blobs - set(current))
             deletes = sorted(
@@ -681,9 +690,24 @@ class GithubRepoMetadataRepository(IMetaDataRepository):
                 )
 
     async def get(self) -> TGFSMetadata:
-        # One call to read the repo head plus at most one to diff it against
-        # the cached one. Off the event loop because PyGithub is synchronous.
-        await asyncio.to_thread(self._timestamps.load)
+        # Off the event loop: PyGithub and the facade are synchronous.
+        head = await asyncio.to_thread(self._head_commit)
+        if head is not None:
+            # The listing only changes when the branch moves, and a grown
+            # repository costs hundreds of requests to list: when the head
+            # of this boot is the head the last boot listed, the local
+            # snapshot of that listing serves the tree in its place.
+            tree = await asyncio.to_thread(
+                self._snapshot.load,
+                self._ghc.repo_name,
+                self._ghc.commit,
+                head.sha,
+            )
+            if tree is not None:
+                await asyncio.to_thread(self._timestamps.load)
+                metadata = TGFSMetadata.from_dict(tree)
+                metadata.revision = head.epoch
+                return metadata
         # Off the loop too: with a large repo the walk is a request per
         # directory. The structure is built fresh, so nothing is shared.
         root_dir = await asyncio.to_thread(self._build_directory_structure)
@@ -692,20 +716,65 @@ class GithubRepoMetadataRepository(IMetaDataRepository):
         # is when this copy was written last. A store that proves dead later
         # during the read fails the load anyway; an empty repository has no
         # head and simply dates as unknown.
-        metadata.revision = await asyncio.to_thread(self._head_commit_epoch)
+        metadata.revision = head.epoch if head else None
+        if head is not None:
+            await asyncio.to_thread(
+                self._snapshot.save,
+                self._ghc.repo_name,
+                self._ghc.commit,
+                head.sha,
+                metadata.to_dict(),
+            )
         return metadata
 
-    def _head_commit_epoch(self) -> Optional[float]:
-        """When the branch was written last, as a Unix epoch, or None."""
+    def _head_commit(self) -> Optional[_HeadCommit]:
+        """The branch head's sha and commit date, or None.
+
+        Asked for through ``get_branch`` and ``get_git_commit``, the two
+        calls that carry their request themselves: a dead connection
+        then fails inside the guarded call, where the breaker sees it."""
         try:
-            ref = self._ghc.repo.get_git_ref(f"heads/{self._ghc.commit}")
-            commit = self._ghc.repo.get_git_commit(ref.object.sha)
+            branch = self._ghc.repo.get_branch(self._ghc.commit)
+            sha = branch.commit.sha
+            commit = self._ghc.repo.get_git_commit(sha)
             date = commit.committer.date
         except Exception:
             return None
         if not isinstance(date, datetime.datetime):
             return None
-        return date.timestamp()
+        return _HeadCommit(sha, date.timestamp())
+
+    def _head_commit_epoch(self) -> Optional[float]:
+        """When the branch was written last, as a Unix epoch, or None."""
+        head = self._head_commit()
+        return None if head is None else head.epoch
+
+    async def head_revision(self) -> Optional[float]:
+        """The branch head's commit date; an empty store is reported
+        with ``NoStoredMetadata`` and a head that cannot be dated with
+        ``None``, so a load can tell unreachable, empty and undatable
+        apart."""
+        try:
+            head = await asyncio.to_thread(self._probe_head)
+        except GithubException as ex:
+            if ex.status in (404, 409):
+                raise NoStoredMetadata(
+                    f"The branch {self._ghc.commit} of {self._ghc.repo_name} "
+                    f"does not exist yet"
+                ) from ex
+            raise
+        return None if head is None else head.epoch
+
+    def _probe_head(self) -> Optional[_HeadCommit]:
+        """The branch head, letting a failed read raise (a swallowed one
+        would hide an outage from the load and from the breaker)."""
+        branch = self._ghc.repo.get_branch(self._ghc.commit)
+        sha = branch.commit.sha
+        commit = self._ghc.repo.get_git_commit(sha)
+        date = commit.committer.date
+        if not isinstance(date, datetime.datetime):
+            return None
+        return _HeadCommit(sha, date.timestamp())
 
     def _build_directory_structure(self) -> GithubDirectory:
         root = GithubDirectory(

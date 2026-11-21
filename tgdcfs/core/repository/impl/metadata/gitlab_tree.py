@@ -44,7 +44,7 @@ from tgdcfs.core.repository.impl.metadata.github_repo.dir_timestamps import (
     STATS_COMMIT_SCAN_LIMIT,
 )
 from tgdcfs.crypto.metadata_blob import decrypt_metadata_blob
-from tgdcfs.errors import TechnicalError
+from tgdcfs.errors import NoStoredMetadata, TechnicalError
 
 logger = logging.getLogger(__name__)
 
@@ -220,6 +220,13 @@ class GitlabRepository:
         self._token = config.access_token
         self._blob_fetch_concurrency = config.blob_fetch_concurrency
         self._local = threading.local()
+        # The moment (clock monotonic) until no request of this project may
+        # be sent, because a 429 prescribed a wait. Every caller -- the
+        # retries of its own request and any parallel worker of a listing
+        # pool -- holds off until then: at one shared limiter, requests that
+        # kept firing their separate wait budgets simultaneously were what
+        # turned one rate limit into a self-sustaining storm of them.
+        self._paused_until = 0.0
         # Tree object ids seen in listings, mapped to their path: GitLab's
         # tree API takes a commit-ish ref plus a path, never a tree id,
         # while the store walks trees by the shas a parent listing showed.
@@ -332,6 +339,19 @@ class GitlabRepository:
             wait = float(2**attempt)
         return min(max(wait, 1.0), RATE_LIMIT_MAX_SLEEP_SECONDS)
 
+    def _hold_off(self) -> None:
+        """Sleep until the pause a 429 prescribed has passed, once."""
+        remaining = self._paused_until - time.monotonic()
+        if remaining > 0:
+            time.sleep(remaining)
+
+    def _publish_pause(self, wait: float) -> None:
+        """Make every later request of this project wait out ``wait``
+        seconds before it sends, keeping the longest pause asked for."""
+        until = time.monotonic() + wait
+        if until > self._paused_until:
+            self._paused_until = until
+
     def _request(
         self,
         method: str,
@@ -339,32 +359,41 @@ class GitlabRepository:
         *,
         params: Optional[dict] = None,
         json_body: Optional[dict] = None,
+        retry_rate_limit: bool = True,
     ) -> requests.Response:
         url = f"{self._base_url}/api/v4/projects/{self._project}{path}"
-        response = self._session.request(
-            method,
-            url,
-            params=params,
-            json=json_body,
-            timeout=REQUEST_TIMEOUT_SECONDS,
-        )
-        for attempt in range(RATE_LIMIT_RETRIES - 1):
-            if response.status_code != 429:
-                break
-            wait = self._rate_limit_wait(response, attempt)
-            logger.warning(
-                f"GitLab rate limit exceeded on {method} {path} "
-                f"(attempt {attempt + 1} of {RATE_LIMIT_RETRIES}); "
-                f"retrying in {wait:.0f}s"
-            )
-            time.sleep(wait)
-            response = self._session.request(
+
+        def send():
+            # Unannotated on purpose: naming ``requests.Response`` here makes
+            # a stub-less mypy read ``Response.status_code`` out of the
+            # untyped requests source, where the branch's own ``_request``
+            # return type already carries the guarantee.
+            return self._session.request(
                 method,
                 url,
                 params=params,
                 json=json_body,
                 timeout=REQUEST_TIMEOUT_SECONDS,
             )
+
+        attempts = RATE_LIMIT_RETRIES if retry_rate_limit else 1
+        self._hold_off()
+        response = send()
+        for attempt in range(attempts - 1):
+            if response.status_code != 429:
+                break
+            wait = self._rate_limit_wait(response, attempt)
+            logger.warning(
+                f"GitLab rate limit exceeded on {method} {path} "
+                f"(attempt {attempt + 1} of {attempts}); "
+                f"retrying in {wait:.0f}s"
+            )
+            # Every other call of this project holds off too: a wave of
+            # requests that each burned its own wait budget against the
+            # same limiter kept the limit from ever clearing.
+            self._publish_pause(wait)
+            time.sleep(wait)
+            response = send()
         if response.status_code >= 400:
             data = _error_data(response)
             if _is_gitaly_deadline(data):
@@ -935,9 +964,7 @@ class GitlabRepository:
             # full history pages; the branch of an incremental metadata
             # store holds one commit per write, and only its root ends
             # the chain.
-            history = self.commit_history(
-                self._branch, MAX_HISTORY_PAGES * PER_PAGE
-            )
+            history = self.commit_history(self._branch, MAX_HISTORY_PAGES * PER_PAGE)
         except GithubException as ex:
             if ex.status == 404:
                 self._branch_missing = True
@@ -1175,6 +1202,50 @@ class GitlabTreeRepoMetadataRepository(GithubRepoMetadataRepository):
     async def close(self) -> None:
         self._gitlab_breaker.stop()
         await super().close()
+
+    async def head_revision(self) -> Optional[float]:
+        """The branch head's commit date, probed without any retrying.
+
+        The replicated layer probes this before it reads anything, and a
+        probe that retried its way through a rate limit re-created the
+        minutes of 429 waiting the probe exists to avoid: one attempt
+        per request either answers, or the store counts as unreachable
+        and the layer skips it."""
+        try:
+            return await asyncio.to_thread(self._head_epoch_once)
+        except GithubException as ex:
+            if ex.status in (404, 409):
+                raise NoStoredMetadata(
+                    f"The branch {self._ghc.commit} of {self._ghc.repo_name} "
+                    f"does not exist yet"
+                ) from ex
+            raise
+
+    def _head_epoch_once(self) -> float:
+        branch = self._ghc.commit
+        facade = self._gitlab
+        head = facade._json(
+            facade._request(
+                "GET",
+                f"/repository/branches/{quote(branch, safe='')}",
+                retry_rate_limit=False,
+            )
+        )
+        sha = head["commit"]["id"]
+        commit = facade._json(
+            facade._request(
+                "GET",
+                f"/repository/commits/{quote(sha, safe='')}",
+                retry_rate_limit=False,
+            )
+        )
+        date = _parse_date(commit.get("committed_date"))
+        if date is None:
+            raise TechnicalError(
+                f"The branch head of {self._ghc.repo_name}@{branch} "
+                f"carries no commit date"
+            )
+        return date.timestamp()
 
     async def get(self) -> TGFSMetadata:
         metadata = await super().get()

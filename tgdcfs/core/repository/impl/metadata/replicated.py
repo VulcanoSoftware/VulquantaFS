@@ -170,16 +170,119 @@ class ReplicatedMetadataRepository(IMetaDataRepository):
     async def _load(self) -> TGFSMetadata:
         """The tree to serve: the most recent one across the stores.
 
-        Every store that answers is read and dated by its revision, so
-        the copy a store received while the primary was down wins over
-        the primary's older one; git stores date themselves by their
-        branch head commit. The primary is preferred only while no other
-        store is meaningfully newer, so calm operation never flips the
-        source of truth on the split seconds between two stores' clocks.
+        The stores are dated by their revision, so the copy a store
+        received while the primary was down wins over the primary's
+        older one; git stores date themselves by their branch head
+        commit. The primary is preferred only while no other store is
+        meaningfully newer, so calm operation never flips the source of
+        truth on the split seconds between two stores' clocks.
 
         Stores that could not serve a tree (failed *or* empty *or* older
         than the winner) are marked stale, so the push that follows and
-        the periodic heal write the winning tree to them."""
+        the periodic heal write the winning tree to them. When the
+        stores can answer with their revision cheaply,
+        :meth:`_load_probed` decides the winner before any tree is
+        read; only when that is impossible (or the read of the winner
+        fails) is every store read and compared, as
+        :meth:`_load_full` has always done."""
+        probed = await self._load_probed()
+        if probed is not None:
+            return probed
+        return await self._load_full()
+
+    async def _load_probed(self) -> Optional[TGFSMetadata]:
+        """The winner chosen from cheap head probes, reading only that
+        store; None when the probes cannot decide.
+
+        Reading a grown git tree costs hundreds of listing requests, and
+        the boot used to pay that for every store -- even the ones that
+        were sure to lose, and even when a rate-limited store turned
+        every one of those listings into minutes of waiting out 429s. A
+        git store dates its tree with two small requests instead, so
+        the losers stay unread: the stores are probed, the freshest one
+        (under the usual primary preference) is read fully, and
+        everything else is marked stale -- exactly what reading and
+        comparing every store used to conclude.
+
+        ``None`` means the probes cannot decide and every store must be
+        read fully. That is a store that cannot date its tree cheaply
+        (the pinned and document stores, whose live read is small) and
+        answers ``None``; a store that cannot even be probed raises,
+        which marks it stale like a failing read does."""
+        hints: List[tuple[MetadataStore, float]] = []
+        empty_store: Optional[MetadataStore] = None
+        failures: List[str] = []
+        first_error: Optional[Exception] = None
+
+        for store in self._stores:
+            try:
+                revision = await store.repo.head_revision()
+            except EMPTY_METADATA_ERRORS:
+                # The store is reachable and holds nothing. Remember the
+                # first one; if no store holds a tree, this is where a
+                # fresh installation starts. A losing empty store is
+                # marked stale together with the other losers below.
+                if empty_store is None:
+                    empty_store = store
+                continue
+            except Exception as ex:
+                self._stale.add(store.key)
+                if first_error is None:
+                    first_error = ex
+                failures.append(f"{store.key}: {ex}")
+                logger.warning(
+                    f"Could not read the metadata from store {store.key}: {ex}"
+                )
+                continue
+            if revision is None:
+                return None
+            hints.append((store, revision))
+
+        if not hints:
+            if empty_store is not None:
+                if failures:
+                    logger.warning(
+                        f"No metadata store could serve a tree "
+                        f"({'; '.join(failures)}); starting from the "
+                        f"empty tree of {empty_store.key}"
+                    )
+                return TGFSMetadata(dir=TGFSDirectory.root_dir())
+            raise TechnicalError(
+                "No metadata store could be read: " + "; ".join(failures)
+            ) from first_error
+
+        stubs = [
+            (store, TGFSMetadata(dir=TGFSDirectory.root_dir(), revision=revision))
+            for store, revision in hints
+        ]
+        winner, _ = self._freshest(stubs)
+        try:
+            tree = await winner.repo.get()
+        except Exception as ex:
+            # The probe answered a moment ago and the read failed: the
+            # full periodic path handles those failures per store, so
+            # fall back to it rather than deciding anything here.
+            logger.warning(f"Could not read the metadata from store {winner.key}: {ex}")
+            return None
+        for store, _ in hints:
+            if store is not winner:
+                self._stale.add(store.key)
+                logger.info(
+                    f"Metadata store {winner.key} holds the most recent "
+                    f"metadata tree; store {store.key} will be re-synced"
+                )
+        if empty_store is not None:
+            self._stale.add(empty_store.key)
+        return tree
+
+    async def _load_full(self) -> TGFSMetadata:
+        """Every store is read and dated by its revision.
+
+        The fallback :meth:`_load` uses when the cheap probes cannot
+        decide (an ambiguous store, or the probed winner failed its
+        read): all stores are read and the freshest tree wins.
+
+        See :meth:`_load` for how the stores are compared."""
         candidates: List[tuple[MetadataStore, TGFSMetadata]] = []
         fresh: Optional[TGFSMetadata] = None
         fresh_store: Optional[MetadataStore] = None
@@ -367,9 +470,7 @@ class ReplicatedMetadataRepository(IMetaDataRepository):
             try:
                 await store.repo.maintain()
             except Exception as ex:
-                logger.warning(
-                    f"Maintaining metadata store {store.key} failed: {ex}"
-                )
+                logger.warning(f"Maintaining metadata store {store.key} failed: {ex}")
 
     def stale_stores(self) -> List[str]:
         return sorted(self._stale | set(self._skipped))
