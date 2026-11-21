@@ -12,23 +12,23 @@ We welcome contributions from the developer community! Follow this guide to set 
 
 ## Setting Up Your GitHub Repository Fork
 
-To contribute code to TGDCFS, you should create a personal fork of the main repository.
+To contribute code to VulquantaFS, you should create a personal fork of the main repository.
 
 ### 1. Fork the Repository
-1. Navigate to the main repository at [https://github.com/Xyvran/tgdcfs](https://github.com/Xyvran/tgdcfs).
-2. Click the **Fork** button in the top-right corner to create a copy under your GitHub user account (e.g., `github.com/your-username/tgdcfs`).
+1. Navigate to the main repository at [https://github.com/Xyvran/vulquantafs](https://github.com/Xyvran/vulquantafs).
+2. Click the **Fork** button in the top-right corner to create a copy under your GitHub user account (e.g., `github.com/your-username/vulquantafs`).
 
 ### 2. Clone Your Fork Locally
 Clone your fork to your workstation:
 ```bash
-git clone https://github.com/your-username/tgdcfs.git
-cd tgdcfs
+git clone https://github.com/your-username/vulquantafs.git
+cd vulquantafs
 ```
 
 ### 3. Add the Upstream Remote
 Configure the original repository as an `upstream` remote so you can sync changes from `master`:
 ```bash
-git remote add upstream https://github.com/Xyvran/tgdcfs.git
+git remote add upstream https://github.com/Xyvran/vulquantafs.git
 git remote -v
 ```
 
@@ -54,11 +54,11 @@ When running GitHub Actions workflows on your own fork or upstream repository, c
 
 The Docker Hub **namespace** the workflows publish to is never hard-coded.
 It is resolved from the repository's own owner (`github.repository_owner`),
-so a fork publishes to `<fork-owner>/tgdcfs` and `<fork-owner>/tgdcfs-fe`,
+so a fork publishes to `<fork-owner>/vulquantafs` and `<fork-owner>/vulquantafs-fe`,
 never to the upstream namespace. If the Docker Hub namespace differs from
 the GitHub username, set the repository variable `DOCKERHUB_NAMESPACE`
 instead of editing the workflows. The images are also published to GHCR
-(`ghcr.io/<fork-owner>/<fork-repo>/tgdcfs` and `ghcr.io/<fork-owner>/<fork-repo>/tgdcfs-fe`) with
+(`ghcr.io/<fork-owner>/<fork-repo>/vulquantafs` and `ghcr.io/<fork-owner>/<fork-repo>/vulquantafs-fe`) with
 the workflow's own `GITHUB_TOKEN`, which needs no secrets at all — a fork
 without the Docker Hub secrets still ships its images there.
 
@@ -72,7 +72,7 @@ for the full fork-setup guide.
 
 ### How GitHub Actions Behaves on Forks Without Secrets:
 - **No Secret Errors**: Workflows are designed to detect missing registry secrets gracefully.
-- **`docker-preview.yml`**: In a fork or PR without `DOCKERHUB_TOKEN`, the workflow still checks out code, builds both Docker images (`tgdcfs` and `tgdcfs-fe`), runs the automated SFTP and Nginx smoke tests, and verifies data directory pinning (`TGDCFS_DATA_DIR`). It skips the Docker Hub `docker login` and push, but still pushes the preview images to GHCR.
+- **`docker-preview.yml`**: In a fork or PR without `DOCKERHUB_TOKEN`, the workflow still checks out code, builds both Docker images (`vulquantafs` and `vulquantafs-fe`), runs the automated SFTP and Nginx smoke tests, and verifies data directory pinning (`VULQUANTAFS_DATA_DIR`). It skips the Docker Hub `docker login` and push, but still pushes the preview images to GHCR.
 - **`test.yml`**: Runs full `pytest` suite, `mypy` typechecks, and `ruff` linting. Codecov upload step is skipped or non-blocking if `CODECOV_TOKEN` is absent.
 
 ---
@@ -122,13 +122,13 @@ git push origin feature/your-feature-name
 ```
 
 ### Step 6: Open a Pull Request
-Go to the [Xyvran/tgdcfs GitHub Repository](https://github.com/Xyvran/tgdcfs) and open a Pull Request targeting `master`.
+Go to the [Xyvran/vulquantafs GitHub Repository](https://github.com/Xyvran/vulquantafs) and open a Pull Request targeting `master`.
 
 ---
 
 ## Deep Dive: GitHub Actions CI/CD Workflows
 
-TGDCFS uses 6 GitHub Actions workflows in `.github/workflows/`: the five described below plus `badge-sync.yml` ("Sync README badges", see [Fork Setup](./fork-setup.md)).
+VulquantaFS uses 6 GitHub Actions workflows in `.github/workflows/`: the five described below plus `badge-sync.yml` ("Sync README badges", see [Fork Setup](./fork-setup.md)).
 
 ### 1. Test and Coverage (`.github/workflows/test.yml`)
 - **Triggers**: On every `push` (all branches) and `pull_request` targeting `master`.
@@ -142,18 +142,18 @@ TGDCFS uses 6 GitHub Actions workflows in `.github/workflows/`: the five describ
 
 ### 2. Docker Preview Builds (`.github/workflows/docker-preview.yml`)
 - **Triggers**: On `push` to any branch except `master`.
-- **Matrix**: Builds both `tgdcfs` (backend) and `tgdcfs-fe` (frontend).
+- **Matrix**: Builds both `vulquantafs` (backend) and `vulquantafs-fe` (frontend).
 - **Steps**:
   1. Tags preview image with commit hash: `preview-<commit_hash>` and `preview`.
   2. Uses Docker Buildx with GitHub Actions cache.
   3. **Local Container Verification**: Runs container smoke tests:
-     - For backend: Runs `python scripts/docker_smoke_check.py` and verifies `TGDCFS_DATA_DIR` path pinning with default and unprivileged UIDs (`--user 12345`).
-     - For frontend: Starts Nginx container and curls `http://127.0.0.1:8080/tgdcfs/`.
+     - For backend: Runs `python scripts/docker_smoke_check.py` and verifies `VULQUANTAFS_DATA_DIR` path pinning with default and unprivileged UIDs (`--user 12345`).
+     - For frontend: Starts Nginx container and curls `http://127.0.0.1:8080/vulquantafs/`.
   4. **Conditional Registry Push**: If `DOCKERHUB_TOKEN` secret is present, publishes preview tags to Docker Hub.
 
 ### 3. Docker Publish on Master (`.github/workflows/docker-publish.yml`)
 - **Triggers**: Automatically runs via `workflow_run` when `Test and Coverage` workflow successfully completes on branch `master`.
-- **Builds & Pushes**: Multi-architecture (`linux/amd64`, `linux/arm64`) images tagged `:latest` and `:<commit_hash>` for both `<namespace>/tgdcfs` and `<namespace>/tgdcfs-fe`, where `<namespace>` is the repository's own publishing namespace (see above).
+- **Builds & Pushes**: Multi-architecture (`linux/amd64`, `linux/arm64`) images tagged `:latest` and `:<commit_hash>` for both `<namespace>/vulquantafs` and `<namespace>/vulquantafs-fe`, where `<namespace>` is the repository's own publishing namespace (see above).
 
 ### 4. Release Automation (`.github/workflows/release.yml`)
 - **Triggers**: On push of git tag `vX.Y.Z` or when a commit on `master` bumps the `version` in `pyproject.toml`.
@@ -165,13 +165,13 @@ TGDCFS uses 6 GitHub Actions workflows in `.github/workflows/`: the five describ
 
 ### 5. GitHub Pages Deployment (`.github/workflows/gh-pages.yml`)
 - **Triggers**: On push to `master`.
-- **Steps**: Builds the Next.js web application (`tgdcfs-gh-pages/`) and the Docusaurus documentation website (`docusaurus/`), assembles both into a single Pages artifact — the web app at `/tgdcfs/` and the docs at `/tgdcfs/docs/` — and deploys it to GitHub Pages.
+- **Steps**: Builds the Next.js web application (`vulquantafs-gh-pages/`) and the Docusaurus documentation website (`docusaurus/`), assembles both into a single Pages artifact — the web app at `/vulquantafs/` and the docs at `/vulquantafs/docs/` — and deploys it to GitHub Pages.
 
 ---
 
 ## Release Process (For Maintainers)
 
-TGDCFS strictly follows [Semantic Versioning (SemVer)](https://semver.org/).
+VulquantaFS strictly follows [Semantic Versioning (SemVer)](https://semver.org/).
 
 When cutting a new release on `master`:
 
@@ -183,4 +183,4 @@ When cutting a new release on `master`:
    git tag vX.Y.Z
    git push origin vX.Y.Z
    ```
-5. GitHub Actions `release.yml` will automatically publish the release notes and build multi-arch Docker tags (`<namespace>/tgdcfs:X.Y.Z` and `<namespace>/tgdcfs:X.Y`).
+5. GitHub Actions `release.yml` will automatically publish the release notes and build multi-arch Docker tags (`<namespace>/vulquantafs:X.Y.Z` and `<namespace>/vulquantafs:X.Y`).

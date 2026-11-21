@@ -1,0 +1,178 @@
+import asyncio
+from abc import ABCMeta, abstractmethod
+from dataclasses import dataclass
+from itertools import cycle
+from typing import Any, Awaitable, Optional, Sequence
+
+from vulquantafs.config import get_config
+from vulquantafs.errors import RpcTimeoutError
+from vulquantafs.reqres import (
+    DeleteMessagesReq,
+    DownloadFileReq,
+    DownloadFileResp,
+    EditMessageMediaReq,
+    EditMessageTextReq,
+    ForwardMessagesReq,
+    GetMeResp,
+    GetMessagesReq,
+    GetMessagesResp,
+    GetMessagesRespNoNone,
+    GetPinnedMessageReq,
+    Message,
+    PinMessageReq,
+    SaveBigFilePartReq,
+    SaveFilePartReq,
+    SaveFilePartResp,
+    SearchMessageReq,
+    SendFileReq,
+    SendMessageResp,
+    SendTextReq,
+)
+
+
+def bounded_part(what: str, action: Awaitable):
+    """Bound one part upload by ``transfer.upload_part_timeout_s``.
+
+    The part uploads pace the SFTP write acknowledgements: a frozen part
+    freezes them, and an SFTP client that waits out its inactivity
+    timeout (FileZilla: 20 s) drops the session and looks at a stalled
+    transfer. This bound sits below that timeout, so a silent store's
+    failure reaches the failover while the client is still willing to
+    retry. ``0`` leaves the part to the wide ``rpc_timeout_s`` bound of
+    ``_bounded``.
+    """
+    timeout = get_config().vulquantafs.transfer.upload_part_timeout_s
+    if timeout <= 0:
+        return action
+
+    async def run() -> Any:
+        try:
+            return await asyncio.wait_for(action, float(timeout))
+        except asyncio.TimeoutError as ex:
+            raise RpcTimeoutError(
+                f"Telegram did not answer {what} within {timeout}s"
+            ) from ex
+
+    return run()
+
+
+class ITDLibClient(metaclass=ABCMeta):
+    def __init__(self):
+        self._me: Optional[GetMeResp] = None
+
+    async def _bounded(self, what: str, action: Awaitable):
+        """Turn the endless silence of a down service into an error.
+
+        The library behind this client re-connects to Telegram forever on
+        its own, so a call into a network that simply drops the packets
+        never returns: the write failover of a mirror group -- which
+        trips its breaker only on exceptions -- would then wait out the
+        whole outage without ever failing over. A call that stays silent
+        for the configured ``rpc_timeout_s`` becomes a
+        :class:`RpcTimeoutError`, which reads and saves treat like any
+        other store failure, and which the retry loops give up on
+        immediately: a silent store has nothing to negotiate.
+        ``0`` switches the bound off.
+        """
+        timeout = get_config().vulquantafs.transfer.rpc_timeout_s
+        if timeout <= 0:
+            return await action
+        try:
+            return await asyncio.wait_for(action, float(timeout))
+        except asyncio.TimeoutError as ex:
+            raise RpcTimeoutError(
+                f"Telegram did not answer {what} within {timeout}s"
+            ) from ex
+
+    @abstractmethod
+    async def get_messages(self, req: GetMessagesReq) -> GetMessagesResp:
+        pass
+
+    @abstractmethod
+    async def send_text(self, req: SendTextReq) -> SendMessageResp:
+        pass
+
+    @abstractmethod
+    async def edit_message_text(self, req: EditMessageTextReq) -> SendMessageResp:
+        pass
+
+    @abstractmethod
+    async def search_messages(self, req: SearchMessageReq) -> GetMessagesRespNoNone:
+        pass
+
+    @abstractmethod
+    async def get_pinned_messages(
+        self, req: GetPinnedMessageReq
+    ) -> GetMessagesRespNoNone:
+        pass
+
+    @abstractmethod
+    async def pin_message(self, req: PinMessageReq) -> None:
+        pass
+
+    @abstractmethod
+    async def save_big_file_part(self, req: SaveBigFilePartReq) -> SaveFilePartResp:
+        pass
+
+    @abstractmethod
+    async def save_file_part(self, req: SaveFilePartReq) -> SaveFilePartResp:
+        pass
+
+    @abstractmethod
+    async def send_big_file(self, req: SendFileReq) -> SendMessageResp:
+        pass
+
+    @abstractmethod
+    async def send_small_file(self, req: SendFileReq) -> SendMessageResp:
+        pass
+
+    @abstractmethod
+    async def edit_message_media(self, req: EditMessageMediaReq) -> Message:
+        pass
+
+    @abstractmethod
+    async def forward_messages(self, req: ForwardMessagesReq) -> list[SendMessageResp]:
+        """Server-side copy of messages into another chat.
+
+        Returns the new message ids in ``to_chat``, in the same order as
+        ``req.message_ids``. No file content is re-uploaded.
+        """
+        pass
+
+    @abstractmethod
+    async def download_file(self, req: DownloadFileReq) -> DownloadFileResp:
+        pass
+
+    @abstractmethod
+    async def delete_messages(self, req: DeleteMessagesReq) -> None:
+        pass
+
+    @abstractmethod
+    async def resolve_channel_id(self, channel_id: str) -> int:
+        pass
+
+    @abstractmethod
+    async def _get_me(self) -> GetMeResp:
+        pass
+
+    async def get_me(self) -> GetMeResp:
+        if self._me is None:
+            self._me = await self._get_me()
+        return self._me
+
+
+@dataclass
+class TDLibApi:
+    bots: Sequence[ITDLibClient]
+    account: Optional[ITDLibClient] = None
+
+    def __post_init__(self):
+        self.__bots_cycle = cycle(self.bots)
+
+    @property
+    def bot(self) -> ITDLibClient:
+        return self.bots[0]
+
+    @property
+    def next_bot(self) -> ITDLibClient:
+        return next(self.__bots_cycle)

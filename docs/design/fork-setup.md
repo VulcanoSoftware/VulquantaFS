@@ -13,20 +13,20 @@ GitHub's own context:
 * `github.repository_owner` is the GitHub username or organization that
   owns the repository in which the workflow is running. In a fork that is
   the fork's owner, never the upstream's.
-* `github.repository` is `<owner>/<repo>`, e.g. `VulcanoSoftware/tgdcfs`.
+* `github.repository` is `<owner>/<repo>`, e.g. `VulcanoSoftware/vulquantafs`.
 
 Workflows use these like this:
 
 | Workflow | What is derived |
 |---|---|
-| `docker-publish.yml` | Docker Hub namespace for the `tgdcfs` and `tgdcfs-fe` images |
+| `docker-publish.yml` | Docker Hub namespace for the `vulquantafs` and `vulquantafs-fe` images |
 | `docker-preview.yml` | Same namespace, for `preview-<commit>` and `preview` tags |
 | `release.yml` | Same namespace, for `X.Y.Z` and `X.Y` release tags |
 | `test.yml` | Codecov `slug` for the coverage upload |
 | `badge-sync.yml` | The owner, repository and default branch in the README badges, and the GitHub Pages links in the README |
 
 A fork that runs these workflows therefore publishes to
-`<fork-owner>/tgdcfs` and `<fork-owner>/tgdcfs-fe`, not to the upstream
+`<fork-owner>/vulquantafs` and `<fork-owner>/vulquantafs-fe`, not to the upstream
 namespace.
 
 ### README badges and site links
@@ -44,7 +44,7 @@ workflow solves this:
 3. The same script rewrites the GitHub Pages URLs of the deployed web
    frontend — the site itself, the config generator and the
    getting-started guide — from the upstream Pages site to the fork's
-   own (`https://<fork-owner>.github.io/tgdcfs/`).
+   own (`https://<fork-owner>.github.io/vulquantafs/`).
 4. When the result differs from what is committed, the workflow commits it
    with `[skip ci]`, so it cannot run against its own commits.
 
@@ -58,7 +58,7 @@ fork automatically.
 
 Docker Hub does not know about GitHub forks. A fork that wants its images
 published under its own Docker Hub account needs credentials that GitHub
-Actions can use, and the repositories `tgdcfs` and `tgdcfs-fe` must exist
+Actions can use, and the repositories `vulquantafs` and `vulquantafs-fe` must exist
 on that Docker Hub account.
 
 ### 1. Create the Docker Hub repositories
@@ -66,8 +66,8 @@ on that Docker Hub account.
 Log into [hub.docker.com](https://hub.docker.com/) and create the public
 repositories:
 
-* `<dockerhub-username>/tgdcfs`
-* `<dockerhub-username>/tgdcfs-fe`
+* `<dockerhub-username>/vulquantafs`
+* `<dockerhub-username>/vulquantafs-fe`
 
 They must be named exactly like that; the workflows derive the image name
 from the repository name in `pyproject.toml` / the matrix.
@@ -76,7 +76,7 @@ from the repository name in `pyproject.toml` / the matrix.
 
 On the same Docker Hub account, open **Account Settings → Personal access
 tokens → Generate new token**. Give it `Read & Write` permissions, name it
-e.g. `github-actions-tgdcfs`, and copy the value once — Docker Hub shows it
+e.g. `github-actions-vulquantafs`, and copy the value once — Docker Hub shows it
 only once.
 
 ### 3. Add the secrets to the fork
@@ -124,9 +124,9 @@ it, coverage uploads are skipped on branches where they are not required
 * **GitHub Pages itself** must be enabled once per fork: under
   *Settings → Pages*, set the source to *GitHub Actions*. After that the
   "Deploy site to GitHub Pages" workflow (`gh-pages.yml`) publishes the
-  Next.js web frontend at `https://<fork-owner>.github.io/tgdcfs/` and,
+  Next.js web frontend at `https://<fork-owner>.github.io/vulquantafs/` and,
   under `docs/` in the same artifact, the Docusaurus documentation at
-  `https://<fork-owner>.github.io/tgdcfs/docs/`. Both read the fork's own
+  `https://<fork-owner>.github.io/vulquantafs/docs/`. Both read the fork's own
   coordinates from `github.repository`, so nothing in
   `docusaurus/docusaurus.config.ts` has to be edited.
 

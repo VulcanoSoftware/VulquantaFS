@@ -196,7 +196,7 @@ jobs:
       DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
     strategy:
       matrix:
-        image: [tgdcfs, tgdcfs-fe]
+        image: [vulquantafs, vulquantafs-fe]
     steps:
       - name: Checkout code
         uses: actions/checkout@v5

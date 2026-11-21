@@ -34,9 +34,9 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - name: tgdcfs
+          - name: vulquantafs
             dockerfile: Dockerfile
-          - name: tgdcfs-fe
+          - name: vulquantafs-fe
             dockerfile: Dockerfile.frontend
     steps:
       - name: Checkout code
@@ -122,7 +122,7 @@ jobs:
           cache-to: type=gha,mode=max,ignore-error=true
 
       - name: Smoke test the SFTP server
-        if: matrix.name == 'tgdcfs'
+        if: matrix.name == 'vulquantafs'
         run: |
           docker run --rm \
             -v "$PWD/scripts:/app/scripts:ro" \
@@ -136,13 +136,13 @@ jobs:
       # point of pinning the path is that it holds whoever the container runs
       # as, instead of being derived from HOME or a passwd lookup.
       - name: Check the image pins its data directory
-        if: matrix.name == 'tgdcfs'
+        if: matrix.name == 'vulquantafs'
         env:
-          EXPECTED: /home/tgdcfs/.tgdcfs
+          EXPECTED: /home/vulquantafs/.vulquantafs
         run: |
           probe() {
             docker run --rm "$@" "${{ steps.prep.outputs.image }}" \
-              python -c "from tgdcfs.config import DATA_DIR; print(DATA_DIR)"
+              python -c "from vulquantafs.config import DATA_DIR; print(DATA_DIR)"
           }
           for args in "" "--user 12345"; do
             # shellcheck disable=SC2086
@@ -155,19 +155,19 @@ jobs:
           done
 
       - name: Smoke test the frontend
-        if: matrix.name == 'tgdcfs-fe'
+        if: matrix.name == 'vulquantafs-fe'
         run: |
-          docker run -d --name tgdcfs-fe-smoke -p 8080:80 \
+          docker run -d --name vulquantafs-fe-smoke -p 8080:80 \
             "${{ steps.prep.outputs.image }}"
           for _ in $(seq 1 30); do
-            code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8080/tgdcfs/ || true)
+            code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8080/vulquantafs/ || true)
             [ "$code" = "200" ] && break
             sleep 1
           done
-          docker logs tgdcfs-fe-smoke
-          docker rm -f tgdcfs-fe-smoke
+          docker logs vulquantafs-fe-smoke
+          docker rm -f vulquantafs-fe-smoke
           if [ "$code" != "200" ]; then
-            echo "::error::the frontend did not serve /tgdcfs/ (last status: ${code:-none})"
+            echo "::error::the frontend did not serve /vulquantafs/ (last status: ${code:-none})"
             exit 1
           fi
 

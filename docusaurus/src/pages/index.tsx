@@ -48,7 +48,7 @@ function AudienceCards() {
               <div>
                 <Heading as="h3">👤 For General Users</Heading>
                 <p>
-                  Understand how TGDCFS works in everyday plain English. Learn how to connect your favorite WebDAV and SFTP apps like WinSCP, Cyberduck, rclone, or mobile clients to stream media and organize files.
+                  Understand how VulquantaFS works in everyday plain English. Learn how to connect your favorite WebDAV and SFTP apps like WinSCP, Cyberduck, rclone, or mobile clients to stream media and organize files.
                 </p>
               </div>
               <div style={{marginTop: '1rem'}}>
@@ -64,7 +64,7 @@ function AudienceCards() {
               <div>
                 <Heading as="h3">🛠️ For Technical Users</Heading>
                 <p>
-                  Learn how to deploy TGDCFS using Docker, Docker Compose, or systemd. Master `config.yaml`, client-side AES-256-GCM encryption, RAID-1 store mirroring, local caching, and failover runbooks.
+                  Learn how to deploy VulquantaFS using Docker, Docker Compose, or systemd. Master `config.yaml`, client-side AES-256-GCM encryption, RAID-1 store mirroring, local caching, and failover runbooks.
                 </p>
               </div>
               <div style={{marginTop: '1rem'}}>
@@ -101,7 +101,7 @@ export default function Home(): ReactNode {
   return (
     <Layout
       title={`${siteConfig.title} - Documentation`}
-      description="Clear, accessible documentation for TGDCFS (Telegram & Discord as storage backends)">
+      description="Clear, accessible documentation for VulquantaFS (Telegram & Discord as storage backends)">
       <HomepageHeader />
       <main>
         <AudienceCards />

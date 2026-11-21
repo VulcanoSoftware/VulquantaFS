@@ -1,7 +1,7 @@
 name: Deploy site to GitHub Pages
 
-# One Pages site per repository: the Next.js web frontend at /tgdcfs/ and
-# the Docusaurus documentation at /tgdcfs/docs/, assembled into a single
+# One Pages site per repository: the Next.js web frontend at /vulquantafs/ and
+# the Docusaurus documentation at /vulquantafs/docs/, assembled into a single
 # artifact below.
 
 on:
@@ -31,7 +31,7 @@ jobs:
           node-version: '24'
           cache: 'npm'
           cache-dependency-path: |
-            ./tgdcfs-gh-pages/package-lock.json
+            ./vulquantafs-gh-pages/package-lock.json
             ./docusaurus/package-lock.json
 
       - name: Setup Pages
@@ -43,18 +43,18 @@ jobs:
         uses: actions/cache@v5
         with:
           path: |
-            ./tgdcfs-gh-pages/.next/cache
-          key: ${{ runner.os }}-nextjs-${{ hashFiles('./tgdcfs-gh-pages/package-lock.json') }}-${{ hashFiles('./tgdcfs-gh-pages/**/*.js', './tgdcfs-gh-pages/**/*.jsx', './tgdcfs-gh-pages/**/*.ts', './tgdcfs-gh-pages/**/*.tsx') }}
+            ./vulquantafs-gh-pages/.next/cache
+          key: ${{ runner.os }}-nextjs-${{ hashFiles('./vulquantafs-gh-pages/package-lock.json') }}-${{ hashFiles('./vulquantafs-gh-pages/**/*.js', './vulquantafs-gh-pages/**/*.jsx', './vulquantafs-gh-pages/**/*.ts', './vulquantafs-gh-pages/**/*.tsx') }}
           restore-keys: |
-            ${{ runner.os }}-nextjs-${{ hashFiles('./tgdcfs-gh-pages/package-lock.json') }}-
+            ${{ runner.os }}-nextjs-${{ hashFiles('./vulquantafs-gh-pages/package-lock.json') }}-
 
       - name: Install dependencies
         run: npm ci
-        working-directory: ./tgdcfs-gh-pages
+        working-directory: ./vulquantafs-gh-pages
 
       - name: Build with Next.js
         run: npm run build
-        working-directory: ./tgdcfs-gh-pages
+        working-directory: ./vulquantafs-gh-pages
         # next.config.ts derives the Docker images and the Pages URL shown in
         # the config generator and the guides from these.
         env:
@@ -75,7 +75,7 @@ jobs:
       - name: Assemble the Pages artifact
         run: |
           mkdir -p site
-          cp -r tgdcfs-gh-pages/out/. site/
+          cp -r vulquantafs-gh-pages/out/. site/
           cp -r docusaurus/build/. site/docs/
 
       - name: Upload artifact

@@ -10,8 +10,8 @@ from main import (
     run_server,
     start_replication_workers,
 )
-from tgdcfs.config import Config
-from tgdcfs.core.replication import ReplicationQueue
+from vulquantafs.config import Config
+from vulquantafs.core.replication import ReplicationQueue
 
 CONFIG: Dict[str, Any] = {
     "backends": {
@@ -29,7 +29,7 @@ CONFIG: Dict[str, Any] = {
         "media": {"primary": "tg-main", "mirrors": ["tg-spare"]},
         "notes": {"primary": "tg-spare", "allow_shared_store": True},
     },
-    "tgdcfs": {
+    "vulquantafs": {
         "users": {},
         "jwt": {"secret": "jwt_secret", "algorithm": "HS256", "life": 3600},
         "server": {"host": "0.0.0.0", "port": 8080},
@@ -61,7 +61,7 @@ class TestMain:
             filesystem, cfg, factory, encryption_cfg=None, replication=None, cache=None
         ):
             assert cfg is config
-            assert encryption_cfg is config.tgdcfs.encryption
+            assert encryption_cfg is config.vulquantafs.encryption
             created[filesystem.name] = await factory(cfg.stores[filesystem.primary])
             return mocker.Mock(name=filesystem.name)
 
@@ -196,10 +196,10 @@ class TestMain:
         mock_run_server = mocker.patch("main.run_server")
         mocker.patch("main.start_replication_workers", return_value=[])
         mock_config = mocker.Mock()
-        mock_config.tgdcfs.server.host = "0.0.0.0"
-        mock_config.tgdcfs.server.port = 9000
-        mock_config.tgdcfs.cache.enabled = False
-        mock_config.tgdcfs.listing.message_cache_size = 1024
+        mock_config.vulquantafs.server.host = "0.0.0.0"
+        mock_config.vulquantafs.server.port = 9000
+        mock_config.vulquantafs.cache.enabled = False
+        mock_config.vulquantafs.listing.message_cache_size = 1024
         mock_config.replication_queue_file = None
 
         mock_clients = mocker.Mock()
@@ -226,5 +226,7 @@ class TestMain:
         assert mock_create_clients.call_args.args[0] is mock_config
         mock_create_app.assert_called_once()
         assert mock_create_app.call_args.args[:2] == (mock_clients, mock_config)
-        mock_run_server.assert_called_once_with(mock_app, "0.0.0.0", 9000, "TGDCFS")
+        mock_run_server.assert_called_once_with(
+            mock_app, "0.0.0.0", 9000, "VulquantaFS"
+        )
         stats.close.assert_awaited_once()

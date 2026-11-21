@@ -1,5 +1,5 @@
-"""Integration tests for :mod:`tgdcfs.crypto.stream` and
-:mod:`tgdcfs.crypto.repository`.
+"""Integration tests for :mod:`vulquantafs.crypto.stream` and
+:mod:`vulquantafs.crypto.repository`.
 
 These tests deliberately do not touch Telegram. They drive the
 encryption/decryption pipeline with a fake :class:`IFileContentRepository`
@@ -19,11 +19,11 @@ from typing import List, Optional
 
 import pytest
 
-from tgdcfs.core.repository.interface import IFileContentRepository
-from tgdcfs.crypto.cipher import CHUNK_OVERHEAD
-from tgdcfs.crypto.header import HEADER_SIZE, InvalidHeaderError
-from tgdcfs.crypto.repository import EncryptingFileContentRepository
-from tgdcfs.reqres import (
+from vulquantafs.core.repository.interface import IFileContentRepository
+from vulquantafs.crypto.cipher import CHUNK_OVERHEAD
+from vulquantafs.crypto.header import HEADER_SIZE, InvalidHeaderError
+from vulquantafs.crypto.repository import EncryptingFileContentRepository
+from vulquantafs.reqres import (
     FileContent,
     FileMessageFromBuffer,
     SentFileMessage,
@@ -51,7 +51,7 @@ class _InMemoryRepo(IFileContentRepository):
 
     A "part" of the file is one message id. To make range tests interesting,
     we always store the file as a single part -- this matches small files
-    in tgdcfs (anything < 2 GB) and exercises the chunk-level range logic in
+    in vulquantafs (anything < 2 GB) and exercises the chunk-level range logic in
     the encrypting wrapper.
     """
 
@@ -373,7 +373,7 @@ async def test_overwrite_plaintext_produces_ciphertext() -> None:
 
 
 async def test_plaintext_with_accidental_tgfs_prefix_fails_loudly() -> None:
-    """A plaintext file that happens to start with ``TGDCFS`` and looks like a
+    """A plaintext file that happens to start with ``VulquantaFS`` and looks like a
     header parse target must NOT be silently treated as plaintext: the MAC
     will fail and we must surface the error so a real key mismatch is never
     masked.
@@ -390,7 +390,7 @@ async def test_plaintext_with_accidental_tgfs_prefix_fails_loudly() -> None:
         await _collect(await repo.get(fv, 0, -1, "ambiguous.bin"))
 
 
-async def test_plaintext_with_tgdcfs_prefix_short_fails_loudly() -> None:
+async def test_plaintext_with_vulquantafs_prefix_short_fails_loudly() -> None:
     """Magic match but truncated below HEADER_SIZE: surface as error."""
     repo = _make_repo(chunk_size=4096)
     fv = _seed_plaintext(repo, b"TGFS" + b"\x00" * 10)  # 14 bytes total
@@ -401,7 +401,7 @@ async def test_plaintext_with_tgdcfs_prefix_short_fails_loudly() -> None:
 async def test_encrypt_names_replaces_name_passed_to_inner_save() -> None:
     """When ``encrypt_names`` is on, the inner repo must never receive the
     plaintext document name -- only the obfuscated form."""
-    from tgdcfs.crypto.names import NAME_PREFIX, derive_name_key, decrypt_name
+    from vulquantafs.crypto.names import NAME_PREFIX, derive_name_key, decrypt_name
 
     repo = _make_repo(encrypt_names=True)
     inner: _InMemoryRepo = repo._inner  # type: ignore[assignment]
@@ -431,7 +431,7 @@ async def test_encrypt_names_replaces_name_passed_to_inner_save() -> None:
 async def test_encrypt_names_replaces_name_passed_to_inner_update() -> None:
     """``update`` is the path used by the metadata layer to refresh the
     pinned metadata.json -- its document name must also be obfuscated."""
-    from tgdcfs.crypto.names import NAME_PREFIX
+    from vulquantafs.crypto.names import NAME_PREFIX
 
     repo = _make_repo(encrypt_names=True)
     inner: _InMemoryRepo = repo._inner  # type: ignore[assignment]
@@ -482,7 +482,7 @@ async def test_encrypt_names_consistent_across_multipart_split() -> None:
     We simulate the real ``StoreFileContentRepository.save`` loop, which
     captures the base name once and then prefixes ``[partN]`` per part.
     """
-    from tgdcfs.crypto.names import NAME_PREFIX, decrypt_name, derive_name_key
+    from vulquantafs.crypto.names import NAME_PREFIX, decrypt_name, derive_name_key
 
     repo = _make_repo(encrypt_names=True)
     inner: _InMemoryRepo = repo._inner  # type: ignore[assignment]
@@ -491,7 +491,7 @@ async def test_encrypt_names_consistent_across_multipart_split() -> None:
 
     async def multipart_save(file_msg):
         # Mirror the partition + rename loop in
-        # ``tgdcfs.core.repository.impl.file_content.StoreFileContentRepository``.
+        # ``vulquantafs.core.repository.impl.file_content.StoreFileContentRepository``.
         base = file_msg.name or "unnamed"
         total = file_msg.get_size()
         # Three artificial parts; the size split is irrelevant for the
