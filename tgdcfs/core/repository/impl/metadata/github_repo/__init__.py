@@ -710,7 +710,7 @@ class GithubRepoMetadataRepository(IMetaDataRepository):
                 return metadata
         # Off the loop too: with a large repo the walk is a request per
         # directory. The structure is built fresh, so nothing is shared.
-        root_dir = await asyncio.to_thread(self._build_directory_structure)
+        root_dir = await asyncio.to_thread(self._load_directory_at, head)
         metadata = TGFSMetadata(dir=root_dir)
         # The replicated layer compares stores by this date: the branch head
         # is when this copy was written last. A store that proves dead later
@@ -776,21 +776,24 @@ class GithubRepoMetadataRepository(IMetaDataRepository):
             return None
         return _HeadCommit(sha, date.timestamp())
 
-    def _build_directory_structure(self) -> GithubDirectory:
+    def _load_directory_at(self, head: Optional[_HeadCommit]) -> GithubDirectory:
+        return self._build_directory_structure()
+
+    def _build_directory_structure(self, ref: Optional[str] = None) -> GithubDirectory:
         root = GithubDirectory(
             self._ghc, name="root", parent=None, children=[], files=[]
         )
         self._restore_root_timestamps(root)
 
         try:
-            entries = self._read_tree()
+            entries = self._read_tree(ref) if ref is not None else self._read_tree()
             if entries is not None:
                 self._build_from_tree(entries, root)
             else:
                 contents = self._ghc.repo.get_contents("", ref=self._ghc.commit)
                 self._process_contents(contents, root)
         except GithubException as ex:
-            if ex.status in (404, 409):
+            if ref is None and ex.status in (404, 409):
                 # An empty repository, or the branch does not exist yet:
                 # there is no tree, which is how every installation starts.
                 logger.warning(
@@ -813,7 +816,7 @@ class GithubRepoMetadataRepository(IMetaDataRepository):
 
         return root
 
-    def _read_tree(self) -> Optional[Sequence[_TreeEntry]]:
+    def _read_tree(self, ref: Optional[str] = None) -> Optional[Sequence[_TreeEntry]]:
         """The whole repo tree in one request, or ``None`` if it is unusable.
 
         ``get_contents`` lists exactly one directory, so walking the tree with
@@ -828,7 +831,7 @@ class GithubRepoMetadataRepository(IMetaDataRepository):
         then read one directory at a time instead.
         """
         try:
-            tree = self._ghc.repo.get_git_tree(self._ghc.commit, recursive=True)
+            tree = self._ghc.repo.get_git_tree(ref or self._ghc.commit, recursive=True)
             if not tree.truncated:
                 return [_TreeEntry(e.path, e.type, e.sha) for e in tree.tree]
             logger.warning(

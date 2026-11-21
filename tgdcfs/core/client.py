@@ -247,6 +247,7 @@ class Client:
             # queue is only told about a file some store still lacks a
             # copy of; in background mode every write is queued.
             written_gaps_only=inline or tee,
+            cleanup_local_versions=cache is not None,
             stat_api=FileStatApi(
                 fd_api,
                 validate=config.tgdcfs.listing.validate_on_list,

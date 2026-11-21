@@ -651,7 +651,7 @@ class TestProbedLoad:
         assert mirror.get_calls == 0
         assert layer.stale_stores() == ["mirror", "primary"]
 
-    async def test_a_failing_winning_read_falls_back_to_the_full_load(self):
+    async def test_a_failing_winning_read_is_not_repeated(self):
         class ProbeDateableButBrokenRead(FakeMetadataRepo):
             """A store whose probe answers while its read is broken."""
 
@@ -674,10 +674,21 @@ class TestProbedLoad:
         assert layer.metadata is not None
         assert layer.metadata.dir.find_dir("primary") is not None
         assert primary.get_calls == 1
-        assert mirror.get_calls == 2
-        # The full read decided again, from every store: the failed one is
-        # stale like it always was, the primary keeps serving.
+        assert mirror.get_calls == 1
         assert layer.stale_stores() == ["mirror"]
+
+    async def test_a_newer_document_does_not_trigger_an_older_git_tree_load(self):
+        primary = FakeMetadataRepo("primary", tree("old"), revision_hint=10)
+        newer = tree("new")
+        newer.revision = 1000
+        mirror = FakeMetadataRepo("mirror", newer)
+        layer = replicated(primary, mirror)
+
+        await layer.init()
+
+        assert layer.metadata is newer
+        assert primary.get_calls == 0
+        assert mirror.get_calls == 1
 
 
 class TestHeal:

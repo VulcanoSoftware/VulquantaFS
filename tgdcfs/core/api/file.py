@@ -52,12 +52,14 @@ class FileApi:
         on_written: Optional[Callable[[TGFSFileRef], Awaitable[None]]] = None,
         written_gaps_only: bool = False,
         stat_api: Optional[FileStatApi] = None,
+        cleanup_local_versions: bool = True,
     ):
         self._metadata_api = metadata_api
         self._file_desc_api = file_desc_api
         self._message_api = message_api
         self._mirror_group = mirror_group
         self._inline_mirroring = inline_mirroring
+        self._cleanup_local_versions = cleanup_local_versions
         # Called after a file's content changed and the metadata is
         # pushed; the replication queue hooks in here for
         # ``sync: background``.
@@ -109,7 +111,9 @@ class FileApi:
         ids: List[int] = []
         mirror_ids: MirrorMessageIds = {}
         try:
-            fd = await self._file_desc_api.get_file_desc(fr)
+            # The recorded ids are enough for best-effort deletion; don't
+            # ask Telegram/Discord whether every content part still exists.
+            fd = await self._file_desc_api.get_file_desc(fr, validate=False)
         except Exception as ex:
             logger.warning(
                 f"Could not load file descriptor for {fr.name} "
@@ -170,7 +174,7 @@ class FileApi:
         self, fr: TGFSFileRef, version_id: str
     ) -> Tuple[List[int], MirrorMessageIds]:
         try:
-            fd = await self._file_desc_api.get_file_desc(fr)
+            fd = await self._file_desc_api.get_file_desc(fr, validate=False)
             version = fd.get_version(version_id)
         except Exception as ex:
             logger.warning(f"Could not load version {version_id} of {fr.name}: {ex}")
@@ -220,6 +224,14 @@ class FileApi:
         contribute nothing: their messages are shared and must stay.
         ``version_ids`` collects the ids of the versions that go with them.
         """
+        if not (
+            self._message_api.deletes_on_remove
+            or (self._mirror_group and self._mirror_group.deletes_on_remove)
+            or (version_ids is not None and self._cleanup_local_versions)
+        ):
+            # A metadata-only delete needs neither a scan for shared
+            # descriptors nor any descriptor reads from the backends.
+            return [], {}
         shared = self._descriptors_referenced_elsewhere(frs)
         ids: List[int] = []
         mirror_ids: MirrorMessageIds = {}
@@ -446,7 +458,7 @@ class FileApi:
         if not version_id:
             version_ids: List[str] = []
             message_ids, mirror_ids = await self.collect_deletable_message_ids(
-                [fr], version_ids
+                [fr], version_ids if self._cleanup_local_versions else None
             )
             await fr.delete_async()
             await self._metadata_api.push()

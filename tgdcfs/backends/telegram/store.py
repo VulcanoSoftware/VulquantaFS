@@ -651,6 +651,10 @@ class TelegramStore(MessageBroker, IStore):
             f"{MAX_SEND_ATTEMPTS} attempts: {last}"
         ) from last
 
+    @property
+    def deletes_on_remove(self) -> bool:
+        return get_config().telegram.delete_messages_on_remove
+
     async def delete_messages(
         self, message_ids: Iterable[int], force: bool = False
     ) -> None:
@@ -667,7 +671,7 @@ class TelegramStore(MessageBroker, IStore):
         that should never linger regardless of the user's preference for
         keeping removed *file* messages.
         """
-        if not force and not get_config().telegram.delete_messages_on_remove:
+        if not force and not self.deletes_on_remove:
             return
         message_ids = list(message_ids)
         # A text message that overflowed takes its document along.
