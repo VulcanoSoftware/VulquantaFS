@@ -692,6 +692,10 @@ class MirrorGroup:
 
     # -- deletion ----------------------------------------------------------
 
+    @property
+    def deletes_on_remove(self) -> bool:
+        return any(channel.store.deletes_on_remove for channel in self._stores)
+
     async def delete(
         self, per_store: Dict[str, List[int]], force: bool = False
     ) -> None:
