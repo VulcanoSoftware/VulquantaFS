@@ -555,7 +555,7 @@ class TGFSSFTPServer(asyncssh.SFTPServer):
         resolved = resolve(path)
         if resolved.is_root or resolved.is_client_root:
             raise asyncssh.SFTPPermissionDenied("Cannot remove a client root")
-        await self._ops(resolved).rm_file(resolved.relative)
+        await self._ops(resolved).rm_file(resolved.relative, defer_metadata=True)
 
     @translate_errors
     async def rename(self, oldpath: bytes, newpath: bytes) -> None:

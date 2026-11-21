@@ -70,15 +70,13 @@ def commit_tree_overlay(
     ] or [[]]
     commit = first_base
     for number, chunk in enumerate(chunks, start=1):
-        tree = repo.create_git_tree(
-            chunk, base_tree=first_base.tree if commit is first_base else commit.tree
-        )
+        tree = repo.create_git_tree(chunk, base_tree=commit.tree)
         chunk_message = (
             message if len(chunks) == 1 else f"{message} ({number}/{len(chunks)})"
         )
-        commit = repo.create_git_commit(
-            chunk_message, tree, [] if commit is first_base else [commit]
-        )
+        # Preserve the original head as an ancestor. An orphan first chunk
+        # makes the final ref update a non-fast-forward on GitHub.
+        commit = repo.create_git_commit(chunk_message, tree, [commit])
     ref.edit(commit.sha)
     return commit.sha
 

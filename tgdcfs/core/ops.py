@@ -193,14 +193,17 @@ class Ops:
 
         return dir_to_remove
 
-    async def rm_file(self, path: str) -> TGFSFileRef:
+    async def rm_file(self, path: str, defer_metadata: bool = False) -> TGFSFileRef:
         self._validate_path(path)
         dirname, basename = os.path.dirname(path), os.path.basename(path)
 
         d = self.cd(dirname)
         file_to_remove = d.find_file(basename)
 
-        await self._client.file_api.rm(file_to_remove)
+        if defer_metadata:
+            await self._client.file_api.rm(file_to_remove, defer_metadata=True)
+        else:
+            await self._client.file_api.rm(file_to_remove)
 
         return file_to_remove
 

@@ -552,6 +552,9 @@ class LocalCache:
     def entry(self, version_id: str) -> Optional[CacheEntry]:
         return self._entries.get(version_id)
 
+    def has_entries(self) -> bool:
+        return bool(self._entries)
+
     def complete(self, version_id: str) -> bool:
         entry = self._entries.get(version_id)
         return entry is not None and not entry.writing and entry.is_complete()

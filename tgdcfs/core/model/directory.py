@@ -334,6 +334,10 @@ class TGFSDirectory:
         return fr
 
     def delete_file_ref(self, fr: TGFSFileRef) -> None:
+        self.unlink_file_ref(fr)
+
+    def unlink_file_ref(self, fr: TGFSFileRef) -> None:
+        """Remove the reference from memory only (no backend operations)."""
         self.files.remove(fr)
         self._touch_modified()
 

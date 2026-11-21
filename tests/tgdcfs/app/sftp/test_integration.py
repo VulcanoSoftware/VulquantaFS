@@ -15,7 +15,10 @@ from tests.tgdcfs.app.sftp.mocked_stats import mocked_stats
 from tgdcfs.app.sftp.server import make_server_factory, make_sftp_factory
 from tgdcfs.config import SFTPConfig
 from tgdcfs.core import Client
-from tgdcfs.core.model import TGFSDirectory, TGFSFileDesc, TGFSFileVersion
+from tgdcfs.core.api import DirectoryApi, FileApi, MetaDataApi
+from tgdcfs.core.api.removal_journal import RemovalJournal
+from tgdcfs.core.model import TGFSDirectory, TGFSFileDesc, TGFSFileVersion, TGFSMetadata
+from tgdcfs.core.repository.interface import IMetaDataRepository
 from tgdcfs.reqres import UploadableFileMessage
 
 CONTENT = bytes(range(256)) * 400  # 100 KiB
@@ -89,7 +92,7 @@ def build_client(mocker, name: str, channel: FakeChannel) -> Client:
             channel.contents[file_msg.name] = payload
         return desc(directory.find_file(file_msg.name))
 
-    async def rm(fr):
+    async def rm(fr, defer_metadata=False):
         fr.delete()
         channel.contents.pop(fr.name, None)
 
@@ -152,6 +155,77 @@ async def server(mocker, channel, users):
     finally:
         acceptor.close()
         await acceptor.wait_closed()
+
+
+async def test_sequential_remove_does_not_wait_for_remote_mirror(
+    mocker, users, tmp_path
+):
+    root = TGFSDirectory.root_dir()
+    folder = root.create_dir("batch")
+    for i in range(2640):
+        folder.create_file_ref(f"file-{i}", i + 1)
+
+    mirror_started = asyncio.Event()
+    mirror_available = asyncio.Event()
+
+    class Repo(IMetaDataRepository):
+        pushes = 0
+
+        async def get(self):
+            return TGFSMetadata(root)
+
+        async def push(self):
+            self.pushes += 1
+            mirror_started.set()
+            await mirror_available.wait()
+
+    repo = Repo()
+    journal = RemovalJournal(str(tmp_path / "removes.sqlite3"), None)
+    api = MetaDataApi(repo, push_mode="coalesced", removal_journal=journal)
+    await api.init()
+    store = mocker.Mock(deletes_on_remove=False)
+    descriptors = mocker.Mock(get_file_desc=mocker.AsyncMock())
+    client = mocker.Mock(spec=Client, name="notes")
+    client.file_api = FileApi(
+        api, descriptors, store, has_cached_versions=lambda: False
+    )
+    client.dir_api = DirectoryApi(api, client.file_api, store)
+    config = build_config(mocker, users)
+    mocker.patch(
+        "tgdcfs.app.sftp.server.authenticate",
+        side_effect=lambda username, password: _authenticate(users, username, password),
+    )
+    acceptor = await asyncssh.listen(
+        host="127.0.0.1",
+        port=0,
+        server_factory=make_server_factory(config),
+        server_host_keys=[asyncssh.generate_private_key("ssh-ed25519")],
+        sftp_factory=make_sftp_factory({"notes": client}, config),
+    )
+    try:
+        async with await connect(acceptor) as conn:
+            async with conn.start_sftp_client() as sftp:
+                await sftp.remove("/notes/batch/file-0")
+                flush = asyncio.create_task(api.flush_removals())
+                try:
+                    await asyncio.wait_for(mirror_started.wait(), timeout=2)
+                    async with asyncio.timeout(15):
+                        for i in range(1, 2640):
+                            await sftp.remove(f"/notes/batch/file-{i}")
+                    assert not folder.find_files()
+                    assert repo.pushes == 1
+                    assert len(journal.load()[1]) == 2640
+                finally:
+                    mirror_available.set()
+                    await flush
+        assert repo.pushes == 2
+        assert journal.load() == (0, set())
+        descriptors.get_file_desc.assert_not_called()
+    finally:
+        acceptor.close()
+        await acceptor.wait_closed()
+        mirror_available.set()
+        await api.close()
 
 
 def _authenticate(users, username, password):

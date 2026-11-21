@@ -838,8 +838,9 @@ class TestFileApi:
         ]
         mock_file_desc_api.get_file_desc.return_value = fd
 
-        await file_api.rm(fr)
+        await file_api.rm(fr, defer_metadata=True)
 
+        mock_metadata_api.defer_removal.assert_not_called()
         mock_file_desc_api.get_file_desc.assert_awaited_once_with(fr, validate=False)
         deleted_ids = mock_message_api.delete_messages.call_args[0][0]
         assert sorted(deleted_ids) == [123, 200, 201]
