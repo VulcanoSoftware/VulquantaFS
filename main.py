@@ -46,6 +46,7 @@ async def create_store_factory(config: Config) -> StoreFactory:
         tg = logins.create_task(login_telegram())
         dc = logins.create_task(login_discord())
     tdlib_api, discord_bots = tg.result(), dc.result()
+    logging.getLogger(__name__).info("Storage backend logins complete")
 
     async def create_store(store_cfg: StoreConfig) -> IStore:
         if store_cfg.backend == "telegram" and tdlib_api is not None:
@@ -75,6 +76,7 @@ async def create_clients(
 
     clients: Clients = {}
     for filesystem in config.filesystems.values():
+        logging.getLogger(__name__).info("Initializing filesystem %s", filesystem.name)
         clients[filesystem.name] = await Client.create(
             filesystem,
             config,

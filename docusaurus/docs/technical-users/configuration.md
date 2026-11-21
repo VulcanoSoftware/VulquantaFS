@@ -19,6 +19,7 @@ backends:
     api_hash: "0123456789abcdef0123456789abcdef"
     bot:
       session_file: bot.session
+      login_timeout_s: 20  # Telethon: time limit for each bot at startup
       tokens:
         - "123456789:ABCdefGHIjklMNOpqrsTUVwxyZ"
     delete_messages_on_remove: false
@@ -127,6 +128,7 @@ The `telegram` block can be left out for a Discord-only setup (no store may then
   - `api_id` *(int)*: Telegram API App ID from [my.telegram.org](https://my.telegram.org).
   - `api_hash` *(string)*: Telegram API App Hash.
   - `bot.tokens` *(list of strings)*: Telegram Bot tokens from [@BotFather](https://t.me/BotFather). Providing multiple tokens distributes download/upload operations across tokens.
+  - `bot.login_timeout_s` *(number, default `20`)*: Telethon login deadline for each bot, including the first Telegram RPC. A bot that times out or cannot connect is logged and left out until restart; at least one bot must log in. This setting does not apply to Pyrogram or interactive user logins.
   - `bot.session_file` *(string)*: Telethon session file for the bot, relative to `TGDCFS_DATA_DIR` (default: `bot.session`).
   - `lib` *(pyrogram | telethon)*: MTProto client library used by the Telegram backend (default: `telethon`).
   - `account` *(optional object)*: A regular Telegram user account in addition to the bots, with `session_file` (relative to `TGDCFS_DATA_DIR`), `used_to_upload` and `used_to_download` flags. Parts above the bot limit (up to 4,194,304,000 bytes) are only uploaded when this account has `used_to_upload: true` and Telegram Premium.
