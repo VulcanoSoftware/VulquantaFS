@@ -9,9 +9,11 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import Iterable, NamedTuple, Optional, Sequence, Set, cast
 
-from github import Github, GithubException, GithubRetry, InputGitTreeElement
+from github import Github, GithubException, InputGitTreeElement
 from github.ContentFile import ContentFile
+from github.GitCommit import GitCommit
 from github.Repository import Repository
+from urllib3.util import Retry
 
 from tgdcfs.config import GithubRepoConfig, expand_path
 from tgdcfs.core.model import FileStat, TGFSDirectory, TGFSFileRef, TGFSMetadata
@@ -27,28 +29,46 @@ from tgdcfs.crypto.path_names import (
     encrypt_path_name,
     is_encrypted_path_name,
 )
-from tgdcfs.errors import MetadataNotInitialized, TechnicalError
+from tgdcfs.errors import MetadataNotInitialized, NoStoredMetadata, TechnicalError
 
 from .dir_timestamps import DirTimestampStore, cache_file_name
-from .gh_directory import GithubConfig, GithubDirectory
+from .gh_directory import (
+    DROP_COMMIT_ATTEMPTS,
+    DROP_FLUSH_BATCH,
+    DROP_FLUSH_INTERVAL,
+    TREE_OVERLAY_ACTION_LIMIT,
+    GithubConfig,
+    GithubDirectory,
+    commit_tree_overlay,
+)
 from .stats_file import STATS_COMMIT_PREFIX, STATS_FILE_NAME
+from .tree_snapshot import TreeSnapshot, snapshot_file_name
 
 logger = logging.getLogger(__name__)
 
 
 class _TreeEntry(NamedTuple):
     """The part of a git tree entry the tree builder reads: a full storage
-    path, ``"tree"`` or ``"blob"``, and the object's sha."""
+    path, ``"tree"`` or ``"blob"``, the object's sha and its file mode."""
 
     path: str
     type: str
     sha: str
+    mode: str = "100644"
+
+
+class _HeadCommit(NamedTuple):
+    """The branch head's sha with the Unix epoch of its commit date."""
+
+    sha: str
+    epoch: float
 
 
 # How often a stats commit is retried when the branch moved under it.
 STATS_COMMIT_ATTEMPTS = 3
 # How often the full-tree sync commit is retried when the branch moved.
 SYNC_COMMIT_ATTEMPTS = 3
+GITHUB_PAGE_SIZE = 100
 
 
 def _blob_sha(content: str) -> str:
@@ -70,7 +90,13 @@ class GithubRepoMetadataRepository(IMetaDataRepository):
         super().__init__()
         self._stats_loads: dict[int, asyncio.Future[bool]] = {}
 
-        gh = Github(config.access_token, retry=GithubRetry(total=1))
+        # Keep bounded connection retries, but don't sleep through GitHub
+        # rate limits on the single metadata writer or the SFTP event loop.
+        gh = Github(
+            config.access_token,
+            per_page=GITHUB_PAGE_SIZE,
+            retry=Retry(total=1, status=0, respect_retry_after_header=False),
+        )
         # Injectable for a store that speaks the PyGithub surface without
         # being GitHub (the GitLab tree mirror); the default client talks
         # to GitHub itself. The lazy flag keeps the resolution request out
@@ -96,6 +122,9 @@ class GithubRepoMetadataRepository(IMetaDataRepository):
             branch=config.commit,
             path=expand_path(cache_file_name(config.repo, config.commit)),
         )
+        self._snapshot = TreeSnapshot(
+            expand_path(snapshot_file_name(config.repo, config.commit))
+        )
 
         self._ghc = GithubConfig(
             gh=gh,
@@ -105,6 +134,7 @@ class GithubRepoMetadataRepository(IMetaDataRepository):
             name_key=name_key,
             timestamps=self._timestamps,
             tree_fetch_concurrency=config.tree_fetch_concurrency,
+            squash_history_max_commits=config.squash_history_max_commits,
         )
 
     # -- the shared tree -----------------------------------------------------
@@ -173,7 +203,129 @@ class GithubRepoMetadataRepository(IMetaDataRepository):
             )
 
     async def push(self) -> None:
-        pass
+        # The incremental writes already landed while the tree was mutated;
+        # what is left is the batched file-reference deletions.
+        if not self._ghc.pending_drops:
+            return
+        now = time.monotonic()
+        if (
+            len(self._ghc.pending_drops) < DROP_FLUSH_BATCH
+            and now - self._ghc.pending_drops_since < DROP_FLUSH_INTERVAL
+        ):
+            return
+        async with self._ghc.lock:
+            paths = sorted(self._ghc.pending_drops)
+            self._ghc.pending_drops.clear()
+            self._ghc.pending_drops_since = 0.0
+            try:
+                await self._ghc.write(self._commit_drops, paths)
+            except GithubException as ex:
+                if getattr(ex, "status", None) == 404:
+                    # No branch yet: a fresh store holds no blobs.
+                    return
+                self._requeue_drops(paths)
+            except Exception:
+                self._requeue_drops(paths)
+
+    def _requeue_drops(self, paths: list[str]) -> None:
+        logger.exception(
+            f"Committing the deletion of {len(paths)} file reference(s) "
+            f"to {self._ghc.repo_name} failed; the deletes are queued for "
+            "the next metadata push"
+        )
+        self._ghc.pending_drops.update(paths)
+        if not self._ghc.pending_drops_since:
+            self._ghc.pending_drops_since = time.monotonic()
+
+    def _commit_drops(self, paths: list[str]) -> None:
+        """Overlay the pending deletions on the branch head in one commit.
+
+        A tree element with neither content nor sha removes the path from
+        the base tree, like the stats commit does; a path that was never
+        there, or that a directory delete already removed, is a no-op.
+        Blocking; raises when the commit does not land, and retried when
+        the branch moved under it, like the stats commit.
+        """
+        repo = self._ghc.repo
+        elements = [
+            InputGitTreeElement(path=path, mode="100644", type="blob", sha=None)
+            for path in paths
+        ]
+        for attempt in range(DROP_COMMIT_ATTEMPTS):
+            ref = repo.get_git_ref(f"heads/{self._ghc.commit}")
+            base_commit = repo.get_git_commit(ref.object.sha)
+            tree = repo.create_git_tree(elements, base_tree=base_commit.tree)
+            commit = repo.create_git_commit(
+                f"Delete {len(paths)} file reference(s)", tree, [base_commit]
+            )
+            try:
+                ref.edit(commit.sha)
+                logger.info(
+                    f"Deleted {len(paths)} file reference(s) from "
+                    f"{self._ghc.repo_name}"
+                )
+                return
+            except GithubException as ex:
+                if attempt + 1 == DROP_COMMIT_ATTEMPTS:
+                    raise
+                logger.info(
+                    f"Branch {self._ghc.commit} moved while committing the "
+                    f"file reference deletions ({ex.status}), retrying"
+                )
+
+    # -- maintenance (``maintain``) -----------------------------------------
+    #
+    # Run next to ``heal`` by the heal worker: once per interval, with the
+    # store configured for it or not. A git store written one blob at a
+    # time accumulates exactly the history that keeps every deleted blob
+    # alive; squashing it into one commit carrying the whole current
+    # state is what makes the backend reclaim the old ones.
+
+    async def maintain(self) -> None:
+        if self._ghc.squash_history_max_commits <= 0:
+            return
+        # History inspection does not write. Do not queue it ahead of
+        # deletes on the single writer thread.
+        head = await asyncio.to_thread(self._compaction_candidate)
+        if head is not None:
+            async with self._ghc.lock:
+                await self._ghc.write(self._compact_history, head)
+
+    def _compaction_candidate(self) -> Optional[str]:
+        """Check only the page that would contain the first excess commit."""
+        repo = self._ghc.repo
+        page, offset = divmod(self._ghc.squash_history_max_commits, GITHUB_PAGE_SIZE)
+        try:
+            head = repo.get_git_ref(f"heads/{self._ghc.commit}").object.sha
+            commits = repo.get_commits(sha=head).get_page(page)
+        except GithubException as ex:
+            if ex.status in (404, 409):
+                return None
+            raise
+        return head if len(commits) > offset else None
+
+    def _compact_history(self, head: str) -> None:
+        """Reuse the complete immutable tree of the checked branch head."""
+        repo = self._ghc.repo
+        ref_name = f"heads/{self._ghc.commit}"
+        ref = repo.get_git_ref(ref_name)
+        if ref.object.sha != head:
+            return
+        base_commit = repo.get_git_commit(head)
+        commit = repo.create_git_commit(
+            "Compact metadata history",
+            base_commit.tree,
+            [],
+        )
+        # Skip the rewrite if another writer already published a new head.
+        # The ref API offers no compare-and-swap for this forced update.
+        if repo.get_git_ref(ref_name).object.sha != head:
+            return
+        ref.edit(commit.sha, force=True)
+        logger.info(
+            f"Compacted the metadata history of {self._ghc.repo_name}@"
+            f"{self._ghc.commit} into one commit"
+        )
 
     # -- full-tree sync (``push_full``) -------------------------------------
     #
@@ -194,6 +346,11 @@ class GithubRepoMetadataRepository(IMetaDataRepository):
         async with self._ghc.lock:
             desired_blobs = self._desired_blobs()
             await self._ghc.write(self._sync_tree_commit, desired_blobs)
+            # The sync reconciled the whole tree; every pending blob delete
+            # it covered is durable now -- and a tree a file reference was
+            # dropped from wrote them all out.
+            self._ghc.pending_drops.clear()
+            self._ghc.pending_drops_since = 0.0
 
     def _desired_blobs(self) -> Set[str]:
         """The blob paths the in-memory tree implies."""
@@ -254,7 +411,7 @@ class GithubRepoMetadataRepository(IMetaDataRepository):
     def _is_managed_blob(path: str) -> bool:
         """Whether the sync may delete this blob: file references (``name.id``
         -- the same shape the loader parses) and ``.gitkeep`` placeholders.
-        Anything else in the repo (stats files, a README) is left alone."""
+        Stats files have their own retention rule; foreign blobs are left alone."""
         segment = path.rsplit("/", 1)[-1]
         if segment == ".gitkeep":
             return True
@@ -283,46 +440,65 @@ class GithubRepoMetadataRepository(IMetaDataRepository):
             tree = repo.get_git_tree(base_commit.tree.sha, recursive=True)
             if tree.truncated:
                 # A truncated listing would make the rewrite below drop
-                # every blob it did not see. Never sync from that.
-                raise TechnicalError(
-                    f"The tree of {self._ghc.repo_name}@{self._ghc.commit} is "
-                    f"truncated; the metadata sync cannot run safely"
+                # every blob it did not see. Repositories past GitHub's
+                # truncation limit (100,000 entries or 7 MB) never grow
+                # out of it, so refusing here kept a caught-up store
+                # failing forever; the listing is rebuilt one directory
+                # at a time instead, complete if slower. Only a walk
+                # whose own directories truncate (an unreachable repo)
+                # still refuses the sync.
+                logger.warning(
+                    f"Tree of {self._ghc.repo_name}@{self._ghc.commit} came "
+                    "back truncated; reading it one directory at a time"
                 )
-            current = {e.path: (e.sha, e.mode) for e in tree.tree if e.type == "blob"}
+                current = {
+                    e.path: (e.sha, e.mode)
+                    for e in self._walk_tree()
+                    if e.type == "blob"
+                }
+            else:
+                current = {
+                    e.path: (e.sha, e.mode) for e in tree.tree if e.type == "blob"
+                }
             creates = sorted(desired_blobs - set(current))
+            desired_sorted = sorted(desired_blobs)
+
+            def stale_stats(path: str) -> bool:
+                parent, _, filename = path.rpartition("/")
+                if not parent or filename != STATS_FILE_NAME:
+                    return False
+                prefix = parent + "/"
+                index = bisect.bisect_left(desired_sorted, prefix)
+                return index == len(desired_sorted) or not desired_sorted[
+                    index
+                ].startswith(prefix)
+
             deletes = sorted(
                 path
                 for path in current
-                if path not in desired_blobs and self._is_managed_blob(path)
+                if path not in desired_blobs
+                and (self._is_managed_blob(path) or stale_stats(path))
             )
             if not creates and not deletes:
                 return
-            elements = [
+            overlay = [
                 # The content creates the blob server side; an element that
                 # also carries a sha (even null) is rejected with a 422.
                 InputGitTreeElement(path=path, mode="100644", type="blob", content="")
                 for path in creates
             ]
-            elements += [
-                InputGitTreeElement(path=path, mode=mode, type="blob", sha=sha)
-                for path, (sha, mode) in sorted(current.items())
-                if path not in set(deletes)
+            overlay += [
+                InputGitTreeElement(path=path, mode="100644", type="blob", sha=None)
+                for path in deletes
             ]
-            new_tree = repo.create_git_tree(elements)
-            commit = repo.create_git_commit(
-                f"Sync TGDCFS metadata tree ({len(creates)} created, "
-                f"{len(deletes)} deleted)",
-                new_tree,
-                [base_commit],
-            )
             try:
-                ref.edit(commit.sha)
-                logger.info(
-                    f"Synced the metadata tree to {self._ghc.repo_name}@"
-                    f"{self._ghc.commit}: {len(creates)} created, "
-                    f"{len(deletes)} deleted"
+                commit_tree_overlay(
+                    repo,
+                    self._ghc.commit,
+                    overlay,
+                    f"Sync TGDCFS metadata tree ({len(creates)} created, "
+                    f"{len(deletes)} deleted)",
                 )
-                return
             except GithubException as ex:
                 if attempt + 1 == SYNC_COMMIT_ATTEMPTS:
                     raise
@@ -330,25 +506,55 @@ class GithubRepoMetadataRepository(IMetaDataRepository):
                     f"Branch {self._ghc.commit} moved while syncing the "
                     f"metadata tree ({ex.status}), retrying"
                 )
+                continue
+            logger.info(
+                f"Synced the metadata tree to {self._ghc.repo_name}@"
+                f"{self._ghc.commit}: {len(creates)} created, "
+                f"{len(deletes)} deleted"
+            )
+            return
 
     def _initial_sync_commit(self, desired_blobs: Set[str]) -> None:
-        """First commit on a branch that does not exist yet."""
+        """First commit on a branch that does not exist yet.
+
+        The desired blobs are committed as content-only creates in chunks
+        of at most ``TREE_OVERLAY_ACTION_LIMIT`` elements chained by base
+        tree: one request naming a whole metadata tree refused with an
+        "input too large" 422 once the repository outgrew it.
+        """
         repo = self._ghc.repo
-        elements = [
-            # See _sync_tree_commit: content must go alone.
-            InputGitTreeElement(path=path, mode="100644", type="blob", content="")
-            for path in sorted(desired_blobs)
-        ]
-        new_tree = repo.create_git_tree(elements)
-        commit = repo.create_git_commit(
-            f"Sync TGDCFS metadata tree ({len(desired_blobs)} created)",
-            new_tree,
-            [],
-        )
-        repo.create_git_ref(f"refs/heads/{self._ghc.commit}", commit.sha)
+        paths = sorted(desired_blobs)
+        chunks = [
+            paths[i : i + TREE_OVERLAY_ACTION_LIMIT]
+            for i in range(0, len(paths), TREE_OVERLAY_ACTION_LIMIT)
+        ] or [[]]
+        parent: Optional[GitCommit] = None
+        head = ""
+        for number, chunk in enumerate(chunks, start=1):
+            elements = [
+                InputGitTreeElement(path=path, mode="100644", type="blob", content="")
+                for path in chunk
+            ]
+            tree = (
+                repo.create_git_tree(elements)
+                if parent is None
+                else repo.create_git_tree(elements, base_tree=parent.tree)
+            )
+            message = (
+                f"Sync TGDCFS metadata tree ({len(paths)} created)"
+                if len(chunks) == 1
+                else f"Sync TGDCFS metadata tree ({len(paths)} created) "
+                f"({number}/{len(chunks)})"
+            )
+            commit = repo.create_git_commit(
+                message, tree, [] if parent is None else [parent]
+            )
+            head = commit.sha
+            parent = commit
+        repo.create_git_ref(f"refs/heads/{self._ghc.commit}", head)
         logger.info(
             f"Created {self._ghc.repo_name}@{self._ghc.commit} with the "
-            f"synced metadata tree ({len(desired_blobs)} blobs)"
+            f"synced metadata tree ({len(paths)} blobs)"
         )
 
     # -- file stats (``listing.stat_in_metadata``) -------------------------
@@ -434,16 +640,18 @@ class GithubRepoMetadataRepository(IMetaDataRepository):
                 changes.append((directory, content))
 
         if changes:
-            # Paths and contents are fixed here, on the event loop; the
-            # thread only talks to GitHub.
-            writes = [(d.stats_path, content) for d, content in changes]
-            # Same writer thread as the file references: both commit on the
-            # branch, and two at once is what made the stats ref update fail
-            # with "not a fast forward".
-            await self._ghc.write(self._commit_stats, writes)
-            for directory, content in changes:
-                directory.stats_sha = None if content is None else _blob_sha(content)
-                directory.stats_loaded = True
+            async with self._ghc.lock:
+                # RMDIR may have completed while this write was queued.
+                # A stats blob must never recreate a detached directory.
+                attached = [(d, content) for d, content in changes if d.is_attached()]
+                if attached:
+                    writes = [(d.stats_path, content) for d, content in attached]
+                    await self._ghc.write(self._commit_stats, writes)
+                    for directory, content in attached:
+                        directory.stats_sha = (
+                            None if content is None else _blob_sha(content)
+                        )
+                        directory.stats_loaded = True
 
         if unreadable:
             raise TechnicalError(
@@ -500,47 +708,110 @@ class GithubRepoMetadataRepository(IMetaDataRepository):
                 )
 
     async def get(self) -> TGFSMetadata:
-        # One call to read the repo head plus at most one to diff it against
-        # the cached one. Off the event loop because PyGithub is synchronous.
-        await asyncio.to_thread(self._timestamps.load)
+        # Off the event loop: PyGithub and the facade are synchronous.
+        head = await asyncio.to_thread(self._head_commit)
+        if head is not None:
+            # The listing only changes when the branch moves, and a grown
+            # repository costs hundreds of requests to list: when the head
+            # of this boot is the head the last boot listed, the local
+            # snapshot of that listing serves the tree in its place.
+            tree = await asyncio.to_thread(
+                self._snapshot.load,
+                self._ghc.repo_name,
+                self._ghc.commit,
+                head.sha,
+            )
+            if tree is not None:
+                await asyncio.to_thread(self._timestamps.load)
+                metadata = TGFSMetadata.from_dict(tree)
+                metadata.revision = head.epoch
+                return metadata
         # Off the loop too: with a large repo the walk is a request per
         # directory. The structure is built fresh, so nothing is shared.
-        root_dir = await asyncio.to_thread(self._build_directory_structure)
+        root_dir = await asyncio.to_thread(self._load_directory_at, head)
         metadata = TGFSMetadata(dir=root_dir)
         # The replicated layer compares stores by this date: the branch head
         # is when this copy was written last. A store that proves dead later
         # during the read fails the load anyway; an empty repository has no
         # head and simply dates as unknown.
-        metadata.revision = await asyncio.to_thread(self._head_commit_epoch)
+        metadata.revision = head.epoch if head else None
+        if head is not None:
+            await asyncio.to_thread(
+                self._snapshot.save,
+                self._ghc.repo_name,
+                self._ghc.commit,
+                head.sha,
+                metadata.to_dict(),
+            )
         return metadata
 
-    def _head_commit_epoch(self) -> Optional[float]:
-        """When the branch was written last, as a Unix epoch, or None."""
+    def _head_commit(self) -> Optional[_HeadCommit]:
+        """The branch head's sha and commit date, or None.
+
+        Asked for through ``get_branch`` and ``get_git_commit``, the two
+        calls that carry their request themselves: a dead connection
+        then fails inside the guarded call, where the breaker sees it."""
         try:
-            ref = self._ghc.repo.get_git_ref(f"heads/{self._ghc.commit}")
-            commit = self._ghc.repo.get_git_commit(ref.object.sha)
+            branch = self._ghc.repo.get_branch(self._ghc.commit)
+            sha = branch.commit.sha
+            commit = self._ghc.repo.get_git_commit(sha)
             date = commit.committer.date
         except Exception:
             return None
         if not isinstance(date, datetime.datetime):
             return None
-        return date.timestamp()
+        return _HeadCommit(sha, date.timestamp())
 
-    def _build_directory_structure(self) -> GithubDirectory:
+    def _head_commit_epoch(self) -> Optional[float]:
+        """When the branch was written last, as a Unix epoch, or None."""
+        head = self._head_commit()
+        return None if head is None else head.epoch
+
+    async def head_revision(self) -> Optional[float]:
+        """The branch head's commit date; an empty store is reported
+        with ``NoStoredMetadata`` and a head that cannot be dated with
+        ``None``, so a load can tell unreachable, empty and undatable
+        apart."""
+        try:
+            head = await asyncio.to_thread(self._probe_head)
+        except GithubException as ex:
+            if ex.status in (404, 409):
+                raise NoStoredMetadata(
+                    f"The branch {self._ghc.commit} of {self._ghc.repo_name} "
+                    f"does not exist yet"
+                ) from ex
+            raise
+        return None if head is None else head.epoch
+
+    def _probe_head(self) -> Optional[_HeadCommit]:
+        """The branch head, letting a failed read raise (a swallowed one
+        would hide an outage from the load and from the breaker)."""
+        branch = self._ghc.repo.get_branch(self._ghc.commit)
+        sha = branch.commit.sha
+        commit = self._ghc.repo.get_git_commit(sha)
+        date = commit.committer.date
+        if not isinstance(date, datetime.datetime):
+            return None
+        return _HeadCommit(sha, date.timestamp())
+
+    def _load_directory_at(self, head: Optional[_HeadCommit]) -> GithubDirectory:
+        return self._build_directory_structure()
+
+    def _build_directory_structure(self, ref: Optional[str] = None) -> GithubDirectory:
         root = GithubDirectory(
             self._ghc, name="root", parent=None, children=[], files=[]
         )
         self._restore_root_timestamps(root)
 
         try:
-            entries = self._read_tree()
+            entries = self._read_tree(ref) if ref is not None else self._read_tree()
             if entries is not None:
                 self._build_from_tree(entries, root)
             else:
                 contents = self._ghc.repo.get_contents("", ref=self._ghc.commit)
                 self._process_contents(contents, root)
         except GithubException as ex:
-            if ex.status in (404, 409):
+            if ref is None and ex.status in (404, 409):
                 # An empty repository, or the branch does not exist yet:
                 # there is no tree, which is how every installation starts.
                 logger.warning(
@@ -563,7 +834,7 @@ class GithubRepoMetadataRepository(IMetaDataRepository):
 
         return root
 
-    def _read_tree(self) -> Optional[Sequence[_TreeEntry]]:
+    def _read_tree(self, ref: Optional[str] = None) -> Optional[Sequence[_TreeEntry]]:
         """The whole repo tree in one request, or ``None`` if it is unusable.
 
         ``get_contents`` lists exactly one directory, so walking the tree with
@@ -578,7 +849,7 @@ class GithubRepoMetadataRepository(IMetaDataRepository):
         then read one directory at a time instead.
         """
         try:
-            tree = self._ghc.repo.get_git_tree(self._ghc.commit, recursive=True)
+            tree = self._ghc.repo.get_git_tree(ref or self._ghc.commit, recursive=True)
             if not tree.truncated:
                 return [_TreeEntry(e.path, e.type, e.sha) for e in tree.tree]
             logger.warning(
@@ -634,7 +905,7 @@ class GithubRepoMetadataRepository(IMetaDataRepository):
                         )
                     for e in t.tree:
                         path = f"{prefix}{e.path}"
-                        entries.append(_TreeEntry(path, e.type, e.sha))
+                        entries.append(_TreeEntry(path, e.type, e.sha, e.mode))
                         if e.type == "tree":
                             pending.append((f"{path}/", e.sha))
         logger.info(

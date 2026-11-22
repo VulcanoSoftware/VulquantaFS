@@ -1,7 +1,7 @@
 import asyncio
 import logging
 import time
-from typing import Dict, Optional
+from typing import Dict, Optional, Sequence
 
 from tgdcfs.core.model import FileStat, TGFSDirectory, TGFSFileDesc, TGFSFileRef
 from tgdcfs.utils.time import ts
@@ -32,6 +32,9 @@ FLUSH_DUTY = 10.0
 # thousands of files without stored stats started that many reads in one
 # PROPFIND, which kept the event loop busy for tens of seconds.
 MAX_STAT_READS = 16
+# A cold SFTP listing can consult one stats blob, but cannot wait out a
+# metadata store outage or fall back to downloading every file's header.
+STORED_LISTING_TIMEOUT = 1.0
 # Pause before a failed write is tried again.
 FLUSH_RETRY_DELAY = 60.0
 # How long shutdown waits for the last write.
@@ -85,6 +88,25 @@ class FileStatApi:
     @property
     def persist(self) -> bool:
         return self._persist
+
+    async def get_stored_listing(
+        self, directory: TGFSDirectory, refs: Sequence[TGFSFileRef]
+    ) -> list[Optional[FileStat]]:
+        """Return known stats only, in order, without ever reading descriptors."""
+        metadata = self._metadata_api
+        if not self._persist or metadata is None:
+            return [None] * len(refs)
+        if any(ref.stat is None for ref in refs):
+            try:
+                async with asyncio.timeout(STORED_LISTING_TIMEOUT):
+                    await metadata.load_stats(directory)
+            except TimeoutError:
+                logger.debug("Timed out loading stored stats for SFTP READDIR")
+            except Exception:
+                logger.warning(
+                    "Could not load stored stats for SFTP READDIR", exc_info=True
+                )
+        return [ref.stat for ref in refs]
 
     async def get(self, fr: TGFSFileRef) -> FileStat:
         if not self._persist:

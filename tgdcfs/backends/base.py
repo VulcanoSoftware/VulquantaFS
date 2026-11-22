@@ -194,6 +194,11 @@ class IStore(metaclass=ABCMeta):
 
     # -- bookkeeping -------------------------------------------------------
 
+    @property
+    def deletes_on_remove(self) -> bool:
+        """Whether an ordinary remove deletes messages from this store."""
+        return True
+
     @abstractmethod
     async def delete_messages(
         self, message_ids: Iterable[int], force: bool = False

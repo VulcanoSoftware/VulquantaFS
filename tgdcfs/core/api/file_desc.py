@@ -147,7 +147,7 @@ class FileDescApi:
     async def delete_file_version(
         self, fr: TGFSFileRef, version_id: str
     ) -> FDRepositoryResp:
-        fd = await self.get_file_desc(fr)
+        fd = await self.get_file_desc(fr, validate=False)
         fd.delete_version(version_id)
         resp = await self.__fd_repo.save(fd, fr)
         await self.__fc_repo.forget([version_id])

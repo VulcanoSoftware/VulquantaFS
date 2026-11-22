@@ -17,6 +17,14 @@ from tgdcfs.reqres import FileMessageFromBuffer
 from tests.fakes.store import FakeStore
 
 
+async def settled_initial_push(client) -> None:
+    """Wait for the background full push Client.create schedules."""
+    repo = getattr(client.metadata_api, "_MetaDataApi__metadata_repo")
+    initial = getattr(repo, "_initial_push", None)
+    assert initial is not None
+    await initial
+
+
 def config_dict() -> dict:
     return {
         "backends": {
@@ -83,6 +91,7 @@ class TestRedundantMetadata:
         client = await Client.create(
             config.filesystems["media"], config, build_clients(config)
         )
+        await settled_initial_push(client)
 
         root = api(client).get_root_directory()
         await client.file_api.upload(
@@ -98,6 +107,7 @@ class TestRedundantMetadata:
         client = await Client.create(
             config.filesystems["media"], config, build_clients(config)
         )
+        await settled_initial_push(client)
 
         root = api(client).get_root_directory()
         await client.file_api.upload(
@@ -116,6 +126,7 @@ class TestRedundantMetadata:
         client = await Client.create(
             config.filesystems["media"], config, build_clients(config)
         )
+        await settled_initial_push(client)
         assert api(client).stale_stores() == []
 
         # Take the Discord store down.
@@ -137,6 +148,7 @@ class TestRedundantMetadata:
         client = await Client.create(
             config.filesystems["media"], config, build_clients(config)
         )
+        await settled_initial_push(client)
         dc_store = discord_store(client)
         dc_store.fail = {"upload", "pin_message", "replace_document"}
         root = api(client).get_root_directory()
@@ -158,6 +170,7 @@ class TestRedundantMetadata:
         client = await Client.create(
             config.filesystems["media"], config, build_clients(config)
         )
+        await settled_initial_push(client)
         root = api(client).get_root_directory()
         await client.file_api.upload(
             root, FileMessageFromBuffer.new(buffer=b"data", name="keep.txt")
@@ -175,6 +188,7 @@ class TestRedundantMetadata:
             return dc_store
 
         client2 = await Client.create(config.filesystems["media"], config, factory)
+        await settled_initial_push(client2)
 
         root2 = api(client2).get_root_directory()
         assert root2.find_file("keep.txt") is not None

@@ -1,3 +1,6 @@
+import hashlib
+import json
+import logging
 from typing import Awaitable, Callable, Dict, List, Optional
 
 from tgdcfs.backends.base import IStore
@@ -9,6 +12,7 @@ from tgdcfs.config import (
     MetadataLayout,
     MetadataType,
     StoreConfig,
+    expand_path,
 )
 from tgdcfs.core.api import (
     DirectoryApi,
@@ -17,6 +21,7 @@ from tgdcfs.core.api import (
     FileStatApi,
     MetaDataApi,
 )
+from tgdcfs.core.api.removal_journal import RemovalJournal
 from tgdcfs.core.local_cache import LocalCache
 from tgdcfs.core.mirror import MirrorGroup, MirrorStore
 from tgdcfs.core.model import TGFSFileRef
@@ -216,8 +221,30 @@ class Client:
             fd_repo, fc_repo, write_ack="cache" if write_back else "primary"
         )
 
-        metadata_api = MetaDataApi(metadata_repo)
+        # Isolate filesystems and avoid replaying an old journal against
+        # an unrelated metadata target after reconfiguring a filesystem.
+        journal_id = hashlib.sha256(
+            json.dumps([filesystem.name, store.key, metadata_cfg.key]).encode()
+        ).hexdigest()
+        metadata_api = MetaDataApi(
+            metadata_repo,
+            push_mode=filesystem.metadata_push.mode,
+            push_window=filesystem.metadata_push.window_seconds,
+            removal_journal=(
+                RemovalJournal(
+                    expand_path(f"removals/{journal_id}.sqlite3"),
+                    metadata_blob_key,
+                    default_store=store.key,
+                )
+                if filesystem.metadata_mirrors
+                or metadata_cfg.type != MetadataType.PINNED_MESSAGE
+                else None
+            ),
+        )
+        logger = logging.getLogger(__name__)
+        logger.info("Loading metadata for filesystem %s", filesystem.name)
         await metadata_api.init()
+        logger.info("Metadata ready for filesystem %s", filesystem.name)
 
         on_written = None
         # Mirrors filled in the background put every write on the queue;
@@ -243,6 +270,8 @@ class Client:
             # queue is only told about a file some store still lacks a
             # copy of; in background mode every write is queued.
             written_gaps_only=inline or tee,
+            cleanup_local_versions=cache is not None,
+            has_cached_versions=cache.has_entries if cache is not None else None,
             stat_api=FileStatApi(
                 fd_api,
                 validate=config.tgdcfs.listing.validate_on_list,
@@ -389,7 +418,10 @@ class Client:
                     cfg, path_name_key, metadata_blob_key
                 )
             stores.append(MetadataStore(key=cfg.key, repo=repo, primary=i == 0))
-        return ReplicatedMetadataRepository(stores)
+        return ReplicatedMetadataRepository(
+            stores,
+            concurrent_stores=filesystem.metadata_push.parallel_stores,
+        )
 
 
 Clients = Dict[str, Client]

@@ -224,7 +224,9 @@ class TestCreateFileRefDeferred:
         self, ghc, monkeypatch
     ):
         """A file deleted while its deferred create still retries must not
-        reappear after a restart: the retry may not re-create the blob."""
+        reappear after a restart: the delete takes the lock between the
+        attempts, removes the ref, and the retries then see it gone and
+        never write the blob."""
         from github import GithubException
 
         from tgdcfs.core.repository.impl.metadata.github_repo import gh_directory
@@ -242,11 +244,7 @@ class TestCreateFileRefDeferred:
                 proceed.wait(timeout=5)
             raise GithubException(500, {}, {})
 
-        def delete_file(**_):
-            order.append("delete")
-
         ghc.repo.create_file.side_effect = create_file
-        ghc.repo.delete_file.side_effect = delete_file
         ghc.repo.get_contents.return_value = Mock(sha="abc")
         directory = GithubDirectory(ghc, "d", None)
 
@@ -259,17 +257,21 @@ class TestCreateFileRefDeferred:
 
         deleter = asyncio.ensure_future(directory.delete_file_ref_async(fr))
         await asyncio.sleep(0.05)
-        # The delete waits for the retrying create instead of racing it.
+        # The delete waits for the retrying create's lock instead of
+        # racing it.
         assert not deleter.done()
         proceed.set()
 
         await deleter
+        before = len(order)
         await self._wait_for_background(directory)
 
-        # The retry saw the ref gone from the tree: no blob was written
-        # after the delete.
-        assert "delete" in order
-        assert "create" not in order[order.index("delete") + 1 :]
+        # The delete made no remote write of its own (the blob leaves in
+        # the batched deletions of the next push), and every retry that
+        # ran after it saw the ref gone from the tree.
+        assert "delete" not in order
+        assert order[before:] == []
+        assert ghc.pending_drops == {"f.1"}
         assert len(directory.files) == 0
 
     async def test_a_permanent_failure_leaves_the_path_consistent(
@@ -313,17 +315,21 @@ class TestCreateFileRefDeferred:
 
 
 class TestDeleteFileRefAsync:
-    async def test_removes_blob_and_ref_without_blocking(self, ghc):
+    async def test_defers_the_blob_removal_to_the_next_push(self, ghc):
+        """A waited-on delete used to cost two API calls on the writer
+        thread per file; now it only registers the blob paths, and the
+        next push takes them out in one commit."""
         ghc.repo.get_contents.return_value = Mock(sha="abc")
         ghc.repo.delete_file.side_effect = lambda **_: time.sleep(0.3)
         directory = GithubDirectory(ghc, "d", None)
         fr = directory.create_file_ref("f", 7)
         ghc.repo.create_file.reset_mock()
 
-        ticks = await _ticks_while(directory.delete_file_ref_async(fr))
+        await directory.delete_file_ref_async(fr)
 
-        assert ticks >= 10
-        ghc.repo.delete_file.assert_called_once()
+        ghc.repo.delete_file.assert_not_called()
+        ghc.repo.get_contents.assert_not_called()
+        assert ghc.pending_drops == {"f.7"}
         assert len(directory.files) == 0
 
     async def test_missing_blob_still_drops_the_ref(self, ghc):

@@ -127,15 +127,42 @@ class IMetaDataRepository(metaclass=ABCMeta):
         """
         await self.push()
 
+    async def push_removals(self) -> None:
+        """Persist journaled removals, which bypass incremental writes."""
+        await self.push_full()
+
     @abstractmethod
     async def get(self) -> TGFSMetadata:
         pass
+
+    async def head_revision(self) -> Optional[float]:
+        """The revision the store would date its tree with, read cheaply.
+
+        A git store answers with its branch head's commit date -- two
+        small requests -- so the replicated layer can decide which store
+        holds the freshest tree *before* reading any of them fully (a
+        grown tree costs hundreds of listing requests per store). ``None``
+        means the store cannot tell cheaply and must be read to compare;
+        it raises when the store could not be asked at all.
+        """
+        return None
 
     async def heal(self) -> None:
         """Re-sync every store this repository knows to be behind.
 
         Only the replicated layer has several stores to reconcile; the
         default has nothing to do.
+        """
+        return
+
+    async def maintain(self) -> None:
+        """Run the store's periodic housekeeping (commit-history compaction,
+        deferred write flushes) once.
+
+        Configured per store (e.g. ``squash_history_max_commits``); a store
+        with no maintenance configured does nothing. Called next to
+        :meth:`heal` by the heal worker, so it also runs on a store
+        without mirrors.
         """
         return
 

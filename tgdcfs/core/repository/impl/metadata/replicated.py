@@ -10,10 +10,11 @@ or Discord, each its own store), a GitHub repo and a GitLab repo.
 
 Behaviour:
 
-* Every ``push`` writes the primary store and then every mirror. A
-  mirror that fails is logged, marked *stale* and skipped -- the write
-  still succeeds as long as one store holds the tree, and the next push
-  writes the stale store again.
+* Every ``push`` writes the primary store and then every mirror (all
+  stores at once when ``concurrent_stores`` is set). A mirror that fails
+  is logged, marked *stale* and skipped -- the write still succeeds as
+  long as one store holds the tree, and the next push writes the stale
+  store again.
 * ``init`` loads the tree from the primary; when the primary cannot be
   read (store down, repository unreachable) it fails over to the first
   mirror that holds one. A store that holds no document at all counts as
@@ -36,10 +37,11 @@ copy was beaten at load is handed the winner's tree like a stale one.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from dataclasses import dataclass
-from typing import Iterable, List, Optional, Sequence, Set
+from typing import AsyncIterator, Iterable, List, Optional, Sequence, Set
 
 from tgdcfs.core.model import TGFSDirectory, TGFSMetadata
 from tgdcfs.core.repository.interface import IMetaDataRepository
@@ -64,6 +66,7 @@ EMPTY_METADATA_ERRORS = (NoPinnedMessage, NoStoredMetadata)
 # is newer by more than this much -- otherwise the primary keeps the
 # lead, and calm operation never flips the source of truth.
 PRIMARY_FRESHNESS_WINDOW_SECONDS = 60.0
+LOAD_HEDGE_SECONDS = 1.0
 
 
 @dataclass
@@ -81,18 +84,29 @@ class MetadataStore:
 
 
 class ReplicatedMetadataRepository(IMetaDataRepository):
-    def __init__(self, stores: Sequence[MetadataStore]):
+    def __init__(
+        self, stores: Sequence[MetadataStore], concurrent_stores: bool = False
+    ):
         if not stores:
             raise ValueError("a replicated metadata repository needs a store")
         if not stores[0].primary:
             raise ValueError("the first metadata store must be the primary")
         self._stores: List[MetadataStore] = list(stores)
+        # False keeps the historical one-store-after-another write order, so
+        # a push lasts for the sum of every pending store's effort; True
+        # writes all stores at once, so it lasts for the slowest one. The
+        # stale/skipped bookkeeping of :meth:`_write` is per store and needs
+        # no order, so both spread failures the same way.
+        self._concurrent_stores = concurrent_stores
         # Keys of the stores that missed a write and await a re-sync.
         self._stale: Set[str] = set()
         # Keys of the stores that cannot hold the current document at all
         # (a pinned copy whose messages are too small), with the reason.
         # Re-checked on every heal: a smaller tree fits again.
         self._skipped: dict[str, str] = {}
+        # The boot's first push, once init() has run; see init().
+        self._initial_push: Optional[asyncio.Task] = None
+        self._writes = asyncio.Lock()
         super().__init__()
         # Read as a plain attribute by the API layer, so it is copied from
         # the primary instead of forwarded dynamically.
@@ -124,69 +138,167 @@ class ReplicatedMetadataRepository(IMetaDataRepository):
     async def init(self) -> None:
         tree = await self._load()
         self.metadata = tree
-        await self.push()
+        # The first push runs in the background: the boot served nothing
+        # until it completed, so the stores that missed something -- mere
+        # mirrors by definition -- lined the whole server up behind their
+        # re-sync (measured: past 15 minutes of boot over one stale
+        # GitHub mirror that kept losing its ref races). The tree is
+        # loaded and readable, that is what serving reads; the heal
+        # worker would make this exact write a moment later anyway, and
+        # like its retries a failing write logs and leaves the store
+        # stale instead of taking the server down.
+        self._initial_push = asyncio.create_task(
+            self._push_at_startup(), name="metadata-initial-push"
+        )
+
+    async def _push_at_startup(self) -> None:
+        try:
+            await self.push()
+        except TechnicalError as ex:
+            # A tree was loaded, so the file system can serve reads: the
+            # stores that could not take the write are marked stale and
+            # re-synced by the heal worker. Crashing the boot instead kept
+            # the whole server down over one store's outage (a rate limit,
+            # a repository that came back slower than the write).
+            logger.warning(
+                f"Could not write the metadata tree at startup; the heal "
+                f"worker will re-sync the failed stores: {ex}"
+            )
+        except Exception:
+            # The task dies with the boot gone otherwise; the heal worker
+            # still rewrites the stale stores.
+            logger.exception("The startup push of the metadata stores failed")
 
     async def _load(self) -> TGFSMetadata:
         """The tree to serve: the most recent one across the stores.
 
-        Every store that answers is read and dated by its revision, so
-        the copy a store received while the primary was down wins over
-        the primary's older one; git stores date themselves by their
-        branch head commit. The primary is preferred only while no other
-        store is meaningfully newer, so calm operation never flips the
-        source of truth on the split seconds between two stores' clocks.
+        The stores are dated by their revision, so the copy a store
+        received while the primary was down wins over the primary's
+        older one; git stores date themselves by their branch head
+        commit. The primary is preferred only while no other store is
+        meaningfully newer, so calm operation never flips the source of
+        truth on the split seconds between two stores' clocks.
 
         Stores that could not serve a tree (failed *or* empty *or* older
         than the winner) are marked stale, so the push that follows and
-        the periodic heal write the winning tree to them."""
+        the periodic heal write the winning tree to them. When the
+        stores can answer with their revision cheaply, only the winner's
+        tree is loaded. A failing read is not retried on the startup path.
+        """
         candidates: List[tuple[MetadataStore, TGFSMetadata]] = []
-        fresh: Optional[TGFSMetadata] = None
-        fresh_store: Optional[MetadataStore] = None
+        loaded: Set[str] = set()
+        empty_store: Optional[MetadataStore] = None
         failures: List[str] = []
         first_error: Optional[Exception] = None
 
-        for store in self._stores:
-            try:
-                candidates.append((store, await store.repo.get()))
-            except EMPTY_METADATA_ERRORS:
-                # The store is reachable and holds nothing. Remember the
-                # first one; if no store holds a tree, this is where a
-                # fresh installation starts.
-                self._stale.add(store.key)
-                if fresh is None:
-                    fresh = TGFSMetadata(dir=TGFSDirectory.root_dir())
-                    fresh_store = store
-            except Exception as ex:
-                self._stale.add(store.key)
-                if first_error is None:
-                    first_error = ex
-                failures.append(f"{store.key}: {ex}")
-                logger.warning(
-                    f"Could not read the metadata from store {store.key}: {ex}"
-                )
+        async def probe(store: MetadataStore) -> tuple[TGFSMetadata, bool]:
+            revision = await store.repo.head_revision()
+            if revision is None:
+                return await store.repo.get(), True
+            return TGFSMetadata(dir=TGFSDirectory.root_dir(), revision=revision), False
 
-        if not candidates:
-            if fresh is not None and fresh_store is not None:
+        def failed(store: MetadataStore, ex: Exception) -> None:
+            nonlocal first_error
+            self._stale.add(store.key)
+            first_error = first_error or ex
+            failures.append(f"{store.key}: {ex}")
+            logger.warning("Could not read metadata from store %s: %s", store.key, ex)
+
+        results = await asyncio.gather(
+            *(probe(store) for store in self._stores), return_exceptions=True
+        )
+        for store, result in zip(self._stores, results):
+            if isinstance(result, EMPTY_METADATA_ERRORS):
+                self._stale.add(store.key)
+                empty_store = empty_store or store
+            elif isinstance(result, Exception):
+                failed(store, result)
+            elif isinstance(result, BaseException):
+                raise result
+            else:
+                tree, is_loaded = result
+                candidates.append((store, tree))
+                if is_loaded:
+                    loaded.add(store.key)
+
+        failed_dated_read = False
+        selected: Optional[tuple[MetadataStore, TGFSMetadata]] = None
+        async for candidate, loaded_tree in self._read_candidates(candidates, loaded):
+            if isinstance(loaded_tree, EMPTY_METADATA_ERRORS):
+                self._stale.add(candidate.key)
+                empty_store = empty_store or candidate
+            elif isinstance(loaded_tree, Exception):
+                failed(candidate, loaded_tree)
+                failed_dated_read = True
+            else:
+                selected = candidate, loaded_tree
+
+        if selected is None:
+            if empty_store is not None and not failed_dated_read:
                 if failures:
                     logger.warning(
                         f"No metadata store could serve a tree "
                         f"({'; '.join(failures)}); starting from the "
-                        f"empty tree of {fresh_store.key}"
+                        f"empty tree of {empty_store.key}"
                     )
-                return fresh
+                # The selected empty store is the bootstrap source, not
+                # a stale copy that needs a full remote reconciliation.
+                self._stale.discard(empty_store.key)
+                return TGFSMetadata(dir=TGFSDirectory.root_dir())
             raise TechnicalError(
                 "No metadata store could be read: " + "; ".join(failures)
             ) from first_error
 
-        winner, tree = self._freshest(candidates)
+        winner, tree = selected
         for store, _ in candidates:
-            if store is not winner:
+            if store is not winner and store.key not in self._stale:
                 self._stale.add(store.key)
                 logger.info(
                     f"Metadata store {winner.key} holds the most recent "
                     f"metadata tree; store {store.key} will be re-synced"
                 )
         return tree
+
+    async def _read_candidates(
+        self,
+        candidates: Sequence[tuple[MetadataStore, TGFSMetadata]],
+        loaded: Set[str],
+    ) -> AsyncIterator[tuple[MetadataStore, TGFSMetadata | Exception]]:
+        """Keep the freshness order, but give a slow load a warm fallback."""
+        remaining = list(candidates)
+        reads: dict[str, asyncio.Task[TGFSMetadata]] = {}
+        try:
+            while remaining:
+                winner, tree = self._freshest(remaining)
+                remaining = [(s, t) for s, t in remaining if s is not winner]
+                if winner.key in loaded:
+                    yield winner, tree
+                    return
+                task = reads.get(winner.key)
+                if task is None:
+                    task = reads[winner.key] = asyncio.create_task(winner.repo.get())
+                if remaining and len(reads) == 1:
+                    fallback, _ = self._freshest(remaining)
+                    if fallback.key not in loaded:
+                        done, _ = await asyncio.wait({task}, timeout=LOAD_HEDGE_SECONDS)
+                        if not done:
+                            reads[fallback.key] = asyncio.create_task(
+                                fallback.repo.get()
+                            )
+                try:
+                    tree = await task
+                except Exception as ex:
+                    yield winner, ex
+                else:
+                    yield winner, tree
+                    return
+                finally:
+                    reads.pop(winner.key, None)
+        finally:
+            for task in reads.values():
+                task.cancel()
+            if reads:
+                await asyncio.gather(*reads.values(), return_exceptions=True)
 
     def _freshest(
         self,
@@ -220,22 +332,50 @@ class ReplicatedMetadataRepository(IMetaDataRepository):
     # -- writing ---------------------------------------------------------------
 
     async def push(self) -> None:
+        async with self._writes:
+            await self._push()
+
+    async def push_removals(self) -> None:
+        async with self._writes:
+            await self._push(all_full=True)
+            if stale := self.stale_stores():
+                # A stale mirror can be the only readable copy at a later
+                # boot. Keep the journal until it has the removals as well.
+                raise TechnicalError("Waiting for metadata stores: " + ", ".join(stale))
+
+    async def _push(self, all_full: bool = False) -> None:
         if not self.metadata:
             raise MetadataNotInitialized()
         self._stamp_revision()
 
         any_store_ok = False
         errors: List[str] = []
-        for i, store in enumerate(self._stores):
-            # The primary gets its regular write (a github repo primary has
-            # already written incrementally while the tree was mutated); the
-            # mirrors always get the full sync, since they may have missed
-            # any of those incremental writes while they were down. A primary
-            # that could not serve the tree at boot (it was down or empty)
-            # gets the full sync too: its regular write is a no-op for a tree
-            # store, and everything it missed while it was unavailable has
-            # to land before the next mutation goes through incrementally.
-            ok, error = await self._write(store, full=i > 0 or store.key in self._stale)
+        results: List[tuple[bool, Optional[str]]] = []
+
+        # The primary gets its regular write (a github repo primary has
+        # already written incrementally while the tree was mutated); the
+        # mirrors always get the full sync, since they may have missed any
+        # of those incremental writes while they were down. A primary that
+        # could not serve the tree at boot (it was down or empty) gets the
+        # full sync too: its regular write is a no-op for a tree store, and
+        # everything it missed while it was unavailable has to land before
+        # the next mutation goes through incrementally.
+        def full_for(store: MetadataStore, index: int) -> bool:
+            return all_full or index > 0 or store.key in self._stale
+
+        if self._concurrent_stores and len(self._stores) > 1:
+            results.extend(
+                await asyncio.gather(
+                    *(
+                        self._write(store, full=full_for(store, i))
+                        for i, store in enumerate(self._stores)
+                    )
+                )
+            )
+        else:
+            for i, store in enumerate(self._stores):
+                results.append(await self._write(store, full=full_for(store, i)))
+        for ok, error in results:
             any_store_ok = any_store_ok or ok
             if error:
                 errors.append(error)
@@ -294,16 +434,51 @@ class ReplicatedMetadataRepository(IMetaDataRepository):
 
         Called periodically by the heal worker and safe to call any time;
         a store that is up to date costs nothing, and one that just came
-        back is brought in line with the current tree.
+        back is brought in line with the current tree. Maintenance is
+        deliberately separate so history reads don't hold the write lock.
         """
+        if self._initial_push is not None and not self._initial_push.done():
+            return
+        async with self._writes:
+            await self._heal()
+
+    async def _heal(self) -> None:
         if not self.metadata:
             return
         for store in self._stores:
             if store.key in self._stale or store.key in self._skipped:
                 await self._write(store, full=True)
 
+    async def maintain(self) -> None:
+        if not self.metadata or (
+            self._initial_push is not None and not self._initial_push.done()
+        ):
+            return
+        for store in self._stores:
+            if store.key in self._stale or store.key in self._skipped:
+                continue
+            try:
+                await store.repo.maintain()
+            except Exception as ex:
+                logger.warning(f"Maintaining metadata store {store.key} failed: {ex}")
+
     def stale_stores(self) -> List[str]:
         return sorted(self._stale | set(self._skipped))
+
+    async def close(self) -> None:
+        # Stop the boot push that has not finished, like the coalescer's
+        # pusher: a shutdown that races the first re-sync otherwise waits
+        # for (or kills) an already doomed task at interpreter teardown.
+        task = self._initial_push
+        self._initial_push = None
+        if task is not None and not task.done():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+        for store in self._stores:
+            await store.repo.close()
 
     # -- file stats (``listing.stat_in_metadata``) ---------------------------
     #

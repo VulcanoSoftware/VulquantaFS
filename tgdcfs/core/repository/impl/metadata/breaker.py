@@ -17,6 +17,12 @@ store stale exactly as before, and a background probe watches the
 service -- once it answers again, the breaker closes and the heal worker
 brings the store back in line.
 
+Every further trip in a row doubles the probe interval, up to a cap, and
+a call the service actually answers resets the escalation. A store that
+answers its probe but whose writes keep deadlining (storage that cannot
+serve the work, not a network outage) then costs a single call timeout
+now and then instead of one per interval.
+
 Only transport-level failures (a ConnectionError, a timeout) open the
 breaker. An HTTP status answer, however unfriendly, means the service is
 up; the per-request retry handling already deals with those.
@@ -46,6 +52,13 @@ UNREACHABLE_ERRORS = (requests.exceptions.RequestException, OSError)
 # metadata heal interval: the heal finds the store eventually answer, at
 # most one probe interval after it came back.
 PROBE_COOLDOWN_SECONDS = 30.0
+
+# Every consecutive trip multiplies the probe interval by two, up to this
+# factor: a store that deadlines its writes while answering reads then
+# costs one write timeout per escalated interval instead of per interval.
+# With the 30 s cooldown the last step sits at 8 minutes; a store that
+# recovers is at most one interval late in coming back.
+PROBE_COOLDOWN_MAX_MULTIPLIER = 16.0
 
 # ``None`` as a cooldown reads the module constant above, so patching
 # that constant applies to breakers built after it.
@@ -81,7 +94,11 @@ class StoreCircuitBreaker:
     callers of a down store never queue for its connection timeouts. The
     probe runs on a one-at-a-time daemon thread: it waits for the
     cooldown, performs the cheap reachability call and either closes the
-    breaker or pushes the next attempt back by another cooldown.
+    breaker or pushes the next attempt back by another cooldown. Every
+    further trip in a row doubles that cooldown until the cap, and a
+    call the service answers resets the escalation: a store that answers
+    reads but deadlines its writes is re-tried later and later, not
+    once an interval.
     """
 
     def __init__(
@@ -94,6 +111,7 @@ class StoreCircuitBreaker:
         self._lock = threading.Lock()
         self._open = False
         self._reopen_at = 0.0
+        self._trips_in_a_row = 0
         self._last_error: Optional[BaseException] = None
         self._prober: Optional[threading.Thread] = None
         # Wakes the prober for a prompt stop, instead of letting it run
@@ -121,15 +139,33 @@ class StoreCircuitBreaker:
                 f"the next probe: {blocked}"
             ) from blocked
         try:
-            return fn(*args, **kwargs)
+            result = fn(*args, **kwargs)
         except Exception as ex:
             if is_unreachable_error(ex):
                 with self._lock:
+                    self._trips_in_a_row += 1
                     self._open = True
                     self._last_error = ex
-                    self._reopen_at = time.monotonic() + self._cooldown
+                    self._reopen_at = (
+                        time.monotonic() + self._escalated_cooldown_locked()
+                    )
                     self._start_prober_locked()
+            else:
+                # The service answered this call: the outage it refused
+                # for is over as far as this store is concerned.
+                with self._lock:
+                    self._trips_in_a_row = 0
             raise
+        with self._lock:
+            self._trips_in_a_row = 0
+        return result
+
+    def _escalated_cooldown_locked(self) -> float:
+        """The probe interval after ``self._trips_in_a_row`` consecutive
+        unreachable results: the base cooldown, doubled per further trip
+        until the multiplier above caps it."""
+        growth = 2.0 ** max(self._trips_in_a_row - 1, 0)
+        return self._cooldown * min(PROBE_COOLDOWN_MAX_MULTIPLIER, growth)
 
     def _start_prober_locked(self) -> None:
         if self._prober is None:
@@ -162,7 +198,9 @@ class StoreCircuitBreaker:
                         with self._lock:
                             if self._open:
                                 self._last_error = ex
-                                self._reopen_at = time.monotonic() + self._cooldown
+                                self._reopen_at = (
+                                    time.monotonic() + self._escalated_cooldown_locked()
+                                )
                         continue
                 with self._lock:
                     self._open = False

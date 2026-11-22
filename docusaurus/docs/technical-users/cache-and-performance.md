@@ -103,15 +103,24 @@ tgdcfs:
 
 ## Large Folders (`tgdcfs.listing`)
 
-A folder listing (WebDAV `PROPFIND`, SFTP `ls`) shows the size and dates of
-every file. The directory tree in the metadata only knows the names; size
+A detailed folder listing shows the size and dates of every file.
+The directory tree in the metadata only knows the names; size
 and dates are in each file's descriptor message in the store. Listing a
 folder of 10,000 files therefore reads 10,000 descriptors and checks that
 the content messages of each one still exist: about 20,000 messages, which
 on Telegram means hundreds of requests and on Discord one request per
 message. Clients give up long before that.
 
-The optional `listing` block makes this cheaper. Without it nothing changes.
+SFTP defaults to a fast listing for directories with at least 256 files.
+It uses the directory tree and any available stored sizes and dates, omitting
+values it doesn't know rather than reading file descriptors or encryption
+headers to fill the gaps. This lets a recursive delete enumerate a cold
+directory without first inspecting each file's contents. Such values may
+appear blank in some clients. Explicit `STAT` and `LSTAT` still resolve them.
+If a client requires exact sizes and timestamps in the listing itself, set
+`tgdcfs.sftp.fast_readdir_min_files: 0`.
+
+The optional `listing` block makes detailed listings cheaper.
 
 ```yaml
 tgdcfs:
@@ -130,7 +139,8 @@ entry in the metadata, so a listing reads no descriptor at all:
   first listing after a start.
 
 Nothing has to be prepared. A file whose values are not stored yet is read
-from its descriptor on the first listing, and the values are written back
+from its descriptor when a detailed listing or an explicit stat needs it,
+and the values are written back
 in the background: after 5 seconds without new values, at least once a
 minute during a long listing, and on shutdown. A client that gives up on a
 huge folder does not lose that work: the descriptor reads it started run to
@@ -169,4 +179,3 @@ channel (default 1024). A folder with more files than that evicts its own
 descriptors during the listing, so the next listing reads all of them
 again. Descriptor messages are small; 50,000 entries cost a few tens of
 megabytes.
-

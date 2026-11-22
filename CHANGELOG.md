@@ -16,8 +16,166 @@ the fact on the commits that shipped them.
 
 ## [Unreleased]
 
+### Added
+
+- Git-backed metadata stores (GitHub and GitLab, tree layout) take a new
+  `squash_history_max_commits` setting (default `0`, off). Once the
+  branch's commit history grows past it, the periodic heal rewrites the
+  branch into a single commit that carries its whole current state:
+  GitHub gets a genuine parentless orphan commit, GitLab -- whose commits
+  API cannot create one -- a commit forced onto the history's oldest
+  ancestor that replays the current state. Git backends keep every
+  deleted blob alive for as long as a commit references it, so an
+  unbounded history grows the repository's storage (and the cost of a
+  fresh clone of it) forever; with the squash the old history loses its
+  reference and the backend's garbage collection reclaims the blobs. Set
+  it on any store, primary or mirror; a single primary metadata store
+  alone is enough. A history whose tree walks truncated refuses to
+  squash, and a store that cannot be squashed is logged and skipped, so
+  the heal worker retries on the next round.
+- Metadata pushes are configurable per file system (``metadata_push:
+  {mode, window_ms, parallel_stores}``). The default ``mode: coalesced``
+  merges the pushes of operations that run within one window (300 ms) into
+  a single store write: deleting a folder over SFTP -- the protocol names
+  one file at a time, so every removal pushed the whole tree to the
+  mirrors -- now pays one mirror sync for the burst instead of one per
+  file. The callers of a coalesced push still wait for the write that
+  covers them; a push that fails is logged and caught up by the heal
+  worker instead of failing operations whose local changes are already
+  real. ``mode: inline`` restores the previous behaviour. With
+  ``parallel_stores: true`` (the default) the primary and the mirrors are
+  written at the same time, so a push lasts for the slowest store instead
+  of the sum of all of them.
+- The GitLab tree mirrors read the blobs a full-tree sync needs (the
+  content GitLab commits alongside its actions) concurrently; the new
+  ``blob_fetch_concurrency`` setting (default `8`, like the GitHub
+  equivalent) turns a catch-up sync over thousands of blobs from a chain
+  of round trips into a handful of parallel ones.
+
 ### Fixed
 
+- Starting up now reads only the metadata store that holds the most recent
+  tree instead of reading every store. Git stores date their tree with
+  their branch head, and that head is two small GETs away -- so the boot
+  probes every store's head first and reads only the winner (the primary
+  preferred on a tie: exactly what reading and comparing every store used
+  to conclude). A store whose probe fails counts as gone for this boot and
+  is marked stale for the heal instead of being read, a store that holds
+  nothing boots the fresh installation as before, and a store that cannot
+  date itself cheaply (a pinned message or a document store) falls back to
+  the unconditional read. A rate-limited GitLab mirror could hold the boot
+  for a first wave of listing retries before anything was served; now one
+  cheap probe either answers or skips the store.
+- A git-backed metadata store keeps a local snapshot of its last tree
+  listing, keyed to the head it was listed at. A boot that sees the same
+  head serves the tree from that snapshot: the listing has not changed, so
+  the hundreds of paginated GETs -- and the 429 waits a slow backend adds
+  to each of them -- are paid only when the branch actually moved. A
+  missing, unreadable or stale snapshot just makes the boot list the tree
+  the old way.
+- The GitLab facade publishes every 429's prescribed wait to all the
+  requests of one project. Requests that each burned their own retry
+  budget against the same limiter at the same moment sustained the limit
+  through wave after wave of bursts; every send now holds off until the
+  longest pause asked for has passed, so a concurrent listing pool that
+  hits the limit crawls instead of storming it.
+- Starting up no longer waits for the first full metadata write. ``init()``
+  loaded the trees of every store one after another and then synchronously
+  pushed the winner back into all of them (mirrors that missed something get
+  a full sync), so the SFTP server came up only after the slowest store
+  finished its catch-up -- measured: a boot of over 15 minutes, most of it a
+  GitLab mirror's paginated listing of an 81k-entry tree plus its 429 waits.
+  The first push now runs as a background task: the boot has a loaded,
+  readable tree, that is all serving reads needs, the heal worker makes the
+  same write a moment later, and a failing startup push is logged and caught
+  up by the heal instead of holding the server. Shutdown cancels a push that
+  is still running.
+- The Discord bots of a file system log in concurrently instead of one after
+  another (about two seconds of handshake per bot, half a minute for eleven).
+  A failed login still closes the bots that did make it in.
+- Paginated GitLab listings fetch their pages concurrently: GitLab reports
+  the total page count, so the pages beyond the first are requested at once
+  (bounded by ``blob_fetch_concurrency``) instead of one round trip -- and
+  one 429 wait -- at a time, which alone took a quarter hour of boot for the
+  812-page tree listing above.
+- A boot no longer crashes when the startup write of the metadata fails
+  for every store while a tree could be read from one of them. The
+  previous behaviour raised "Writing the metadata failed for every
+  store" out of ``init()`` and took the server down, which let one
+  store's transient outage (a rate limit, a repository that answered
+  slower than the write) stop the whole file system even though its
+  metadata was loaded and readable. The failures are now logged, the
+  failed stores stay marked stale, and the periodic heal re-syncs them.
+  A boot with no readable tree at all still refuses to start.
+- The full metadata sync onto a GitHub tree store no longer refuses a
+  repository whose recursive tree listing GitHub truncates (over 100,000
+  entries or 7 MB -- a size a busy metadata repo passes permanently, so
+  refusing meant the store never healed again). The sync now rebuilds
+  the listing one directory at a time, the same fallback the loading
+  path already used, and only refuses when even a single directory's
+  tree comes back truncated.
+- The GitLab metadata facade waits out HTTP 429 rate limits instead of
+  failing the request: it retries on the wait GitLab prescribes
+  (``Retry-After``, capped), or on a doubling backoff when none is
+  given, a few times before raising. A full-tree sync fires enough
+  requests in a burst to hit the usage quota, and one un-retried 429
+  failed the whole store write at boot.
+- Directory metadata deletes and moves no longer rewrite the whole
+  metadata tree. Deleting a folder over SFTP re-sent every blob it kept
+  as tree elements, and moving one re-sent them under a new prefix: on a
+  grown metadata repository a single request exceeded GitHub's "your
+  input was too large" processing limit (one sync of an 80k-entry store
+  answered with it until one landed after 26 minutes), and the whole
+  rewrite with it. Both now overwrite their path on top of the branch's
+  current tree with an overlay commit that names only the entries on it,
+  and a delta larger than one request arrives in chunks of at most 1000
+  elements chained by base tree with the branch moved once at the end.
+  The full sync commits its diff the same chunked way.
+- The GitLab metadata facade re-read the branch's whole recursive tree
+  (hundreds of paginated GETs on a grown repository) to diff every
+  overlay commit: each file drop, each stats commit, every sync chunk
+  paid that again, the rate limits it hit while doing so added 30 s
+  waits (measured: a single-file delete alone took 18 minutes), and
+  cumulative 429 retries on a big folder delete stretched it into hours.
+  The branch's listing is now cached and keyed to its head commit: comes
+  free, writes that land through the repository fold their actions back
+  in and files-API writes refresh the head once, and a write from
+  elsewhere invalidates the cache with one re-read.
+- Deleting a file through the protocols no longer leases out its own
+  metadata commit per file. SFTP and WebDAV name one removal at a time,
+  so a folder with 20k files used to pay two repository API calls per
+  file in the coalesced window (one to delete the blob, one to advance
+  the ref). The deletions a window collects now land as one overlay
+  commit that removes every path at once (flushed when 100 files or 5
+  seconds have accumulated); a failed flush is re-queued and caught up
+  by the next push, and a missing branch (a store not yet synced) is
+  simply dropped from the queue.
+- A GitLab metadata mirror that could not do the work (its storage backend
+  answering "Deadline Exceeded"/"Stream removed" after the full request
+  timeout, or the connection dying) no longer holds every file operation
+  up. Every push writes the full metadata tree to the mirrors, so deleting
+  a file with a failing GitLab mirror cost its request timeout per removal
+  -- measured: minutes per file, days for a folder. The GitLab tree mirror
+  is now behind the same circuit breaker as the GitHub ones: transport
+  failures and such deadline answers trip it, every further call is
+  refused immediately (the store is marked stale and the heal worker
+  catches it up later, as before), and a cheap background probe alone
+  waits until GitLab answers again. One failing write pays the timeout
+  once; after that an escalating probe back-off (twice the cooldown per
+  consecutive trip, up to sixteen times) keeps re-tries of a mirror
+  whose reads answer but whose writes keep deadlining rare, so a
+  permanently broken mirror costs one write timeout per escalating
+  interval instead of nearly constantly.
+- A full metadata sync onto the GitLab tree mirror now arrives as a
+  series of commits of at most 500 actions instead of one commit for the
+  whole tree. GitLab applies a commit's actions in a single storage
+  operation, and the batches of a tree with thousands of entries exceeded
+  that operation's own deadline ("4:Stream removed (Deadline
+  Exceeded)") every time, no matter which repository or access token the
+  mirror used -- the reason a healthy-looking GitLab mirrored nothing.
+  The actions of one sync never name a path twice, so the capped commits
+  land cleanly one after the other; a sync that stops in between leaves
+  the store stale and the next push re-syncs it, as before.
 - The file data of a replicated file system now heals itself the way the
   metadata does. With ``sync: tee`` a mirror write that failed (a mirror
   store being temporarily down, for instance) was detected and the file's

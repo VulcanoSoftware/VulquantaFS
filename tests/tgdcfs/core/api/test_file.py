@@ -838,7 +838,28 @@ class TestFileApi:
         ]
         mock_file_desc_api.get_file_desc.return_value = fd
 
-        await file_api.rm(fr)
+        await file_api.rm(fr, defer_metadata=True)
 
+        mock_metadata_api.defer_removal.assert_not_called()
+        mock_file_desc_api.get_file_desc.assert_awaited_once_with(fr, validate=False)
         deleted_ids = mock_message_api.delete_messages.call_args[0][0]
         assert sorted(deleted_ids) == [123, 200, 201]
+
+    async def test_metadata_only_remove_never_fetches_file_descriptor(
+        self, mock_metadata_api, mock_message_api, mock_file_desc_api
+    ):
+        mock_message_api.deletes_on_remove = False
+        api = FileApi(
+            mock_metadata_api,
+            mock_file_desc_api,
+            mock_message_api,
+            cleanup_local_versions=False,
+        )
+        root = TGFSDirectory.root_dir()
+        ref = root.create_file_ref("keep-the-messages", 123)
+
+        await api.rm(ref)
+
+        assert root.find_files() == []
+        mock_metadata_api.push.assert_awaited_once()
+        mock_file_desc_api.get_file_desc.assert_not_awaited()

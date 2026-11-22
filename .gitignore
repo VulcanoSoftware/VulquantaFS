@@ -7,3 +7,9 @@ sftp_host_key.pub
 dist/
 coverage.xml
 .coverage
+
+# Local runtime caches of the metadata stores (the test data dir is the checkout)
+dir-timestamps-*.json
+.dir-timestamps-*
+tree-snapshot-*.json
+.tree-snapshot-*

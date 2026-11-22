@@ -1,3 +1,4 @@
+import asyncio
 from typing import Any, Dict
 
 import pytest
@@ -109,14 +110,24 @@ class TestMain:
                 },
             }
         )
-        mocker.patch("main.telegram.login", mocker.AsyncMock())
         bots = [mocker.Mock()]
-        login = mocker.patch("main.discord.login", mocker.AsyncMock(return_value=bots))
+        discord_started = asyncio.Event()
+
+        async def telegram_login(cfg):
+            await discord_started.wait()
+            return mocker.Mock()
+
+        async def discord_login(cfg):
+            discord_started.set()
+            return bots
+
+        mocker.patch("main.telegram.login", side_effect=telegram_login)
+        login = mocker.patch("main.discord.login", side_effect=discord_login)
         create = mocker.patch(
             "main.discord.create_store", mocker.AsyncMock(return_value="store")
         )
 
-        factory = await create_store_factory(config)
+        factory = await asyncio.wait_for(create_store_factory(config), timeout=2)
         result = await factory(config.stores["dc-mirror"])
 
         login.assert_awaited_once_with(config)
