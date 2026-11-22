@@ -4,7 +4,9 @@
 // ``backends``, ``stores`` and ``filesystems``, and the tgfs layout with a
 // top-level ``telegram`` block, ``private_file_channel``, ``tgfs.metadata``
 // keyed by channel and ``telegram.redundancy``, which is translated into
-// stores and file systems the same way the loader does it. Anything the
+// stores and file systems the same way the loader does it. Configs written
+// for earlier releases are recognized by their top-level block name:
+// ``tgdcfs`` and ``tgfs`` are read as ``vulquantafs``. Anything the
 // form has no field for is reported in ``notes`` instead of being dropped
 // silently.
 
@@ -562,15 +564,22 @@ export const importConfig = (text: string): ImportedConfig => {
   const notes = new Notes();
   const config = defaultConfig();
 
-  // The application block: ``vulquantafs``, or ``tgfs`` from before the rename.
+  // The application block: ``vulquantafs``, or the block name the file
+  // was written under before a rename (``tgdcfs``, then ``tgfs``).
   let app: Mapping;
   if (isMapping(doc.vulquantafs)) {
     app = doc.vulquantafs;
+  } else if (isMapping(doc.tgdcfs)) {
+    app = doc.tgdcfs;
+    notes.add("The top-level block 'tgdcfs' was read as 'vulquantafs'");
   } else if (isMapping(doc.tgfs)) {
     app = doc.tgfs;
     notes.add("The top-level block 'tgfs' was read as 'vulquantafs'");
   } else {
-    throw new Error("The configuration block 'vulquantafs' is missing");
+    throw new Error(
+      "The configuration block 'vulquantafs' is missing " +
+        "(configs saved as 'tgdcfs' or 'tgfs' are read automatically)"
+    );
   }
 
   const legacyLayout = !("stores" in doc) && !("filesystems" in doc);
@@ -581,6 +590,7 @@ export const importConfig = (text: string): ImportedConfig => {
     "stores",
     "filesystems",
     "vulquantafs",
+    "tgdcfs",
     "tgfs",
     "telegram",
   ]);
