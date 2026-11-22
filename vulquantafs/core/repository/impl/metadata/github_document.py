@@ -53,12 +53,19 @@ def _is_sha_missing(ex: Exception) -> bool:
 
 
 class GithubDocumentMetadataRepository(IMetaDataRepository):
-    def __init__(self, config: GithubRepoConfig, blob_key: Optional[bytes] = None):
+    def __init__(
+        self,
+        config: GithubRepoConfig,
+        blob_key: Optional[bytes] = None,
+        legacy_blob_key: Optional[bytes] = None,
+    ):
         super().__init__()
         self._config = config
         # AES-256-GCM key for the blob when at-rest encryption is enabled;
-        # ``None`` stores the document as plain JSON.
+        # ``None`` stores the document as plain JSON. The legacy key opens
+        # blobs left behind by tgdcfs before the rebrand.
         self._blob_key = blob_key
+        self._legacy_blob_key = legacy_blob_key
         # Lazy: the repository completes on the first API call (which runs
         # in ``asyncio.to_thread``), so construction stays off the network
         # and an unreachable GitHub surfaces as this store's read error --
@@ -109,7 +116,9 @@ class GithubDocumentMetadataRepository(IMetaDataRepository):
         try:
             text = base64.b64decode(content.content).decode()
             if self._blob_key is not None:
-                text = decrypt_metadata_blob(self._blob_key, text).decode()
+                text = decrypt_metadata_blob(
+                    self._blob_key, text, legacy_key=self._legacy_blob_key
+                ).decode()
             return TGFSMetadata.from_dict(json.loads(text))
         except TechnicalError:
             raise

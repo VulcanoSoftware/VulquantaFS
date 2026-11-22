@@ -7,6 +7,7 @@ import json
 from unittest.mock import Mock, patch
 
 import pytest
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from github import Github, GithubException
 
 from vulquantafs.config import GithubRepoConfig
@@ -15,6 +16,8 @@ from vulquantafs.core.repository.impl.metadata.github_document import (
     GithubDocumentMetadataRepository,
 )
 from vulquantafs.crypto.metadata_blob import (
+    LEGACY_ENCRYPTED_BLOB_PREFIX,
+    derive_legacy_metadata_blob_key,
     derive_metadata_blob_key,
     encrypt_metadata_blob,
 )
@@ -45,12 +48,14 @@ def content_file(text: str, sha: str = "docsha") -> Mock:
     return content
 
 
-def repository(mock_repo: Mock, cfg=None, blob_key=None):
+def repository(mock_repo: Mock, cfg=None, blob_key=None, legacy_blob_key=None):
     with patch(
         "vulquantafs.core.repository.impl.metadata.github_document.Github", spec=Github
     ) as gh_cls:
         gh_cls.return_value.get_repo.return_value = mock_repo
-        repo = GithubDocumentMetadataRepository(cfg or config(), blob_key=blob_key)
+        repo = GithubDocumentMetadataRepository(
+            cfg or config(), blob_key=blob_key, legacy_blob_key=legacy_blob_key
+        )
     return repo
 
 
@@ -82,6 +87,28 @@ class TestGet:
             encrypt_metadata_blob(key, document(sample_tree()).encode())
         )
         repo = repository(mock_repo, blob_key=key)
+
+        metadata = await repo.get()
+
+        assert metadata.dir.find_dir("docs").find_file("readme").message_id == 42
+
+    async def test_a_document_left_behind_by_tgdcfs_is_decrypted(self):
+        master = b"k" * 32
+        import os
+
+        nonce = os.urandom(12)
+        sealed = nonce + AESGCM(derive_legacy_metadata_blob_key(master)).encrypt(
+            nonce, document(sample_tree()).encode(), None
+        )
+        text = LEGACY_ENCRYPTED_BLOB_PREFIX + base64.urlsafe_b64encode(sealed).decode()
+
+        mock_repo = Mock()
+        mock_repo.get_contents.return_value = content_file(text)
+        repo = repository(
+            mock_repo,
+            blob_key=derive_metadata_blob_key(master),
+            legacy_blob_key=derive_legacy_metadata_blob_key(master),
+        )
 
         metadata = await repo.get()
 

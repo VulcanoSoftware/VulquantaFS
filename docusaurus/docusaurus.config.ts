@@ -8,12 +8,14 @@ import type * as Preset from '@docusaurus/preset-classic';
 // fork publishes its own docs without editing this file.
 const [owner, repo] = (process.env.GITHUB_REPOSITORY || 'Xyvran/vulquantafs').split('/');
 const ownerLower = owner.toLowerCase();
-const repoLower = repo.toLowerCase();
+// GitHub Pages serves under the repository's exact name, capitals
+// included: /VulquantaFS/ answers and the all-lowercase spelling is a 404.
+// Docker Hub namespaces are the exception -- those are always lowercase.
 const pagesHost = `https://${ownerLower}.github.io`;
-const pagesUrl = `${pagesHost}/${repoLower}`;
+const pagesUrl = `${pagesHost}/${repo}`;
 const dockerHubNamespace = (process.env.DOCKERHUB_NAMESPACE || ownerLower).toLowerCase();
 
-const baseUrl = process.env.DOCS_BASE_URL || `/${repoLower}/docs/`;
+const baseUrl = process.env.DOCS_BASE_URL || `/${repo}/docs/`;
 
 const config: Config = {
   title: 'VulquantaFS',

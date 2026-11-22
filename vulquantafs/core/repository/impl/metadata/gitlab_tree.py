@@ -1338,6 +1338,7 @@ class GitlabTreeRepoMetadataRepository(GithubRepoMetadataRepository):
         config: GitlabRepoConfig,
         name_key: Optional[bytes] = None,
         blob_key: Optional[bytes] = None,
+        legacy_blob_key: Optional[bytes] = None,
     ):
         raw = GitlabRepository(config, wait_on_rate_limit=False)
         # Like its GitHub sibling, behind a fail-fast wrapper: GitLab that
@@ -1351,6 +1352,9 @@ class GitlabTreeRepoMetadataRepository(GithubRepoMetadataRepository):
         self._gitlab_breaker = StoreCircuitBreaker(raw.probe)
         self._gitlab = cast(Any, FailFastRepository(raw, self._gitlab_breaker))
         self._blob_key = blob_key
+        # Opens the single-document layout a tgdcfs release may have left
+        # behind, sealed with the pre-rebrand derivation.
+        self._legacy_blob_key = legacy_blob_key
         self._document_path = config.file_path
         # Set once the document is confirmed gone (or never existed), so
         # the cleanup costs one request per process at most.
@@ -1428,7 +1432,9 @@ class GitlabTreeRepoMetadataRepository(GithubRepoMetadataRepository):
             if document is not None:
                 try:
                     text = (
-                        decrypt_metadata_blob(self._blob_key, document).decode()
+                        decrypt_metadata_blob(
+                            self._blob_key, document, legacy_key=self._legacy_blob_key
+                        ).decode()
                         if self._blob_key is not None
                         else document
                     )

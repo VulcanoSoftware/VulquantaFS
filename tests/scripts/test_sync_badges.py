@@ -44,7 +44,7 @@ def sync(repository: str, text: str, branch: str = "master", namespace: str = ""
 
 def test_a_fork_repoints_the_pages_and_docker_hub_links():
     synced = sync("some-owner/VulquantaFS", README_SAMPLE)
-    assert "https://some-owner.github.io/vulquantafs/docs/" in synced
+    assert "https://some-owner.github.io/VulquantaFS/docs/" in synced
     assert "https://hub.docker.com/r/some-owner/vulquantafs" in synced
     assert "https://github.com/some-owner/VulquantaFS/actions" in synced
 
@@ -57,7 +57,7 @@ def test_a_renamed_repository_heals_lowercase_pages_links():
 def test_a_mixed_case_repo_name_is_normalized_to_the_pages_spelling():
     text = README_SAMPLE.replace(".github.io/vulquantafs", ".github.io/VulquantaFS")
     synced = sync("some-owner/VulquantaFS", text)
-    assert "https://some-owner.github.io/vulquantafs/docs/" in synced
+    assert "https://some-owner.github.io/VulquantaFS/docs/" in synced
 
 
 def test_a_docker_namespace_variable_overrides_the_owner():
