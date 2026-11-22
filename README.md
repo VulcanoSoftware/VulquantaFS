@@ -9,7 +9,7 @@
 
 <div align="center">
 
-# Vulquantafs
+# VulquantaFS
 
 Telegram and Discord as storage backends behind one WebDAV and SFTP
 server.
