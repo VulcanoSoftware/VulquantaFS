@@ -224,10 +224,12 @@ class MetaDataApi:
 
         The heal worker calls this on a fixed interval, with one store or
         with several; a store that is up to date and has no maintenance
-        configured costs a pass that does nothing.
+        configured costs a pass that does nothing. No global write lock
+        here: the stores order themselves, and a slow re-sync of one
+        store must not make every concurrent push wait behind it (a File
+        Zilla gives up after 20 s of nothing).
         """
-        async with self.__write_lock:
-            await self.__metadata_repo.heal()
+        await self.__metadata_repo.heal()
         try:
             await self.__metadata_repo.maintain()
         except Exception as ex:

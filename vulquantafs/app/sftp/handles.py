@@ -197,6 +197,7 @@ class WriteHandle(Handle):
         buffer_dir: Optional[str] = None,
         max_gap_bytes: int = DEFAULT_MAX_AHEAD_GAP_BYTES,
         wait_disconnected: Optional[Callable[[], Awaitable[None]]] = None,
+        owns_reservation: bool = False,
     ):
         self._ops = ops
         self._path = path
@@ -204,6 +205,12 @@ class WriteHandle(Handle):
         self._buffer_dir = buffer_dir
         self._max_gap_bytes = max_gap_bytes
         self._wait_disconnected = wait_disconnected
+        # True when the open itself created the file (the name reservation
+        # an SFTP open performs), so an upload dropped before its first
+        # byte can leave no empty file behind: without this, every retry
+        # of a timed-out bulk transfer runs into the client's
+        # "target file already exists" prompt over a zero-byte leftover.
+        self._owns_reservation = owns_reservation
 
         self._queue: Optional[asyncio.Queue[Optional[bytes]]] = None
         self._task: Optional[asyncio.Task] = None
@@ -310,9 +317,30 @@ class WriteHandle(Handle):
             raise
 
     async def abort(self) -> None:
-        """Drop the upload without touching the stored file."""
+        """Drop the upload without touching the stored file.
+
+        When the file only exists because this handle's open reserved the
+        name and not one byte of the (real) upload arrived, the
+        reservation is removed again: the client cancelled it, so the
+        tree should look as it did before the open. The server answers a
+        cancelled transfer's `discard/retry` prompts over a 0-byte file
+        otherwise.
+        """
         async with self._lock:
             await self._abort_locked()
+            if not (self._owns_reservation and self._size == 0):
+                return
+            self._owns_reservation = False
+        try:
+            await self._ops.rm_file(self._path, defer_metadata=True)
+            logger.info(
+                "Removed the empty reservation of %s after an aborted upload",
+                self._path,
+            )
+        except Exception as ex:
+            logger.debug(
+                "Could not remove the empty reservation of %s: %s", self._path, ex
+            )
 
     async def _abort_locked(self) -> None:
         """:meth:`abort` for a caller that already holds the lock."""
