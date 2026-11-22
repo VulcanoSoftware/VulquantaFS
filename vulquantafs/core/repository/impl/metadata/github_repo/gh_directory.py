@@ -38,6 +38,14 @@ PUT_RETRY_DELAY = 1.5
 DEFERRED_PUT_ATTEMPTS = 10
 DEFERRED_PUT_RETRY_DELAY = 5
 
+# The deferred creates are committed in batches: the first wait collects the
+# co-arrivals (an SFTP client opens several files side by side), the rounds
+# after it run back to back, while the bulk upload keeps the queue filled, so
+# the drain keeps up with any client instead of falling behind by one commit
+# per file -- the queue that once grew past ten pushed the opens over
+# FileZilla's 20-second timeout.
+DEFERRED_COMMIT_WINDOW = 1.0
+
 # GitHub refuses a tree whose request carries a whole repository: the
 # rewrites sent every blob as an element and large metadata repositories
 # came back "Sorry, your request timed out.  It's likely that your input
@@ -119,6 +127,22 @@ def _is_sha_missing(ex: Exception) -> bool:
 
 
 @dataclass
+class _PendingRef:
+    """A deferred file reference create whose blob still has to land.
+
+    The in-memory tree already lists the reference; only the repo blob
+    waits. ``directory`` is where its in-tree membership is re-checked at
+    commit time, so a delete or rename that landed meanwhile wins.
+    """
+
+    directory: "GithubDirectory"
+    name: str
+    file_message_id: int
+    file_ref: TGFSFileRef
+    attempts: int = 0
+
+
+@dataclass
 class GithubConfig:
     gh: Github
     repo_name: str
@@ -146,6 +170,21 @@ class GithubConfig:
         repr=False,
     )
     pending_drops_since: float = 0.0
+    # File-reference creates scheduled for the batched background write
+    # (``create_file_ref_deferred``). Touched on the event loop only; the
+    # drain empties it one ``lock``-covered commit at a time.
+    pending_refs: list[_PendingRef] = field(
+        default_factory=list,
+        compare=False,
+        repr=False,
+    )
+    # The background drain committing ``pending_refs``; ``None`` while
+    # there is nothing to commit.
+    pending_refs_flusher: Optional[asyncio.Task[None]] = field(
+        default=None,
+        compare=False,
+        repr=False,
+    )
     # GitLab commits file actions rather than native Git tree overlays.
     delete_subtree: Optional[Callable[[str, bool], int]] = field(
         default=None, compare=False, repr=False
@@ -182,6 +221,118 @@ class GithubConfig:
         """Run the blocking GitHub write ``fn`` off the event loop, after
         the writes queued before it."""
         return await asyncio.get_running_loop().run_in_executor(self.writer, fn, *args)
+
+    def schedule_ref(self, entry: _PendingRef) -> None:
+        """Queue a deferred create for the background drain, pool per
+        repo."""
+        self.pending_refs.append(entry)
+        if self.pending_refs_flusher is None or self.pending_refs_flusher.done():
+            self.pending_refs_flusher = asyncio.get_running_loop().create_task(
+                self._drain_pending_refs(), name="github-file-refs"
+            )
+
+    async def _drain_pending_refs(self) -> None:
+        # One commit per batch, not per reference: a bulk upload schedules
+        # a create for every file it opens, and one-at-a-time commits fell
+        # behind the client, until the queued batched flushes at the back
+        # of the same lock held the metadata push of the open itself --
+        # for longer than the client waits.
+        await asyncio.sleep(DEFERRED_COMMIT_WINDOW)
+        while self.pending_refs:
+            if await self._commit_pending_refs():
+                await asyncio.sleep(DEFERRED_PUT_RETRY_DELAY)
+
+    async def _commit_pending_refs(self) -> bool:
+        """Commit the queued creates. ``True`` when some of them need
+        another round."""
+        batch = self.pending_refs
+        self.pending_refs = []
+        async with self.lock:
+            alive = [
+                entry
+                for entry in batch
+                if any(ref is entry.file_ref for ref in entry.directory.files)
+            ]
+            if not alive:
+                return False
+            if len(alive) == 1:
+                entry = alive[0]
+                try:
+                    await self.write(
+                        entry.directory._put_file_ref,
+                        entry.name,
+                        entry.file_message_id,
+                    )
+                    return False
+                except Exception as ex:
+                    if self._retry(entry, ex):
+                        self.pending_refs.append(entry)
+                    return True
+            try:
+                await self.write(
+                    _put_file_refs,
+                    self.repo,
+                    self.commit,
+                    [
+                        (
+                            entry.directory._ref_storage_path(
+                                entry.name, entry.file_message_id
+                            ),
+                            entry.directory._message_name(entry.name),
+                        )
+                        for entry in alive
+                    ],
+                )
+                logger.info(
+                    f"Created {len(alive)} file reference(s) in {self.repo_name}"
+                )
+                return False
+            except Exception as ex:
+                logger.warning(
+                    f"Committing {len(alive)} file reference(s) to "
+                    f"{self.repo_name} failed ({ex}); writing them one by one"
+                )
+            failures: list[tuple[_PendingRef, Exception]] = []
+            for entry in alive:
+                try:
+                    await self.write(
+                        entry.directory._put_file_ref,
+                        entry.name,
+                        entry.file_message_id,
+                    )
+                except Exception as ex:
+                    failures.append((entry, ex))
+            if not failures:
+                return False
+            self.pending_refs.extend(
+                entry for entry, ex in failures if self._retry(entry, ex)
+            )
+            return True
+
+    def _retry(self, entry: _PendingRef, ex: Exception) -> bool:
+        entry.attempts += 1
+        if entry.attempts >= DEFERRED_PUT_ATTEMPTS or not _is_transient(ex):
+            logger.error(
+                f"Failed to create file reference {entry.name} in "
+                f"{self.repo_name}: {ex}"
+            )
+            entry.directory.files.remove(entry.file_ref)
+            return False
+        logger.warning(
+            f"Creating file reference {entry.name} failed ({ex}); trying again"
+        )
+        return True
+
+
+def _put_file_refs(
+    repo: Repository, branch: str, refs: Sequence[tuple[str, str]]
+) -> None:
+    """Create a batch of empty file-reference blobs in one commit. Blocking;
+    raises when GitHub refuses."""
+    overlay = [
+        InputGitTreeElement(path, "100644", "blob", content="") for path, _ in refs
+    ]
+    commit_tree_overlay(repo, branch, overlay, f"Create {len(refs)} file reference(s)")
 
 
 class GithubDirectory(TGFSDirectory):
@@ -611,48 +762,34 @@ class GithubDirectory(TGFSDirectory):
         and with it the client's transfer -- hostage. A write that keeps
         failing is treated like a failing ``create_file_ref_async``: the
         reference leaves the tree and the error is logged.
+
+        The blob writes are batched: the creates scheduled while one write
+        runs land together in a tree commit, like the batched deletions
+        and the mirror sync do. One commit per file would queue whole
+        folders of creates behind the same lock during a bulk upload,
+        until the metadata push of the open itself waited too long.
         """
         file_ref = super().create_file_ref(name, file_message_id)
-        task = asyncio.create_task(
-            self._put_file_ref_patiently(name, file_message_id, file_ref),
-            name=f"github-file-ref-{name}",
+        entry = _PendingRef(
+            directory=self,
+            name=name,
+            file_message_id=file_message_id,
+            file_ref=file_ref,
         )
-        self._deferred_refs.add(task)
-        task.add_done_callback(self._deferred_refs.discard)
+        self._ghc.schedule_ref(entry)
+        if self._ghc.pending_refs_flusher is not None:
+            self._deferred_refs.add(self._ghc.pending_refs_flusher)
         return file_ref
 
-    async def _put_file_ref_patiently(
-        self, name: str, file_message_id: int, file_ref: TGFSFileRef
-    ) -> None:
-        for attempt in range(DEFERRED_PUT_ATTEMPTS):
-            try:
-                async with self._ghc.lock:
-                    # A delete or rename that waited for the lock took the
-                    # reference out of the tree; writing its blob anyway
-                    # would resurrect the deleted file after a restart.
-                    if not any(r is file_ref for r in self.files):
-                        return
-                    await self._ghc.write(self._put_file_ref, name, file_message_id)
-                return
-            except Exception as ex:
-                if attempt == DEFERRED_PUT_ATTEMPTS - 1 or not _is_transient(ex):
-                    logger.error(
-                        f"Failed to create file reference {name} in "
-                        f"{self._ghc.repo_name}: {ex}"
-                    )
-                    self.files.remove(file_ref)
-                    return
-                logger.warning(
-                    f"Creating file reference {name} failed ({ex}); trying again"
-                )
-                await asyncio.sleep(DEFERRED_PUT_RETRY_DELAY * (attempt + 1))
+    def _ref_storage_path(self, name: str, file_message_id: int) -> str:
+        return self.join_path(
+            self._github_path, self._file_ref_storage_name(name, file_message_id)
+        )
 
     def _put_file_ref(self, name: str, file_message_id: int) -> None:
         """Create the file reference blob in the repo (filename encrypted
         when keyed). Blocking; raises when GitHub refuses."""
-        file_path = self.join_path(
-            self._github_path, self._file_ref_storage_name(name, file_message_id)
-        )
+        file_path = self._ref_storage_path(name, file_message_id)
         for attempt in range(PUT_ATTEMPTS):
             try:
                 self._ghc.repo.create_file(
