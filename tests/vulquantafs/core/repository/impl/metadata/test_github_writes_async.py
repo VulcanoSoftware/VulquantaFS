@@ -313,6 +313,63 @@ class TestCreateFileRefDeferred:
         assert [r.name for r in a.files] == ["f"]
         assert fr.message_id == 1
 
+    async def test_a_burst_commits_in_one_tree_commit(self, ghc, monkeypatch):
+        """A bulk upload schedules a create per file it opens; they land in
+        one commit for the batch instead of one commit per reference."""
+        from vulquantafs.core.repository.impl.metadata.github_repo import gh_directory
+
+        calls: list[tuple[str, list[str]]] = []
+
+        def capture_overlay(repo, branch, overlay, message):
+            calls.append(
+                (message, [element._InputGitTreeElement__path for element in overlay])
+            )
+
+        monkeypatch.setattr(gh_directory, "commit_tree_overlay", capture_overlay)
+        directory = GithubDirectory(ghc, "d", None)
+
+        await asyncio.gather(
+            *(directory.create_file_ref_deferred(f"f{i}", i) for i in range(6))
+        )
+        await self._wait_for_background(directory)
+
+        ghc.repo.create_file.assert_not_called()
+        assert len(calls) == 1
+        message, paths = calls[0]
+        assert paths == sorted(f"f{i}.{i}" for i in range(6))
+        assert "6" in message
+        assert [r.name for r in directory.files] == [f"f{i}" for i in range(6)]
+
+    async def test_a_failed_batch_lands_one_by_one(self, ghc):
+        """A batch commit GitHub refuses must not lose any reference: the
+        round falls back to a create per reference."""
+        from github import GithubException
+
+        ghc.repo.get_git_ref.side_effect = GithubException(422, {}, {})
+        directory = GithubDirectory(ghc, "d", None)
+
+        await asyncio.gather(
+            *(directory.create_file_ref_deferred(f"f{i}", i) for i in range(3))
+        )
+        await self._wait_for_background(directory)
+
+        assert [r.name for r in directory.files] == ["f0", "f1", "f2"]
+        assert ghc.repo.create_file.call_count == 3
+
+    async def test_a_batch_that_gives_up_drops_its_references(self, ghc):
+        from github import GithubException
+
+        ghc.repo.get_git_ref.side_effect = GithubException(422, {}, {})
+        ghc.repo.create_file.side_effect = GithubException(404, {}, {})
+        directory = GithubDirectory(ghc, "d", None)
+
+        await asyncio.gather(
+            *(directory.create_file_ref_deferred(f"f{i}", i) for i in range(2))
+        )
+        await self._wait_for_background(directory)
+
+        assert len(directory.files) == 0
+
 
 class TestDeleteFileRefAsync:
     async def test_defers_the_blob_removal_to_the_next_push(self, ghc):
