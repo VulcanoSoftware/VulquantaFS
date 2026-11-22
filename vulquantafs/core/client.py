@@ -147,9 +147,13 @@ class Client:
         # metadata backend below.
         path_name_key: Optional[bytes] = None
         metadata_blob_key: Optional[bytes] = None
+        legacy_metadata_blob_key: Optional[bytes] = None
         if encryption_cfg is not None and encryption_cfg.enabled:
             from vulquantafs.crypto.bootstrap import load_master_key
-            from vulquantafs.crypto.metadata_blob import derive_metadata_blob_key
+            from vulquantafs.crypto.metadata_blob import (
+                derive_legacy_metadata_blob_key,
+                derive_metadata_blob_key,
+            )
             from vulquantafs.crypto.repository import EncryptingFileContentRepository
 
             master = load_master_key(encryption_cfg)
@@ -164,6 +168,9 @@ class Client:
 
                 path_name_key = derive_path_name_key(master.key)
             metadata_blob_key = derive_metadata_blob_key(master.key)
+            # The derivation tgdcfs sealed its metadata blobs with, so
+            # blobs written before the rebrand keep opening.
+            legacy_metadata_blob_key = derive_legacy_metadata_blob_key(master.key)
 
         fd_repo = StoreFDRepository(
             store,
@@ -191,6 +198,7 @@ class Client:
                 path_name_key,
                 metadata_blob_key,
                 encryption_cfg,
+                legacy_metadata_blob_key,
             )
         elif (
             metadata_cfg.type == MetadataType.PINNED_MESSAGE
@@ -213,7 +221,7 @@ class Client:
             )
         else:
             metadata_repo = cls._build_repo_metadata_repo(
-                metadata_cfg, path_name_key, metadata_blob_key
+                metadata_cfg, path_name_key, metadata_blob_key, legacy_metadata_blob_key
             )
 
         write_back = filesystem.write_ack == "cache" and cache is not None
@@ -332,6 +340,7 @@ class Client:
         cfg: MetadataConfig,
         path_name_key: Optional[bytes],
         metadata_blob_key: Optional[bytes],
+        legacy_blob_key: Optional[bytes] = None,
     ) -> IMetaDataRepository:
         """A git repository metadata store in its configured layout.
 
@@ -352,7 +361,9 @@ class Client:
                 )
 
                 return GithubDocumentMetadataRepository(
-                    cfg.github_repo, blob_key=metadata_blob_key
+                    cfg.github_repo,
+                    blob_key=metadata_blob_key,
+                    legacy_blob_key=legacy_blob_key,
                 )
             from vulquantafs.core.repository.impl.metadata.github_repo import (
                 GithubRepoMetadataRepository,
@@ -369,7 +380,9 @@ class Client:
             )
 
             return GitlabRepoMetadataRepository(
-                cfg.gitlab_repo, blob_key=metadata_blob_key
+                cfg.gitlab_repo,
+                blob_key=metadata_blob_key,
+                legacy_blob_key=legacy_blob_key,
             )
         from vulquantafs.core.repository.impl.metadata.gitlab_tree import (
             GitlabTreeRepoMetadataRepository,
@@ -379,6 +392,7 @@ class Client:
             cfg.gitlab_repo,
             name_key=path_name_key,
             blob_key=metadata_blob_key,
+            legacy_blob_key=legacy_blob_key,
         )
 
     @staticmethod
@@ -390,6 +404,7 @@ class Client:
         path_name_key: Optional[bytes],
         metadata_blob_key: Optional[bytes],
         encryption_cfg: Optional[EncryptionConfig],
+        legacy_blob_key: Optional[bytes] = None,
     ) -> IMetaDataRepository:
         """One primary plus the redundant metadata stores of a file system."""
         from vulquantafs.core.repository.impl.metadata.replicated import (
@@ -415,7 +430,7 @@ class Client:
                 )
             else:
                 repo = Client._build_repo_metadata_repo(
-                    cfg, path_name_key, metadata_blob_key
+                    cfg, path_name_key, metadata_blob_key, legacy_blob_key
                 )
             stores.append(MetadataStore(key=cfg.key, repo=repo, primary=i == 0))
         return ReplicatedMetadataRepository(

@@ -468,6 +468,27 @@ class TestConfig:
 
         assert config.vulquantafs.server.port == 8080
 
+    def test_from_dict_accepts_legacy_tgdcfs_block(self):
+        # A config written for tgdcfs names the application block
+        # ``tgdcfs``; it has to load as the ``vulquantafs`` block.
+        data = {
+            "telegram": {
+                "api_id": 12345,
+                "api_hash": "hash123",
+                "bot": {"token": "bot_token", "session_file": "bot.session"},
+                "private_file_channel": 123456,
+            },
+            "tgdcfs": {
+                "users": {},
+                "metadata": {"123456": {"name": "default", "type": "pinned_message"}},
+                "jwt": {"secret": "jwt_secret", "algorithm": "HS256", "life": 3600},
+                "server": {"host": "0.0.0.0", "port": 8080},
+            },
+        }
+        config = Config.from_dict(data)
+
+        assert config.vulquantafs.server.port == 8080
+
     def test_from_dict_prefers_vulquantafs_block_over_legacy(self):
         data = {
             "telegram": {

@@ -212,6 +212,8 @@ Main application parameters:
 
 ---
 
-### Config written for tgfs
+### Config written for tgfs or tgdcfs
 
 A `config.yaml` in the tgfs layout is translated on load: the top-level `tgfs:` block is read as `vulquantafs:` (deprecation warning), `telegram:` as `backends.telegram`, `telegram.private_file_channel` becomes the primary stores, `tgfs.metadata.<channel>` names each file system and `telegram.redundancy.mirrors` lists its mirrors. This layout cannot be combined with `stores`/`filesystems`.
+
+A config written for tgdcfs keeps its `tgdcfs:` block (deprecation warning) and loads exactly like one named `vulquantafs:`, in both layouts. Encrypted metadata documents (blobs) written by tgdcfs keep opening after the upgrade; new blobs are written with the current derivation.

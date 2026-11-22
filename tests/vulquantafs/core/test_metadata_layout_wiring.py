@@ -38,7 +38,7 @@ def metadata_config(**overrides) -> MetadataConfig:
 
 
 def build(cfg):
-    return Client._build_repo_metadata_repo(cfg, b"k" * 32, b"b" * 32)
+    return Client._build_repo_metadata_repo(cfg, b"k" * 32, b"b" * 32, b"l" * 32)
 
 
 class TestWiring:
@@ -62,7 +62,10 @@ class TestWiring:
             repo = build(metadata_config(github_repo=github_cfg(layout="document")))
 
         assert repo is sentinel
-        assert cls.call_args.kwargs == {"blob_key": b"b" * 32}
+        assert cls.call_args.kwargs == {
+            "blob_key": b"b" * 32,
+            "legacy_blob_key": b"l" * 32,
+        }
 
     def test_gitlab_tree_is_the_default(self):
         with patch(
@@ -75,6 +78,7 @@ class TestWiring:
         assert cls.call_args.kwargs == {
             "name_key": b"k" * 32,
             "blob_key": b"b" * 32,
+            "legacy_blob_key": b"l" * 32,
         }
 
     def test_gitlab_document_layout(self):
@@ -90,7 +94,10 @@ class TestWiring:
             )
 
         assert repo is sentinel
-        assert cls.call_args.kwargs == {"blob_key": b"b" * 32}
+        assert cls.call_args.kwargs == {
+            "blob_key": b"b" * 32,
+            "legacy_blob_key": b"l" * 32,
+        }
 
     def test_a_github_store_without_a_repo_config_is_rejected(self):
         cfg = MetadataConfig(name="m", type=MetadataType.GITHUB_REPO, github_repo=None)
