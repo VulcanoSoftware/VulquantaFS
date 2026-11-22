@@ -112,6 +112,84 @@ async def test_overlapping_pushes_share_one_write():
     assert repo.pushes == 1
 
 
+async def test_a_requested_push_writes_in_the_background():
+    repo = CountingRepo()
+    api = MetaDataApi(repo)
+    api.request_push()
+    await asyncio.sleep(0.01)
+    assert repo.pushes == 1
+
+
+async def test_a_requested_push_during_a_running_write_is_covered():
+    repo = GatedRepo()
+    api = MetaDataApi(repo)
+    waiter = asyncio.create_task(api.push())
+    await repo.entered.wait()
+    api.request_push()
+    repo.release.set()
+    await asyncio.wait_for(waiter, 2)
+    await asyncio.sleep(0.01)
+    assert repo.pushes == 2
+
+
+async def test_a_needed_push_does_not_wait_for_the_write():
+    repo = GatedRepo()
+    api = MetaDataApi(repo, push_mode="coalesced", push_window=0)
+    api.request_push()
+    # No await on the push: the request returns immediately.
+    assert not repo.entered.is_set()
+    repo.release.set()
+    await asyncio.wait_for(asyncio.sleep(0), 2)
+    await asyncio.sleep(0.01)
+    assert repo.pushes == 1
+
+
+async def test_a_needed_push_merges_into_the_running_window():
+    repo = CountingRepo()
+    api = MetaDataApi(repo, push_mode="coalesced", push_window=0.01)
+    waiter = asyncio.create_task(api.push())
+    await asyncio.sleep(0)
+    api.request_push()
+    # The request rides along with the window's write; it is real but
+    # never waited on.
+    await asyncio.wait_for(waiter, 2)
+    assert repo.pushes == 1
+
+
+async def test_a_needed_push_during_a_running_write_gets_its_own_write():
+    repo = GatedRepo()
+    api = MetaDataApi(repo, push_mode="coalesced", push_window=0)
+    api.request_push()
+    await repo.entered.wait()
+    api.request_push()
+    repo.release.set()
+    await asyncio.sleep(0.01)
+    assert repo.pushes == 2
+
+
+async def test_a_needed_push_does_not_hang_the_close():
+    repo = CountingRepo()
+    api = MetaDataApi(repo)
+    api.request_push()
+    await asyncio.sleep(0.01)
+    repo.pushes = 0
+    await api.close()
+
+
+async def test_close_flushes_a_needed_inline_write():
+    repo = GatedRepo()
+    api = MetaDataApi(repo)
+    api.request_push()
+    await repo.entered.wait()
+    # While a background write is under way the close still finishes and
+    # records the requested change.
+    closer = asyncio.create_task(api.close())
+    await asyncio.sleep(0.01)
+    repo.release.set()
+    await asyncio.wait_for(closer, 2)
+    assert repo.pushes >= 1
+
+
 async def test_window_zero_still_coalesces_one_loop_turn():
     repo = CountingRepo()
     api = MetaDataApi(repo, push_mode="coalesced", push_window=0)

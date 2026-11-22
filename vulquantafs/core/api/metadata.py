@@ -51,6 +51,9 @@ class MetaDataApi:
         self.__condition = asyncio.Condition()
         self.__pusher: Optional[asyncio.Task] = None
         self.__write_lock = asyncio.Lock()
+        self.__write_needed = 0
+        self.__write_pushed = 0
+        self.__write_worker: Optional[asyncio.Task] = None
         self.__removals = removal_journal
         self.__remove_checkpoint = 0
         self.__remove_worker: asyncio.Task[None] | None = None
@@ -169,6 +172,50 @@ class MetaDataApi:
             while self.__pushed < target:
                 await self.__condition.wait()
 
+    def request_push(self) -> None:
+        """Ask for a metadata write without waiting for it to land.
+
+        For call sites whose reply must not pay for the push: the change
+        is already real in the in-memory tree, and the write it needs is
+        the same one every other caller of that window wants. Waiting
+        here put an SFTP open behind mirror syncs and deferred-ref
+        commits it did not depend on, stalling opens for whole seconds
+        during bulk uploads.
+        """
+        if self.__batch_depth:
+            self.__pending = True
+            return
+        if self.__push_mode != "coalesced":
+            self.__schedule_write()
+            return
+        # The coalescer bookkeeping of ``push``, minus the wait: the
+        # pusher writes on wake and the landing is nobody's reply.
+        self.__needed += 1
+        self.__ensure_pusher()
+        self.__wake.set()
+
+    def __schedule_write(self) -> None:
+        # One worker at a time: a request that lands while a write is
+        # running raises the counter, and the running worker loops back
+        # for one more round instead of a second task racing the lock.
+        self.__write_needed += 1
+        if self.__write_worker is None or self.__write_worker.done():
+            self.__write_worker = asyncio.get_running_loop().create_task(
+                self.__write_logged()
+            )
+
+    async def __write_logged(self) -> None:
+        while True:
+            target = self.__write_needed
+            try:
+                await self.__write()
+            except Exception as ex:
+                logger.error(f"Pushing the metadata failed: {ex}")
+            self.__write_pushed = max(self.__write_pushed, target)
+            if self.__write_needed <= target:
+                return
+            await asyncio.sleep(0)
+
     def __ensure_pusher(self) -> None:
         if self.__pusher is None or self.__pusher.done():
             self.__pusher = asyncio.get_running_loop().create_task(self.__pusher_loop())
@@ -248,6 +295,21 @@ class MetaDataApi:
                 await pusher
             except asyncio.CancelledError:
                 pass
+        worker = self.__write_worker
+        self.__write_worker = None
+        if worker is not None and not worker.done():
+            worker.cancel()
+            try:
+                await worker
+            except asyncio.CancelledError:
+                pass
+        # A background write that a close caught up with is still real.
+        if self.__write_needed > self.__write_pushed:
+            self.__write_pushed = self.__write_needed
+            try:
+                await self.__write()
+            except Exception as ex:
+                logger.error(f"Pushing the metadata while closing failed: {ex}")
         # Flush a coalesced push whose window has not closed yet: the
         # operations that registered ahead of the close are real and have
         # to be recorded, whatever they are still worth.

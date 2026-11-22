@@ -405,7 +405,13 @@ class FileApi:
             fr = await where.create_file_ref_async(file_msg.name, resp.message_id)
         fr.mirrors = dict(resp.mirrors)
         fr.store = resp.store
-        await self._metadata_api.push()
+        if defer_file_ref:
+            # The reference exists in memory and is durable; the open must
+            # not wait out the push it did not ask for, or it queues
+            # behind the coalescer's mirror syncs and ref commits.
+            self._metadata_api.request_push()
+        else:
+            await self._metadata_api.push()
         await self.stats.record(fr, resp.fd)
         await self._written(fr, resp.fd)
         return resp.fd

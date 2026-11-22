@@ -268,6 +268,36 @@ class TestFileApi:
         assert result == mock_response.fd
 
     @pytest.mark.asyncio
+    async def test_deferred_create_new_file_asks_for_the_push_without_waiting(
+        self,
+        file_api,
+        mock_metadata_api,
+        mock_file_desc_api,
+        sample_directory,
+        sample_file_message,
+        mocker,
+    ):
+        mock_response = mocker.Mock()
+        mock_response.mirrors = {}
+        mock_response.message_id = 456
+        mock_response.fd = mocker.Mock(spec=TGFSFileDesc)
+        mock_file_desc_api.create_file_desc.return_value = mock_response
+        fr = mocker.Mock()
+        sample_directory.create_file_ref_deferred = mocker.AsyncMock(return_value=fr)
+        mock_metadata_api.request_push = mocker.Mock()
+
+        result = await file_api._create_new_file(
+            sample_directory, sample_file_message, defer_file_ref=True
+        )
+
+        sample_directory.create_file_ref_deferred.assert_called_once_with(
+            sample_file_message.name, mock_response.message_id
+        )
+        mock_metadata_api.request_push.assert_called_once_with()
+        mock_metadata_api.push.assert_not_called()
+        assert result == mock_response.fd
+
+    @pytest.mark.asyncio
     async def test_sync_file_ref_no_update(
         self, file_api, mock_metadata_api, sample_file_ref, mocker
     ):
