@@ -35,6 +35,10 @@ ENCRYPTED_BLOB_PREFIX = "VULQUANTAFSMETAV1_"
 # Blobs written before the rebrand carry this prefix; keep reading them.
 LEGACY_ENCRYPTED_BLOB_PREFIX = "TGDCFSMETAV1_"
 
+# tgdcfs sealed its blobs with a key derived from this info string, so the
+# pre-rebrand blobs only open with the legacy derivation.
+_LEGACY_HKDF_INFO = b"tgdcfs-metadata-blob-key-v1"
+
 _NONCE_BYTES = 12
 
 
@@ -55,6 +59,24 @@ def derive_metadata_blob_key(master_key: bytes) -> bytes:
     return hkdf.derive(master_key)
 
 
+def derive_legacy_metadata_blob_key(master_key: bytes) -> bytes:
+    """Derive the key tgdcfs sealed its ``TGDCFSMETAV1_`` blobs with."""
+    if len(master_key) != 32:
+        raise ValueError(f"master key must be 32 bytes, got {len(master_key)}")
+    hkdf = HKDF(
+        algorithm=hashes.SHA256(),
+        length=32,
+        salt=b"",
+        info=_LEGACY_HKDF_INFO,
+    )
+    return hkdf.derive(master_key)
+
+
+def _seal(key: bytes, sealed: bytes) -> bytes:
+    nonce, ciphertext = sealed[:_NONCE_BYTES], sealed[_NONCE_BYTES:]
+    return AESGCM(key).decrypt(nonce, ciphertext, None)
+
+
 def is_encrypted_metadata_blob(text: str) -> bool:
     return text.startswith((ENCRYPTED_BLOB_PREFIX, LEGACY_ENCRYPTED_BLOB_PREFIX))
 
@@ -68,11 +90,27 @@ def encrypt_metadata_blob(key: bytes, plaintext: bytes) -> str:
     return ENCRYPTED_BLOB_PREFIX + base64.urlsafe_b64encode(sealed).decode()
 
 
-def decrypt_metadata_blob(key: bytes, text: str) -> bytes:
-    """Open a blob produced by :func:`encrypt_metadata_blob`."""
+def decrypt_metadata_blob(
+    key: bytes, text: str, legacy_key: bytes | None = None
+) -> bytes:
+    """Open a blob produced by :func:`encrypt_metadata_blob` or by tgdcfs.
+
+    ``key`` opens blobs sealed with the current derivation;
+    ``legacy_key`` (from :func:`derive_legacy_metadata_blob_key`) opens
+    ``TGDCFSMETAV1_`` blobs written before the rebrand.
+    """
     if not is_encrypted_metadata_blob(text):
         # A plaintext document written while encryption was off.
         return text.encode()
+    if text.startswith(LEGACY_ENCRYPTED_BLOB_PREFIX):
+        if legacy_key is None:
+            raise MetadataBlobError(
+                "this metadata blob was written by tgdcfs and can only be "
+                "opened with the legacy blob key"
+            )
+        opened_key = legacy_key
+    else:
+        opened_key = key
     used_prefix = next(
         p
         for p in (ENCRYPTED_BLOB_PREFIX, LEGACY_ENCRYPTED_BLOB_PREFIX)
@@ -82,7 +120,6 @@ def decrypt_metadata_blob(key: bytes, text: str) -> bytes:
         sealed = base64.urlsafe_b64decode(text[len(used_prefix) :].encode())
         if len(sealed) < _NONCE_BYTES + 16:
             raise ValueError("blob too short")
-        nonce, ciphertext = sealed[:_NONCE_BYTES], sealed[_NONCE_BYTES:]
-        return AESGCM(key).decrypt(nonce, ciphertext, None)
+        return _seal(opened_key, sealed)
     except (ValueError, InvalidTag) as ex:
         raise MetadataBlobError(f"Could not decrypt the metadata blob: {ex}") from ex

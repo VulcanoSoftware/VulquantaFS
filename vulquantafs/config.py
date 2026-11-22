@@ -1643,11 +1643,16 @@ class Config:
 
     @classmethod
     def from_dict(cls, data: dict) -> "Config":
-        # A config written for tgfs keeps its ``tgfs:`` block name; it is
-        # read as the ``vulquantafs:`` block so existing installations load
-        # unchanged.
+        # A config written for tgdcfs or tgfs keeps its old block name; it
+        # is read as the ``vulquantafs:`` block so existing installations
+        # load unchanged.
         if "vulquantafs" in data:
             app_data = data["vulquantafs"]
+        elif "tgdcfs" in data:
+            logger.warning(
+                "The top-level config key 'tgdcfs' is deprecated, rename it to 'vulquantafs'"
+            )
+            app_data = data["tgdcfs"]
         elif "tgfs" in data:
             logger.warning(
                 "The top-level config key 'tgfs' is deprecated, rename it to 'vulquantafs'"

@@ -40,12 +40,19 @@ REQUEST_TIMEOUT_SECONDS = 60.0
 
 
 class GitlabRepoMetadataRepository(IMetaDataRepository):
-    def __init__(self, config: GitlabRepoConfig, blob_key: Optional[bytes] = None):
+    def __init__(
+        self,
+        config: GitlabRepoConfig,
+        blob_key: Optional[bytes] = None,
+        legacy_blob_key: Optional[bytes] = None,
+    ):
         super().__init__()
         self._config = config
         # AES-256-GCM key for the blob when at-rest encryption is enabled;
-        # ``None`` stores the document as plain JSON.
+        # ``None`` stores the document as plain JSON. The legacy key opens
+        # blobs left behind by tgdcfs before the rebrand.
         self._blob_key = blob_key
+        self._legacy_blob_key = legacy_blob_key
         self._session: Optional[aiohttp.ClientSession] = None
         # Whether the document exists in the repo; ``None`` until the first
         # successful read or write answered the question.
@@ -111,7 +118,9 @@ class GitlabRepoMetadataRepository(IMetaDataRepository):
         try:
             text = base64.b64decode(data["content"]).decode()
             if self._blob_key is not None:
-                text = decrypt_metadata_blob(self._blob_key, text).decode()
+                text = decrypt_metadata_blob(
+                    self._blob_key, text, legacy_key=self._legacy_blob_key
+                ).decode()
             return TGFSMetadata.from_dict(json.loads(text))
         except TechnicalError:
             raise
