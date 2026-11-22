@@ -1,6 +1,6 @@
 "use client";
 
-import { Add, ContentCopy, Download, Refresh } from "@mui/icons-material";
+import { Add, BugReport, ContentCopy, Download, Refresh } from "@mui/icons-material";
 import {
   Alert,
   AlertTitle,
@@ -41,6 +41,7 @@ import { LoadConfigButton } from "./components/LoadConfigButton";
 import { StoreField } from "./components/StoreField";
 import { UserField } from "./components/UserField";
 import { importConfig } from "./config-import";
+import { redactSecrets } from "./redact";
 import {
   CACHE_DEFAULTS,
   CacheConfig,
@@ -666,7 +667,7 @@ export default function ConfigGenerator() {
     return errors;
   };
 
-  const generateYaml = () => {
+  const buildConfigForYaml = () => {
     const stores: {
       [name: string]: { backend: string; channel: string };
     } = {};
@@ -900,20 +901,32 @@ export default function ConfigGenerator() {
       },
     };
 
-    return yaml.dump(configForYaml, { indent: 2 });
+    return configForYaml;
   };
 
-  const downloadConfig = () => {
-    const yamlContent = generateYaml();
+  const generateYaml = () => yaml.dump(buildConfigForYaml(), { indent: 2 });
+
+  const generateRedactedYaml = () =>
+    yaml.dump(redactSecrets(buildConfigForYaml()), { indent: 2 });
+
+  const downloadFile = (name: string, yamlContent: string) => {
     const blob = new Blob([yamlContent], { type: "text/yaml" });
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
     a.href = url;
-    a.download = "config.yaml";
+    a.download = name;
     document.body.appendChild(a);
     a.click();
     document.body.removeChild(a);
     URL.revokeObjectURL(url);
+  };
+
+  const downloadConfig = () => {
+    downloadFile("config.yaml", generateYaml());
+  };
+
+  const downloadRedactedConfig = () => {
+    downloadFile("config.redacted.yaml", generateRedactedYaml());
   };
 
   const copyToClipboard = () => {
@@ -2134,6 +2147,23 @@ export default function ConfigGenerator() {
               >
                 Copy to Clipboard
               </Button>
+              <Button
+                fullWidth
+                variant="outlined"
+                startIcon={<BugReport />}
+                onClick={downloadRedactedConfig}
+                sx={{ mb: 1 }}
+              >
+                Download redacted config
+              </Button>
+              <Typography
+                variant="body2"
+                color="text.secondary"
+                sx={{ mb: 1 }}
+              >
+                For bug reports: secrets are replaced with{' '}
+                <code>{"<redacted>"}</code>.
+              </Typography>
               <LoadConfigButton
                 fullWidth
                 onLoad={loadConfig}

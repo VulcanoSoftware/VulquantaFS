@@ -182,6 +182,36 @@ class TestWriteHandle:
 
         ops.upload_from_stream.assert_not_awaited()
 
+    async def test_an_aborted_reservation_with_no_bytes_is_removed(self, ops, mocker):
+        """The open reserved the name; the client then dropped the transfer
+        before its first byte. Without the removal the empty file stays
+        in the tree and every FileZilla retry asks over the 'target file
+        already exists' dialog."""
+        ops.rm_file = mocker.AsyncMock()
+        handle = WriteHandle(
+            ops, "/file.bin", buffer_max_bytes=1024, owns_reservation=True
+        )
+        await handle.abort()
+
+        ops.rm_file.assert_awaited_once_with("/file.bin", defer_metadata=True)
+
+    async def test_an_aborted_transfer_with_bytes_keeps_the_file(self, ops, mocker):
+        ops.rm_file = mocker.AsyncMock()
+        handle = WriteHandle(
+            ops, "/file.bin", buffer_max_bytes=1024, owns_reservation=True
+        )
+        await handle.write(0, b"partial")
+        await handle.abort()
+
+        ops.rm_file.assert_not_called()
+
+    async def test_an_aborted_upload_of_a_preexisting_file_keeps_it(self, ops, mocker):
+        ops.rm_file = mocker.AsyncMock()
+        handle = WriteHandle(ops, "/file.bin", buffer_max_bytes=1024)
+        await handle.abort()
+
+        ops.rm_file.assert_not_called()
+
     async def test_close_after_abort_does_not_upload(self, ops):
         handle = WriteHandle(ops, "/file.bin", buffer_max_bytes=1024)
         await handle.write(0, b"partial")

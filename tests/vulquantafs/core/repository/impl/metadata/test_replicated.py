@@ -415,7 +415,12 @@ class TestPush:
             await layer.push()
         assert layer.stale_stores() == ["mirror", "primary"]
 
-    async def test_a_recovered_store_is_retried_on_the_next_push(self):
+    async def test_a_stale_store_is_left_to_the_heal_worker(self):
+        """A store that just failed may answer slowly -- a rate limit's
+        cooldown, a full-tree re-sync over ten thousand files. A bulk
+        upload pushes metadata for every file: retried inline, one slow
+        re-sync would time out the clients (FileZilla gives up after
+        20 s of nothing). The heal worker re-writes the store instead."""
         primary = FakeMetadataRepo("primary")
         mirror = FakeMetadataRepo("mirror", push_full_error=TechnicalError("down"))
         layer = replicated(primary, mirror)
@@ -427,9 +432,27 @@ class TestPush:
         layer.metadata.dir.create_dir("b")
         await layer.push()
 
+        assert mirror.push_full_calls == 1
+        assert primary.stored is layer.metadata
+        assert layer.stale_stores() == ["mirror"]
+
+        await layer.heal()
+
         assert mirror.stored is layer.metadata
         assert layer.stale_stores() == []
-        assert mirror.push_full_calls == 2
+
+    async def test_every_store_stale_reports_a_meaningful_failure(self):
+        primary = FakeMetadataRepo("primary", push_error=TechnicalError("down"))
+        mirror = FakeMetadataRepo("mirror", push_full_error=TechnicalError("down"))
+        layer = replicated(primary, mirror)
+        layer.metadata = tree("a")
+
+        with pytest.raises(TechnicalError, match="failed for every store"):
+            await layer.push()
+        assert layer.stale_stores() == ["mirror", "primary"]
+
+        with pytest.raises(TechnicalError, match="every store awaits a re-sync"):
+            await layer.push()
 
 
 class TestTooLarge:
@@ -575,7 +598,9 @@ class TestStartupResilience:
             """A crash in the layer itself, outside the per-store writes
             that already report failure through the stale bookkeeping."""
 
-            async def push(self) -> None:
+            async def _push(
+                self, all_full: bool = False, include_stale: bool = False
+            ) -> None:
                 raise RuntimeError("exploded")
 
         layer = ExplodingLayer(
@@ -740,6 +765,47 @@ class TestProbedLoad:
 
 
 class TestHeal:
+    async def test_a_slow_heal_does_not_block_the_other_stores(self):
+        """The shape of the bulk upload over a rate-limited mirror: the
+        heal grinds through a full re-sync of the stale mirror while the
+        file system keeps pushing. The pushes must reach the healthy
+        stores without waiting the re-sync out."""
+
+        class BlockingMirror(FakeMetadataRepo):
+            """A mirror whose heal write never finishes until released."""
+
+            def __init__(self, name: str, *args, **kwargs):
+                super().__init__(name, *args, **kwargs)
+                self.release = asyncio.Event()
+
+            async def push_full(self) -> None:
+                self.push_full_calls += 1
+                if self.push_full_error is not None:
+                    raise self.push_full_error
+                await self.release.wait()
+
+        primary = FakeMetadataRepo("primary")
+        mirror = BlockingMirror("mirror", push_full_error=TechnicalError("down"))
+        layer = replicated(primary, mirror)
+        layer.metadata = tree("a")
+        await layer.push()
+        assert "mirror" in layer.stale_stores()
+
+        mirror.push_full_error = None
+        healed = asyncio.ensure_future(layer.heal())
+        await asyncio.sleep(0.05)
+        assert not healed.done()
+
+        layer.metadata.dir.create_dir("b")
+        await asyncio.wait_for(layer.push(), timeout=2)
+
+        assert primary.stored is layer.metadata
+        assert not healed.done()
+
+        mirror.release.set()
+        await healed
+        assert layer.stale_stores() == []
+
     async def test_heal_rewrites_only_the_stale_stores(self):
         primary = FakeMetadataRepo("primary")
         stale = FakeMetadataRepo("stale", push_full_error=TechnicalError("down"))

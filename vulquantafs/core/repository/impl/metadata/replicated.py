@@ -13,8 +13,10 @@ Behaviour:
 * Every ``push`` writes the primary store and then every mirror (all
   stores at once when ``concurrent_stores`` is set). A mirror that fails
   is logged, marked *stale* and skipped -- the write still succeeds as
-  long as one store holds the tree, and the next push writes the stale
-  store again.
+  long as one store holds the tree. Later pushes leave the stale store
+  alone (a store that just failed may answer slowly -- a rate limit's
+  cooldown, a full-tree re-sync over ten thousand files -- and a bulk
+  upload must never wait it out), the periodic heal re-writes it.
 * ``init`` loads the tree from the primary; when the primary cannot be
   read (store down, repository unreachable) it fails over to the first
   mirror that holds one. A store that holds no document at all counts as
@@ -106,7 +108,10 @@ class ReplicatedMetadataRepository(IMetaDataRepository):
         self._skipped: dict[str, str] = {}
         # The boot's first push, once init() has run; see init().
         self._initial_push: Optional[asyncio.Task] = None
-        self._writes = asyncio.Lock()
+        # One write at a time per store: an ordinary push, the journal
+        # flush and the heal may all want the same store. Two pushes hold
+        # the same shared tree object, so their order is without effect.
+        self._store_locks = {store.key: asyncio.Lock() for store in stores}
         super().__init__()
         # Read as a plain attribute by the API layer, so it is copied from
         # the primary instead of forwarded dynamically.
@@ -153,7 +158,10 @@ class ReplicatedMetadataRepository(IMetaDataRepository):
 
     async def _push_at_startup(self) -> None:
         try:
-            await self.push()
+            # include_stale: the boot's one background write still syncs
+            # every store (the load left the losers stale); only the
+            # ordinary pushes below skip the stale ones.
+            await self._push(include_stale=True)
         except TechnicalError as ex:
             # A tree was loaded, so the file system can serve reads: the
             # stores that could not take the write are marked stale and
@@ -332,18 +340,18 @@ class ReplicatedMetadataRepository(IMetaDataRepository):
     # -- writing ---------------------------------------------------------------
 
     async def push(self) -> None:
-        async with self._writes:
-            await self._push()
+        await self._push()
 
     async def push_removals(self) -> None:
-        async with self._writes:
-            await self._push(all_full=True)
-            if stale := self.stale_stores():
-                # A stale mirror can be the only readable copy at a later
-                # boot. Keep the journal until it has the removals as well.
-                raise TechnicalError("Waiting for metadata stores: " + ", ".join(stale))
+        # The journal flusher may not clear an entry until every store,
+        # the stale ones included, holds the tree the removal belongs to.
+        await self._push(all_full=True, include_stale=True)
+        if stale := self.stale_stores():
+            # A stale mirror can be the only readable copy at a later
+            # boot. Keep the journal until it has the removals as well.
+            raise TechnicalError("Waiting for metadata stores: " + ", ".join(stale))
 
-    async def _push(self, all_full: bool = False) -> None:
+    async def _push(self, all_full: bool = False, include_stale: bool = False) -> None:
         if not self.metadata:
             raise MetadataNotInitialized()
         self._stamp_revision()
@@ -363,26 +371,39 @@ class ReplicatedMetadataRepository(IMetaDataRepository):
         def full_for(store: MetadataStore, index: int) -> bool:
             return all_full or index > 0 or store.key in self._stale
 
-        if self._concurrent_stores and len(self._stores) > 1:
+        async def one(store: MetadataStore, index: int) -> tuple[bool, Optional[str]]:
+            async with self._store_locks[store.key]:
+                return await self._write(store, full=full_for(store, index))
+
+        if not include_stale:
+            # A push that retried a store marked stale inline would pay
+            # its slowness on every following operation; the heal worker
+            # re-syncs the store once it answers again.
+            stores = [
+                (store, i)
+                for i, store in enumerate(self._stores)
+                if store.key not in self._stale
+            ]
+        else:
+            stores = [(store, i) for i, store in enumerate(self._stores)]
+
+        if self._concurrent_stores and len(stores) > 1:
             results.extend(
-                await asyncio.gather(
-                    *(
-                        self._write(store, full=full_for(store, i))
-                        for i, store in enumerate(self._stores)
-                    )
-                )
+                await asyncio.gather(*(one(store, i) for store, i in stores))
             )
         else:
-            for i, store in enumerate(self._stores):
-                results.append(await self._write(store, full=full_for(store, i)))
+            for store, i in stores:
+                results.append(await one(store, i))
         for ok, error in results:
             any_store_ok = any_store_ok or ok
             if error:
                 errors.append(error)
         if not any_store_ok:
-            # Not one store holds the tree; the caller has to know.
+            # Not one store holds the tree; the caller has to know. A push
+            # that skipped every stale store lands here as well.
             raise TechnicalError(
-                "Writing the metadata failed for every store: " + "; ".join(errors)
+                "Writing the metadata failed for every store: "
+                + ("; ".join(errors) or "every store awaits a re-sync by the heal")
             )
 
     def _stamp_revision(self) -> None:
@@ -434,20 +455,22 @@ class ReplicatedMetadataRepository(IMetaDataRepository):
 
         Called periodically by the heal worker and safe to call any time;
         a store that is up to date costs nothing, and one that just came
-        back is brought in line with the current tree. Maintenance is
-        deliberately separate so history reads don't hold the write lock.
+        back is brought in line with the current tree. Each store's own
+        lock keeps this apart from the pushes of the same store, so a
+        slow re-sync holds up nothing but that store. Maintenance is
+        deliberately separate so history reads don't hold a write lock.
         """
         if self._initial_push is not None and not self._initial_push.done():
             return
-        async with self._writes:
-            await self._heal()
+        await self._heal()
 
     async def _heal(self) -> None:
         if not self.metadata:
             return
         for store in self._stores:
             if store.key in self._stale or store.key in self._skipped:
-                await self._write(store, full=True)
+                async with self._store_locks[store.key]:
+                    await self._write(store, full=True)
 
     async def maintain(self) -> None:
         if not self.metadata or (
