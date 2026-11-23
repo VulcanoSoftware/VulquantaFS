@@ -120,9 +120,6 @@ class EncryptingFileContentRepository(IFileContentRepository):
         return encrypt_name(self._name_key, name) if self._name_key and name else name
 
     async def save(self, file_msg: UploadableFileMessage) -> List[SentFileMessage]:
-        # Obfuscate the remote document name before wrapping, so the
-        # part-numbering loop downstream sees the encrypted form.
-        file_msg.name = self.storage_name(file_msg.name)
         # Build a fresh header (with a random salt) and derive the per-file
         # key. The header itself is written inline at the start of the
         # ciphertext stream.
@@ -130,12 +127,15 @@ class EncryptingFileContentRepository(IFileContentRepository):
         file_key = derive_file_key(self._master_key, header.file_salt)
         self._remember_header(file_msg, header, file_key)
         encrypted = EncryptingFileMessage.wrap(file_msg, file_key, header)
+        # Only the remote document name is encrypted. The caller still
+        # needs the original name when it publishes a new directory entry.
+        encrypted.name = self.storage_name(file_msg.name)
         # The cache below stages ciphertext under the version's id.
         encrypted.version_id = file_msg.version_id
         plaintext_size = file_msg.get_size()
         logger.debug(
             "Encrypting file '%s': plaintext=%s ciphertext=%s chunks=%s",
-            file_msg.name,
+            encrypted.name,
             plaintext_size,
             encrypted.get_size(),
             (
@@ -163,11 +163,11 @@ class EncryptingFileContentRepository(IFileContentRepository):
         self, file_msg: UploadableFileMessage, version_id: str
     ) -> Optional[int]:
         # Same wrapping as ``save``: the cache below holds ciphertext.
-        file_msg.name = self.storage_name(file_msg.name)
         header = FileHeader.new(chunk_size=self._chunk_size)
         file_key = derive_file_key(self._master_key, header.file_salt)
         self._remember_header(file_msg, header, file_key)
         encrypted = EncryptingFileMessage.wrap(file_msg, file_key, header)
+        encrypted.name = self.storage_name(file_msg.name)
         encrypted.version_id = version_id
         return await self._inner.stage(encrypted, version_id)
 

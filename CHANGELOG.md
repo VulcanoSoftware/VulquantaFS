@@ -54,10 +54,14 @@ the fact on the commits that shipped them.
 
 ### Fixed
 
+- A dropped or failed SFTP upload no longer leaves an empty destination
+  that makes FileZilla pause the queue with an overwrite prompt. Opening a
+  new file claims its path in memory; only close can publish it, and a
+  disconnect before an overwrite commits leaves the previous file in place.
+- The event-loop watchdog reports when the sampler itself missed its
+  schedule, so a frame sampled late is not mistaken for the cause of a stall.
 - Use Python's standard `asyncio` loop by default instead of automatically
-  enabling uvloop. This avoids the uvloop TLS transport path seen in
-  server-wide stalls during SFTP bulk uploads; set
-  `VULQUANTAFS_EVENT_LOOP=uvloop` to opt back in.
+  enabling uvloop. Set `VULQUANTAFS_EVENT_LOOP=uvloop` to opt back in.
 - Starting up now reads only the metadata store that holds the most recent
   tree instead of reading every store. Git stores date their tree with
   their branch head, and that head is two small GETs away -- so the boot

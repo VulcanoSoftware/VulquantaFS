@@ -215,9 +215,6 @@ def run() -> None:
     elif loop_name != "asyncio":
         raise SystemExit("VULQUANTAFS_EVENT_LOOP must be 'asyncio' or 'uvloop'")
 
-    # The bulk-upload watchdog caught the shared uvloop thread inside TLS
-    # reads/shutdown. Use the standard library transport by default so SFTP
-    # and the storage clients no longer take that uvloop code path.
     logger.info("Using asyncio event loop")
     asyncio.run(main())
 

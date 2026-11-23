@@ -1,3 +1,4 @@
+import asyncio
 import datetime
 import logging
 from typing import (
@@ -406,15 +407,37 @@ class FileApi:
         fr.mirrors = dict(resp.mirrors)
         fr.store = resp.store
         if defer_file_ref:
-            # The reference exists in memory and is durable; the open must
-            # not wait out the push it did not ask for, or it queues
-            # behind the coalescer's mirror syncs and ref commits.
+            # Legacy non-blocking create: the reference may still be
+            # pending. SFTP does not use this for a completed transfer.
+            self._metadata_api.request_push()
+        elif where.file_refs_persist_on_create and fr.owned_by(self._store_key):
+            # The pathname and its primary descriptor are already durable
+            # in the git tree; a mirror re-sync must not hold up CLOSE.
             self._metadata_api.request_push()
         else:
-            await self._metadata_api.push()
+            # The descriptor already exists. Even if CLOSE loses its
+            # connection, let the metadata write resolve: deleting the
+            # ref during the write could hide a file which actually landed.
+            commit = asyncio.create_task(self._push_new_file_ref(fr))
+            try:
+                await asyncio.shield(commit)
+            except asyncio.CancelledError:
+                await asyncio.gather(commit, return_exceptions=True)
+                raise
         await self.stats.record(fr, resp.fd)
         await self._written(fr, resp.fd)
         return resp.fd
+
+    async def _push_new_file_ref(self, fr: TGFSFileRef) -> None:
+        try:
+            await self._metadata_api.push(require_success=True)
+        except Exception:
+            where = fr.location
+            if not where.file_refs_persist_on_create and any(
+                current is fr for current in where.find_files([fr.name])
+            ):
+                where.unlink_file_ref(fr)
+            raise
 
     async def _sync_file_ref(self, fr: TGFSFileRef, resp: FDRepositoryResp) -> None:
         """

@@ -40,9 +40,6 @@ def make_ops_class(recorder: Recorder):
     def factory(client):
         ops = Mock(spec=Ops)
 
-        async def touch(path, **kwargs):
-            return None
-
         def stat_file(path):
             raise FileOrDirectoryDoesNotExist(path)
 
@@ -61,10 +58,11 @@ def make_ops_class(recorder: Recorder):
             recorder.committed.append(received)
 
         def cd(path):
+            if path in ("", "/"):
+                return client.dir_api.root
             raise FileOrDirectoryDoesNotExist(path)
 
         ops.cd = cd
-        ops.touch = touch
         ops.stat_file = stat_file
         ops.upload_from_stream = upload_from_stream
         return ops

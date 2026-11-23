@@ -10,6 +10,7 @@ import datetime
 import logging
 import stat
 import threading
+from collections.abc import Awaitable, Callable
 from types import SimpleNamespace
 from unittest.mock import call
 
@@ -45,6 +46,7 @@ class FakeChannel:
     def __init__(self):
         self.root = TGFSDirectory.root_dir()
         self.contents: dict[str, bytes] = {}
+        self.before_commit: Callable[[str, bytes], Awaitable[None]] | None = None
 
     def add_file(self, directory: TGFSDirectory, name: str, data: bytes) -> None:
         directory.create_file_ref(name, fd_message_id=len(self.contents) + 1)
@@ -99,6 +101,8 @@ def build_client(mocker, name: str, channel: FakeChannel) -> Client:
             while chunk := await file_msg.read(8192):
                 data.extend(chunk)
         payload = bytes(data)
+        if channel.before_commit is not None:
+            await channel.before_commit(file_msg.name, payload)
         if not directory.find_files([file_msg.name]):
             channel.add_file(directory, file_msg.name, payload)
         else:
@@ -464,6 +468,88 @@ class TestTransfers:
             await sftp.put(str(source), "/notes/upload.bin")
 
         assert channel.contents["upload.bin"] == payload
+
+    @pytest.mark.parametrize("name", ["retry.bin", "note.txt"])
+    async def test_reconnect_after_dropped_close_can_retry(self, server, channel, name):
+        at_commit = asyncio.Event()
+        cancelled = asyncio.Event()
+        path = f"/notes/{name}"
+        attempted = CONTENT + b"uncommitted overwrite"
+
+        async def stalled_store(filename, payload):
+            assert (filename, payload) == (name, attempted)
+            at_commit.set()
+            try:
+                await asyncio.Future()
+            finally:
+                cancelled.set()
+
+        channel.before_commit = stalled_store
+        async with (
+            await connect(server) as uploader,
+            uploader.start_sftp_client() as sftp,
+        ):
+            handle = await sftp.open(path, "wb")
+            await handle.write(attempted)
+            closing = asyncio.create_task(handle.close())
+            try:
+                await asyncio.wait_for(at_commit.wait(), timeout=3)
+                uploader.abort()
+                await asyncio.wait_for(cancelled.wait(), timeout=3)
+                assert channel.contents == {"note.txt": CONTENT}
+                channel.before_commit = None
+
+                async with (
+                    await connect(server) as observer,
+                    observer.start_sftp_client() as retry,
+                ):
+                    # The first client sent all bytes and CLOSE, but the
+                    # store did not confirm. Its retry must not encounter
+                    # a placeholder or lose a real previous version.
+                    assert (name in await retry.listdir("/notes")) == (
+                        name == "note.txt"
+                    )
+                    if name == "retry.bin":
+                        with pytest.raises(asyncssh.SFTPNoSuchFile):
+                            await retry.stat(path)
+                    async with retry.open(
+                        path, "xb" if name == "retry.bin" else "wb"
+                    ) as reopened:
+                        await reopened.write(b"retry payload")
+                assert channel.contents[name] == b"retry payload"
+            finally:
+                closing.cancel()
+                await asyncio.gather(closing, return_exceptions=True)
+
+    async def test_concurrent_opens_cannot_claim_a_new_path_twice(self, server):
+        path = "/notes/claimed.bin"
+        async with await connect(server) as conn, conn.start_sftp_client() as first:
+            async with first.open(path, "xb"):
+                async with (
+                    await connect(server) as peer,
+                    peer.start_sftp_client() as second,
+                ):
+                    assert path.rsplit("/", 1)[1] not in await second.listdir("/notes")
+                    with pytest.raises(
+                        asyncssh.SFTPFailure, match="already being written"
+                    ):
+                        await second.open(path, "xb")
+
+    async def test_failed_close_does_not_leave_an_empty_target(self, server, channel):
+        async def fail_once(name, payload):
+            raise OSError("store unavailable")
+
+        channel.before_commit = fail_once
+        path = "/notes/retry.bin"
+        async with await connect(server) as conn, conn.start_sftp_client() as sftp:
+            with pytest.raises(asyncssh.SFTPFailure, match="store unavailable"):
+                async with sftp.open(path, "wb") as fh:
+                    await fh.write(b"first attempt")
+            assert "retry.bin" not in await sftp.listdir("/notes")
+            channel.before_commit = None
+            async with sftp.open(path, "xb") as fh:
+                await fh.write(b"second attempt")
+        assert channel.contents["retry.bin"] == b"second attempt"
 
     async def test_upload_20k_files_from_two_sessions(self, server, channel, caplog):
         caplog.set_level(logging.WARNING)

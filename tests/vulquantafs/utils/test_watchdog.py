@@ -8,6 +8,7 @@ import asyncio
 import time
 
 
+from vulquantafs.utils import watchdog
 from vulquantafs.utils.watchdog import EventLoopWatchdog
 
 
@@ -52,3 +53,19 @@ async def test_a_quiet_loop_stays_silent(caplog):
         if "did not run for" in record.getMessage()
         or "has not run for" in record.getMessage()
     ]
+
+
+def test_a_delayed_sampler_does_not_blame_the_recovery_stack(caplog, mocker):
+    dog = EventLoopWatchdog(interval=1, dump_after=10)
+    dog._last_tick = 0
+    clock = mocker.Mock()
+    clock.monotonic.side_effect = [0, 62, 62]
+    mocker.patch.object(watchdog, "time", clock)
+    mocker.patch.object(dog._sampler_stop, "wait", side_effect=[False, True])
+    mocker.patch.object(watchdog, "_thread_stack", return_value="socket.recv_into")
+
+    dog._sample()
+
+    assert "sampler itself ran 61.0 seconds late" in caplog.text
+    assert "may not identify the blocker" in caplog.text
+    assert "socket.recv_into" in caplog.text
