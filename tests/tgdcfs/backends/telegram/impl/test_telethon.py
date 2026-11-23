@@ -230,7 +230,7 @@ class TestTelethonAPI:
         result = await telethon_api.send_text(req)
 
         telethon_api._client.send_message.assert_called_once_with(
-            entity=tlt.PeerChannel(mock_chat), message="Hello World"
+            entity=tlt.PeerChannel(mock_chat), message="Hello World", parse_mode=None
         )
         assert result.message_id == 99999
 
@@ -254,7 +254,10 @@ class TestTelethonAPI:
         result = await telethon_api.edit_message_text(req)
 
         telethon_api._client.edit_message.assert_called_once_with(
-            entity=tlt.PeerChannel(mock_chat), message=12345, text="Updated text"
+            entity=tlt.PeerChannel(mock_chat),
+            message=12345,
+            text="Updated text",
+            parse_mode=None,
         )
         mock_cache.__setitem__.assert_called_once_with(12345, None)
         assert result.message_id == 88888

@@ -2,10 +2,11 @@ from unittest.mock import AsyncMock, Mock
 
 import pytest
 from pyrogram import Client, file_id
+from pyrogram import enums as e
 from pyrogram import types as t
 
 from tgdcfs.errors import TechnicalError
-from tgdcfs.reqres import DownloadFileReq
+from tgdcfs.reqres import DownloadFileReq, EditMessageTextReq, SendTextReq
 from tgdcfs.backends.telegram.impl.pyrogram import GET_FILE_CHUNK_SIZE, PyrogramAPI
 
 
@@ -70,3 +71,44 @@ class TestPyrogramDownload:
         with pytest.raises(TechnicalError, match="ended after 8 of 100 bytes"):
             async for _ in resp.chunks:
                 pass
+
+
+class TestPyrogramText:
+    """Descriptor JSON must reach Telegram verbatim: base64url replica ids
+    contain "__", which markdown parsing would strip."""
+
+    @pytest.fixture
+    def mock_client(self, mocker) -> AsyncMock:
+        client = mocker.AsyncMock(spec=Client)
+        client.send_message.return_value = Mock(id=99999)
+        client.edit_message_text.return_value = Mock(id=88888)
+        return client
+
+    @pytest.fixture
+    def api(self, mock_client) -> PyrogramAPI:
+        return PyrogramAPI(mock_client)
+
+    @pytest.mark.asyncio
+    async def test_send_text_disables_parsing(self, api, mock_client):
+        text = '{"mb": "AB__CD__EF"}'
+        result = await api.send_text(SendTextReq(chat=-100123, text=text))
+
+        mock_client.send_message.assert_called_once_with(
+            chat_id=-100123, text=text, parse_mode=e.ParseMode.DISABLED
+        )
+        assert result.message_id == 99999
+
+    @pytest.mark.asyncio
+    async def test_edit_message_text_disables_parsing(self, api, mock_client):
+        text = '{"mb": "AB__CD__EF"}'
+        result = await api.edit_message_text(
+            EditMessageTextReq(chat=-100123, message_id=12345, text=text)
+        )
+
+        mock_client.edit_message_text.assert_called_once_with(
+            chat_id=-100123,
+            message_id=12345,
+            text=text,
+            parse_mode=e.ParseMode.DISABLED,
+        )
+        assert result.message_id == 88888

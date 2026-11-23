@@ -129,8 +129,10 @@ class TelethonAPI(ITDLibClient):
         return GetMessagesResp(cache.gets(req.message_ids))
 
     async def send_text(self, req: SendTextReq) -> SendMessageResp:
+        # Descriptors are JSON; markdown parsing would strip "__" pairs
+        # out of base64url replica ids.
         message = await self._client.send_message(
-            entity=PeerChannel(channel_id=req.chat), message=req.text
+            entity=PeerChannel(channel_id=req.chat), message=req.text, parse_mode=None
         )
         return SendMessageResp(message_id=message.id)
 
@@ -141,6 +143,7 @@ class TelethonAPI(ITDLibClient):
             entity=PeerChannel(channel_id=req.chat),
             message=req.message_id,
             text=req.text,
+            parse_mode=None,
         )
         return SendMessageResp(message_id=message.id)
 

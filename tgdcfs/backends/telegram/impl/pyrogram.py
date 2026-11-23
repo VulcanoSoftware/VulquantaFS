@@ -116,7 +116,11 @@ class PyrogramAPI(ITDLibClient):
         return GetMessagesResp(cache.gets(req.message_ids))
 
     async def send_text(self, req: SendTextReq) -> SendMessageResp:
-        message = await self._client.send_message(chat_id=req.chat, text=req.text)
+        # Descriptors are JSON; markdown parsing would strip "__" pairs
+        # out of base64url replica ids.
+        message = await self._client.send_message(
+            chat_id=req.chat, text=req.text, parse_mode=e.ParseMode.DISABLED
+        )
         return SendMessageResp(message_id=message.id)
 
     async def edit_message_text(self, req: EditMessageTextReq) -> SendMessageResp:
@@ -126,6 +130,7 @@ class PyrogramAPI(ITDLibClient):
             chat_id=req.chat,
             message_id=req.message_id,
             text=req.text,
+            parse_mode=e.ParseMode.DISABLED,
         )
         return SendMessageResp(message_id=message.id)
 
