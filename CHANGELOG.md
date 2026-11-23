@@ -65,6 +65,12 @@ the fact on the commits that shipped them.
   `DOCKERHUB_NAMESPACE` at build time (`next.config.ts`; the Pages workflow
   and the `tgdcfs-fe` image build pass them in) instead of being hard-coded.
   A plain local build falls back to the upstream's names.
+- A documentation website (Docusaurus, in `docusaurus/`) for users,
+  operators and developers: connecting clients, configuration, deployment,
+  encryption, mirroring, the management API, local setup and contributing.
+  The Pages workflow builds it together with the web frontend and serves it
+  under `/docs/` of the same Pages site, so no other hosting is needed. The
+  web frontend's home page links to it next to the getting-started guide.
 
 ### Changed
 
