@@ -1,4 +1,5 @@
 import asyncio
+import sys
 from typing import Any, Dict
 
 import pytest
@@ -7,6 +8,7 @@ from main import (
     create_clients,
     create_store_factory,
     main,
+    run,
     run_server,
     start_replication_workers,
 )
@@ -35,6 +37,54 @@ CONFIG: Dict[str, Any] = {
         "server": {"host": "0.0.0.0", "port": 8080},
     },
 }
+
+
+@pytest.mark.parametrize("selection", [None, "asyncio", "uvloop"])
+def test_run_selects_the_event_loop_and_closes_it(selection, monkeypatch, mocker):
+    if selection is None:
+        monkeypatch.delenv("VULQUANTAFS_EVENT_LOOP", raising=False)
+    else:
+        monkeypatch.setenv("VULQUANTAFS_EVENT_LOOP", selection)
+    if selection == "uvloop":
+        uvloop = pytest.importorskip("uvloop")
+
+    loops = []
+
+    async def capture_loop():
+        loops.append(asyncio.get_running_loop())
+
+    mocker.patch("main.main", side_effect=capture_loop)
+    policy = asyncio.get_event_loop_policy()
+    run()
+
+    (loop,) = loops
+    if selection == "uvloop":
+        assert isinstance(loop, uvloop.Loop)
+    else:
+        assert isinstance(loop, asyncio.BaseEventLoop)
+    assert loop.is_closed()
+    assert asyncio.get_event_loop_policy() is policy
+
+
+def test_run_falls_back_when_uvloop_is_unavailable(monkeypatch, mocker, caplog):
+    monkeypatch.setenv("VULQUANTAFS_EVENT_LOOP", "uvloop")
+    monkeypatch.setitem(sys.modules, "uvloop", None)
+    start = mocker.patch("main.main")
+
+    run()
+
+    start.assert_awaited_once()
+    assert "falling back to asyncio" in caplog.text
+
+
+def test_run_rejects_an_invalid_event_loop(monkeypatch, mocker):
+    monkeypatch.setenv("VULQUANTAFS_EVENT_LOOP", "typo")
+    start = mocker.patch("main.main")
+
+    with pytest.raises(SystemExit, match="VULQUANTAFS_EVENT_LOOP"):
+        run()
+
+    start.assert_not_called()
 
 
 class TestMain:

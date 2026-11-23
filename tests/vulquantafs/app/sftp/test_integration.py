@@ -7,6 +7,7 @@ between OPEN, READ/WRITE and CLOSE.
 
 import asyncio
 import datetime
+import logging
 import stat
 import threading
 from types import SimpleNamespace
@@ -463,6 +464,27 @@ class TestTransfers:
             await sftp.put(str(source), "/notes/upload.bin")
 
         assert channel.contents["upload.bin"] == payload
+
+    async def test_upload_20k_files_from_two_sessions(self, server, channel, caplog):
+        caplog.set_level(logging.WARNING)
+        expected = {f"file-{i:05d}.bin": f"payload {i}".encode() for i in range(20_000)}
+
+        async def upload_batch(items):
+            async with await connect(server) as conn, conn.start_sftp_client() as sftp:
+                for name, payload in items:
+                    async with sftp.open(f"/notes/sub/{name}", "wb") as fh:
+                        await fh.write(payload)
+
+        items = list(expected.items())
+        async with asyncio.timeout(120), asyncio.TaskGroup() as sessions:
+            sessions.create_task(upload_batch(items[::2]))
+            sessions.create_task(upload_batch(items[1::2]))
+
+        # Every acknowledged CLOSE must have committed the full payload.
+        assert channel.contents == {"note.txt": CONTENT, **expected}
+        async with await connect(server) as conn, conn.start_sftp_client() as sftp:
+            listed = await asyncio.wait_for(sftp.listdir("/notes/sub"), timeout=20)
+        assert sorted(listed) == [".", "..", *sorted(expected)]
 
     async def test_round_trip(self, server, tmp_path):
         source = tmp_path / "round.bin"

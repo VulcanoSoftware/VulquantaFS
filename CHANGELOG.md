@@ -54,6 +54,10 @@ the fact on the commits that shipped them.
 
 ### Fixed
 
+- Use Python's standard `asyncio` loop by default instead of automatically
+  enabling uvloop. This avoids the uvloop TLS transport path seen in
+  server-wide stalls during SFTP bulk uploads; set
+  `VULQUANTAFS_EVENT_LOOP=uvloop` to opt back in.
 - Starting up now reads only the metadata store that holds the most recent
   tree instead of reading every store. Git stores date their tree with
   their branch head, and that head is two small GETs away -- so the boot
