@@ -1,6 +1,7 @@
 import base64
 import datetime
 import json
+import logging
 import struct
 from dataclasses import dataclass, field
 from typing import Dict, Iterable, List, Optional
@@ -24,6 +25,8 @@ INVALID_VERSION_ID = ""
 # Replica id lists longer than this are stored base64-packed: 19-digit
 # Discord snowflakes as JSON cost 21 characters each, packed 11.
 _COMPACT_IDS_THRESHOLD = 100
+
+logger = logging.getLogger(__name__)
 
 
 def _encode_ids(ids: List[int]) -> str:
@@ -67,6 +70,31 @@ def replica_from_dict(data: ReplicaSerialized) -> Replica:
     if (n := data.get("n")) and len(sizes) == 2 and n > 2:
         sizes = [sizes[0]] * (n - 1) + [sizes[1]]
     return Replica(message_ids=ids, part_sizes=sizes)
+
+
+def _replicas_from_dict(data: Dict[str, ReplicaSerialized]) -> Dict[str, Replica]:
+    """Deserialize a version's replicas, dropping any that are damaged.
+
+    Descriptors written before markdown parsing was disabled on send can
+    hold packed ids with "__" pairs stripped out. Such a replica either
+    fails to decode or no longer has one id per part; it is dropped so
+    the version stays readable, and the next backfill copies it again.
+    """
+    replicas: Dict[str, Replica] = {}
+    for key, raw in data.items():
+        try:
+            replica = replica_from_dict(raw)
+        except (ValueError, struct.error) as ex:
+            logger.warning(f"Dropping undecodable replica in store {key}: {ex}")
+            continue
+        if replica.part_sizes and len(replica.part_sizes) != len(replica.message_ids):
+            logger.warning(
+                f"Dropping replica in store {key}: {len(replica.message_ids)} ids "
+                f"for {len(replica.part_sizes)} parts"
+            )
+            continue
+        replicas[normalize_store_key(key)] = replica
+    return replicas
 
 
 @dataclass
@@ -238,10 +266,7 @@ class TGFSFileVersion:
                 normalize_store_key(channel): list(ids)
                 for channel, ids in (data.get("mirrors") or {}).items()
             },
-            replicas={
-                normalize_store_key(key): replica_from_dict(replica)
-                for key, replica in (data.get("replicas") or {}).items()
-            },
+            replicas=_replicas_from_dict(data.get("replicas") or {}),
             store=(normalize_store_key(data["store"]) if data.get("store") else None),
             recorded_size=int(data.get("size", INVALID_FILE_SIZE)),
         )

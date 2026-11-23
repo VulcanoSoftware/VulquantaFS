@@ -209,6 +209,63 @@ class TestReplicas:
         assert await stack.read("b.bin") == DATA[:3000]
 
 
+class TestDamagedReplica:
+    """Packed replica ids that lost "__" pairs to markdown parsing."""
+
+    @staticmethod
+    def _client(stack: Stack):
+        return type(
+            "C",
+            (),
+            {
+                "name": "fs",
+                "mirror_group": stack.mirror_group,
+                "fd_repo": stack.fd_repo,
+                "metadata_api": stack.metadata_api,
+                "dir_api": stack.dir_api,
+            },
+        )()
+
+    async def _damaged(self) -> Stack:
+        mirror = FakeStore(
+            key="dc:9", backend_name="discord", max_part_bytes=32, server_copy=False
+        )
+        stack = await Stack(telegram_like(), mirror).init()
+        await stack.put("a.bin", DATA)
+        fr = stack.root.find_file("a.bin")
+        message = stack.primary.messages[fr.message_id]
+        fd = json.loads(message.text)
+        replica = fd["versions"][0]["replicas"]["dc:9"]
+        assert "mb" in replica
+        # A stripped "__x__" pair removes four characters.
+        replica["mb"] = replica["mb"][:20] + replica["mb"][24:]
+        message.text = json.dumps(fd)
+        return stack
+
+    async def test_the_version_stays_readable_without_the_replica(self):
+        stack = await self._damaged()
+
+        version = await stack.version("a.bin")
+        assert version.is_valid()
+        assert "dc:9" not in version.replicas
+        assert await stack.read("a.bin") == DATA
+
+    async def test_backfill_copies_the_dropped_replica_again(self):
+        stack = await self._damaged()
+        fr = stack.root.find_file("a.bin")
+
+        report = BackfillReport()
+        await backfill_file(self._client(stack), fr, verify=False, report=report)  # type: ignore[arg-type]
+
+        assert report.failures == []
+        replica = (await stack.version("a.bin")).replicas["dc:9"]
+        assert len(replica.message_ids) == 160
+        assert (
+            b"".join(stack.mirror.document_of(mid) for mid in replica.message_ids)
+            == DATA
+        )
+
+
 class TestPromotionWithReplicas:
     async def test_replica_becomes_the_primary_layout(self):
         stack = await Stack(telegram_like(), discord_like()).init()
@@ -451,3 +508,23 @@ class TestModel:
         assert replica_from_dict(packed) == big
 
         assert replica_from_dict({}) == Replica()
+
+    def test_a_damaged_replica_is_dropped_from_the_version(self):
+        from tgdcfs.core.model.file import replica_to_dict
+
+        big = Replica(message_ids=list(range(1, 202)), part_sizes=[7] * 200 + [1])
+        packed = replica_to_dict(big)
+        short = dict(packed, mb=packed["mb"][:-4])  # decodes, one id short
+        bad = dict(packed, mb=packed["mb"][:-3])  # no longer decodes
+        data = {
+            "type": "FV",
+            "id": "v",
+            "updatedAt": 1,
+            "messageIds": [5],
+            "replicas": {"dc:1": packed, "dc:2": short, "dc:3": bad},
+        }
+
+        version = TGFSFileVersion.from_dict(data)  # type: ignore[arg-type]
+
+        assert list(version.replicas) == ["dc:1"]
+        assert version.replicas["dc:1"] == big
