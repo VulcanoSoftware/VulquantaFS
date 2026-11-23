@@ -49,7 +49,7 @@ class TestCreateFileRefAsync:
         entered = asyncio.Event()
         release = threading.Event()
         loop = asyncio.get_running_loop()
-        paths = []
+        paths: list[str] = []
 
         def commit(repo, branch, overlay, message):
             paths.extend(item._InputGitTreeElement__path for item in overlay)
@@ -106,7 +106,7 @@ class TestCreateFileRefAsync:
         loop = asyncio.get_running_loop()
         running = 0
         peak = 0
-        batches = []
+        batches: list[list[str]] = []
 
         def commit(repo, branch, refs):
             nonlocal running, peak
