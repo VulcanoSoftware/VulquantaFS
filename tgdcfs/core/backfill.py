@@ -17,8 +17,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, List, Optional, Tuple
+from typing import TYPE_CHECKING, AsyncIterator, List, Optional, Tuple
 
 from tgdcfs.core.local_cache import version_cache_for
 from tgdcfs.core.mirror import MirrorStore
@@ -33,6 +35,11 @@ if TYPE_CHECKING:
     from tgdcfs.core.client import Client
 
 logger = logging.getLogger(__name__)
+
+# A single store call that takes longer than this is logged while it waits.
+HEARTBEAT_SECONDS = 60.0
+# The descriptor scan logs its progress at most this often.
+SCAN_PROGRESS_SECONDS = 30.0
 
 
 @dataclass
@@ -55,6 +62,30 @@ class BackfillReport:
             "fds_mirrored": self.fds_mirrored,
             "failures": self.failures,
         }
+
+
+@asynccontextmanager
+async def _heartbeat(label: str) -> AsyncIterator[None]:
+    """Log every ``HEARTBEAT_SECONDS`` while the body is still running.
+
+    A store call without a timeout can wait forever; this names the call
+    it is waiting in instead of leaving the log silent.
+    """
+    started = time.monotonic()
+
+    async def beat() -> None:
+        while True:
+            await asyncio.sleep(HEARTBEAT_SECONDS)
+            logger.warning(
+                f"Backfill: still waiting on {label} after "
+                f"{time.monotonic() - started:.0f}s"
+            )
+
+    task = asyncio.create_task(beat())
+    try:
+        yield
+    finally:
+        task.cancel()
 
 
 def _collect_file_refs(directory: TGFSDirectory) -> List[TGFSFileRef]:
@@ -263,6 +294,10 @@ async def backfill_file(
         if not version.owned_by(mirror_group.primary.key):
             # No primary copy to mirror from yet; the next run retries.
             continue
+        logger.info(
+            f"Mirroring {fr.name}@{version.id} ({version.size} bytes, "
+            f"{len(version.message_ids)} parts) to {', '.join(missing)}"
+        )
         copies = await mirror_group.mirror_parts(
             version.message_ids,
             version.part_sizes or None,
@@ -328,31 +363,54 @@ async def backfill_mirrors(
         return report
 
     refs = _collect_file_refs(client.dir_api.root)
+    total = len(refs)
+    logger.info(f"Backfill for '{client.name}': reading {total} descriptors")
 
     # Newest first: load descriptors to know each file's timestamp.
     dated: List[Tuple[TGFSFileRef, int]] = []
-    for fr in refs:
+    scan_started = last_progress = time.monotonic()
+    for index, fr in enumerate(refs, 1):
         try:
-            fd = await client.fd_repo.get(fr)
+            async with _heartbeat(f"the descriptor of {fr.name} ({index}/{total})"):
+                fd = await client.fd_repo.get(fr)
             dated.append((fr, fd.updated_at_timestamp))
         except Exception as ex:
             report.failures.append(f"{fr.name}: cannot read descriptor ({ex})")
+            logger.warning(f"Backfill: cannot read the descriptor of {fr.name}: {ex}")
+        now = time.monotonic()
+        if now - last_progress >= SCAN_PROGRESS_SECONDS or index == total:
+            last_progress = now
+            logger.info(
+                f"Backfill for '{client.name}': read {index}/{total} descriptors "
+                f"in {now - scan_started:.0f}s, {len(report.failures)} unreadable"
+            )
     dated.sort(key=lambda pair: pair[1], reverse=True)
 
     if task_id:
         await task_store.update_task_progress(task_id, status=TaskStatus.IN_PROGRESS)
+    logger.info(f"Backfill for '{client.name}': mirroring {len(dated)} files")
 
     metadata_dirty = False
-    for fr, _ in dated:
+    for index, (fr, _) in enumerate(dated, 1):
         before = (fr.message_id, dict(fr.mirrors), fr.store)
+        mirrored = report.versions_mirrored
+        failed = len(report.failures)
+        file_started = time.monotonic()
         try:
-            await backfill_file(client, fr, verify, report)
+            async with _heartbeat(f"{fr.name} ({index}/{len(dated)})"):
+                await backfill_file(client, fr, verify, report)
         except Exception as ex:
             report.failures.append(f"{fr.name}: {ex}")
             logger.error(f"Backfill failed for {fr.name}: {ex}")
         if before != (fr.message_id, fr.mirrors, fr.store):
             metadata_dirty = True
         report.files_scanned += 1
+        logger.info(
+            f"Backfill [{index}/{len(dated)}] {fr.name}: "
+            f"{report.versions_mirrored - mirrored} versions mirrored, "
+            f"{len(report.failures) - failed} failures, "
+            f"{time.monotonic() - file_started:.1f}s"
+        )
         if task_id:
             await task_store.update_task_progress(task_id, size_delta=1)
 

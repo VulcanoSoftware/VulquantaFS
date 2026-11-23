@@ -1,5 +1,7 @@
+import asyncio
 import datetime
 import json
+import logging
 from types import SimpleNamespace
 
 import pytest
@@ -665,6 +667,77 @@ class TestBackfill:
         )
         report = await backfill_mirrors(client)  # type: ignore[arg-type]
         assert report.failures
+
+    @pytest.mark.asyncio
+    async def test_backfill_logs_scan_and_file_progress(self, mocker, caplog):
+        group, _, mirror_api = make_group(mocker)
+        mirror_api.copy_from.return_value = [11]
+
+        root = TGFSDirectory.root_dir()
+        root.create_file_ref("a.txt", 5)
+
+        fd = TGFSFileDesc(name="a.txt")
+        fd.add_version(make_sent_version())
+        client = SimpleNamespace(
+            name="test",
+            mirror_group=group,
+            fd_repo=FakeFDRepo(fd),
+            metadata_api=mocker.AsyncMock(),
+            dir_api=SimpleNamespace(root=root),
+        )
+
+        with caplog.at_level(logging.INFO, logger="tgdcfs.core.backfill"):
+            await backfill_mirrors(client)  # type: ignore[arg-type]
+
+        messages = [r.getMessage() for r in caplog.records]
+        assert "Backfill for 'test': reading 1 descriptors" in messages
+        assert any(
+            m.startswith("Backfill for 'test': read 1/1 descriptors") for m in messages
+        )
+        assert "Backfill for 'test': mirroring 1 files" in messages
+        assert any(m.startswith("Mirroring a.txt@") for m in messages)
+        assert any(
+            m.startswith("Backfill [1/1] a.txt: 1 versions mirrored, 0 failures")
+            for m in messages
+        )
+
+    @pytest.mark.asyncio
+    async def test_backfill_names_a_slow_descriptor_read(self, mocker, caplog):
+        mocker.patch("tgdcfs.core.backfill.HEARTBEAT_SECONDS", 0.01)
+        group, _, mirror_api = make_group(mocker)
+        mirror_api.copy_from.return_value = [11]
+
+        root = TGFSDirectory.root_dir()
+        root.create_file_ref("slow.txt", 5)
+
+        fd = TGFSFileDesc(name="slow.txt")
+        fd.add_version(make_sent_version())
+
+        class SlowFDRepo(FakeFDRepo):
+            async def get(self, fr, include_all_versions=False):
+                await asyncio.sleep(0.05)
+                return self.fd
+
+        client = SimpleNamespace(
+            name="test",
+            mirror_group=group,
+            fd_repo=SlowFDRepo(fd),
+            metadata_api=mocker.AsyncMock(),
+            dir_api=SimpleNamespace(root=root),
+        )
+
+        with caplog.at_level(logging.WARNING, logger="tgdcfs.core.backfill"):
+            report = await backfill_mirrors(client)  # type: ignore[arg-type]
+
+        assert report.versions_mirrored == 1
+        messages = [r.getMessage() for r in caplog.records]
+        assert any(
+            m.startswith("Backfill: still waiting on the descriptor of slow.txt (1/1)")
+            for m in messages
+        )
+        assert any(
+            m.startswith("Backfill: still waiting on slow.txt (1/1)") for m in messages
+        )
 
 
 class TestSaveMirrorsParts:
