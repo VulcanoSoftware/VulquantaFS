@@ -42,6 +42,12 @@ the fact on the commits that shipped them.
   is written only with the values that differ from the defaults, and
   "Load Existing config.yaml" reads it back.
 
+- The mirror backfill logs its progress. The descriptor scan reports
+  every 30 seconds how many descriptors it has read, each mirrored file
+  gets one line with its result and duration, and a store call that is
+  still running after 60 seconds is named in a warning every minute.
+  The scan used to run for half an hour without a single log line.
+
 ### Changed
 
 - WebDAV listings report a file's creation date as the date of its oldest
@@ -52,6 +58,13 @@ the fact on the commits that shipped them.
   entry; the per-entry lines are at debug level.
 
 ### Fixed
+
+- Descriptors were sent to Telegram with Markdown parsing on, which
+  removed every `__` pair from the JSON. Packed Discord replica ids
+  (files with more than 100 parts) could then not be decoded, and the
+  listing of the whole folder failed. Descriptors are now sent and edited
+  verbatim. A replica that cannot be decoded is dropped with a warning
+  instead of failing the read, and the backfill mirrors it again.
 
 - Uploads above 2 GB over WebDAV no longer time out between Telegram parts.
   A streamed file goes to Telegram in parts of up to 2000 MiB, and after
