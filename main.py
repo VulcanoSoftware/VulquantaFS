@@ -2,9 +2,10 @@ import asyncio
 import logging
 from typing import List, Optional
 
-logging.basicConfig(
-    level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
-)
+from vulquantafs.utils.logger import setup_logging
+from vulquantafs.utils.watchdog import EventLoopWatchdog
+
+setup_logging()
 
 try:
     import uvloop  # type: ignore[import]
@@ -153,6 +154,11 @@ async def run_server(app, host: str, port: int, name: str):
 async def main():
     logger = logging.getLogger(__name__)
     config = get_config()
+    # Size and dates read by listings since the last write (see the
+    # finally block): the watchdog reads the loop's pace off them while
+    # a stall is ongoing, before any handler could log it.
+    watchdog = EventLoopWatchdog()
+    watchdog.start()
     # Before the first store exists, so every channel starts at this size.
     set_message_cache_size(config.vulquantafs.listing.message_cache_size)
 
@@ -196,6 +202,7 @@ async def main():
         if sftp_acceptor:
             sftp_acceptor.close()
             await sftp_acceptor.wait_closed()
+        await watchdog.stop()
 
 
 if __name__ == "__main__":
