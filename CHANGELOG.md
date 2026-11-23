@@ -65,6 +65,12 @@ the fact on the commits that shipped them.
   `DOCKERHUB_NAMESPACE` at build time (`next.config.ts`; the Pages workflow
   and the `tgdcfs-fe` image build pass them in) instead of being hard-coded.
   A plain local build falls back to the upstream's names.
+- The web frontend's config generator and getting-started guide can be
+  customised from an appearance panel: accent colour (presets or a custom
+  colour), background style (aurora, midnight, solid), effects on or off and
+  a normal or full-width layout. The split between the form and the sidebar
+  on the config generator can be dragged (double-click resets it). The
+  choices are kept in the browser's local storage.
 
 ### Changed
 
