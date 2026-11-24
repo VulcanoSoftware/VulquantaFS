@@ -18,6 +18,7 @@ VulquantaFS reads configuration and environment settings from standard environme
 |---|---|---|
 | `VULQUANTAFS_DATA_DIR` | `~/.vulquantafs` (`/home/vulquantafs/.vulquantafs` inside Docker) | Path to persistent data directory (holds sessions, host keys, queue files, cache). |
 | `VULQUANTAFS_CONFIG_FILE` | `config.yaml` (resolved relative to `VULQUANTAFS_DATA_DIR`) | Name of the YAML configuration file. |
+| `VULQUANTAFS_EVENT_LOOP` | `asyncio` | Event loop shared by HTTP, SFTP and the storage clients. Set to `uvloop` to opt back into the previous loop; if uvloop is unavailable, startup falls back to `asyncio` with a warning. |
 
 The encryption passphrase is not read from a fixed environment variable; it is resolved through the `encryption` section of `config.yaml`, in this priority order: `passphrase_env` (the *name* of an environment variable to read, e.g. `VULQUANTAFS_MASTER_PASSPHRASE`), `passphrase_file` (a file containing the passphrase, useful for systemd `LoadCredential`), or inline `passphrase` (development only). The examples below assume `passphrase_env: "VULQUANTAFS_MASTER_PASSPHRASE"` as set in the bundled `demo-config.yaml`.
 

@@ -12,7 +12,11 @@ from vulquantafs.core.model import (
     TGFSFileRef,
     TGFSFileVersion,
 )
-from vulquantafs.errors import FileOrDirectoryAlreadyExists, FileOrDirectoryDoesNotExist
+from vulquantafs.errors import (
+    FileOrDirectoryAlreadyExists,
+    FileOrDirectoryDoesNotExist,
+    TechnicalError,
+)
 from vulquantafs.reqres import (
     FileMessage,
     FileMessageEmpty,
@@ -264,8 +268,31 @@ class TestFileApi:
         sample_directory.create_file_ref.assert_called_once_with(
             sample_file_message.name, mock_response.message_id
         )
-        mock_metadata_api.push.assert_called_once()
+        mock_metadata_api.push.assert_awaited_once_with(require_success=True)
         assert result == mock_response.fd
+
+    @pytest.mark.asyncio
+    async def test_failed_new_file_metadata_write_leaves_the_path_retryable(
+        self,
+        file_api,
+        mock_metadata_api,
+        mock_file_desc_api,
+        sample_directory,
+        sample_file_message,
+        mocker,
+    ):
+        mock_file_desc_api.create_file_desc.return_value = mocker.Mock(
+            mirrors={}, message_id=456, store="tg:111"
+        )
+        mock_metadata_api.push.side_effect = TechnicalError("metadata unavailable")
+        with pytest.raises(TechnicalError, match="metadata unavailable"):
+            await file_api.upload(sample_directory, sample_file_message)
+        assert not sample_directory.find_files([sample_file_message.name])
+
+        mock_metadata_api.push.side_effect = None
+        await file_api.upload(sample_directory, sample_file_message)
+        assert sample_directory.find_file(sample_file_message.name).message_id == 456
+        mock_file_desc_api.append_file_version.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_deferred_create_new_file_asks_for_the_push_without_waiting(

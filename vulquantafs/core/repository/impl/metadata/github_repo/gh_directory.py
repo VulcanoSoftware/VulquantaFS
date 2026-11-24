@@ -45,6 +45,17 @@ DEFERRED_PUT_RETRY_DELAY = 5
 # per file -- the queue that once grew past ten pushed the opens over
 # FileZilla's 20-second timeout.
 DEFERRED_COMMIT_WINDOW = 1.0
+# Completed uploads wait for their reference. Briefly collect concurrent CLOSE
+# requests without adding the full background window to each small file.
+AWAITED_COMMIT_WINDOW = 0.025
+# ... but never longer than this. A GitHub read timeout plus the write
+# thread's inline retries can hold the shared batch for half a minute and
+# more; a client that does not hear its CLOSE reply within about 20 s drops
+# the connection and aborts the upload. Past this bound the caller hears a
+# failure instead while the commit keeps retrying in the background, so a
+# retransmission appends a version to the same reference instead of finding
+# a server that never answers.
+AWAITED_COMMIT_MAX_WAIT = 15.0
 
 # GitHub refuses a tree whose request carries a whole repository: the
 # rewrites sent every blob as an element and large metadata repositories
@@ -140,6 +151,23 @@ class _PendingRef:
     file_message_id: int
     file_ref: TGFSFileRef
     attempts: int = 0
+    committed: Optional[asyncio.Future[None]] = None
+
+    def refresh_message_id(self) -> bool:
+        """Adopt the ref's current descriptor id; ``True`` when it moved.
+
+        A retransmission whose CLOSE was answered while this create was
+        still retrying appends a version and moves the ref to a fresh
+        descriptor message. The blob must name that id, not the stale one,
+        or the next start reads the older, replaced message back. A move
+        also means the file is real in the tree beyond this create, so it
+        earns a full new round of attempts instead of the drop.
+        """
+        if self.file_ref.message_id == self.file_message_id:
+            return False
+        self.file_message_id = self.file_ref.message_id
+        self.attempts = 0
+        return True
 
 
 @dataclass
@@ -223,21 +251,25 @@ class GithubConfig:
         return await asyncio.get_running_loop().run_in_executor(self.writer, fn, *args)
 
     def schedule_ref(self, entry: _PendingRef) -> None:
-        """Queue a deferred create for the background drain, pool per
-        repo."""
+        """Queue a create for the shared commit worker."""
         self.pending_refs.append(entry)
         if self.pending_refs_flusher is None or self.pending_refs_flusher.done():
+            window = (
+                DEFERRED_COMMIT_WINDOW
+                if entry.committed is None
+                else AWAITED_COMMIT_WINDOW
+            )
             self.pending_refs_flusher = asyncio.get_running_loop().create_task(
-                self._drain_pending_refs(), name="github-file-refs"
+                self._drain_pending_refs(window), name="github-file-refs"
             )
 
-    async def _drain_pending_refs(self) -> None:
+    async def _drain_pending_refs(self, window: float) -> None:
         # One commit per batch, not per reference: a bulk upload schedules
         # a create for every file it opens, and one-at-a-time commits fell
         # behind the client, until the queued batched flushes at the back
         # of the same lock held the metadata push of the open itself --
         # for longer than the client waits.
-        await asyncio.sleep(DEFERRED_COMMIT_WINDOW)
+        await asyncio.sleep(window)
         while self.pending_refs:
             if await self._commit_pending_refs():
                 await asyncio.sleep(DEFERRED_PUT_RETRY_DELAY)
@@ -248,13 +280,21 @@ class GithubConfig:
         batch = self.pending_refs
         self.pending_refs = []
         async with self.lock:
-            alive = [
-                entry
-                for entry in batch
-                if any(ref is entry.file_ref for ref in entry.directory.files)
-            ]
+            alive = []
+            for entry in batch:
+                if any(
+                    ref is entry.file_ref
+                    for ref in entry.directory.find_files([entry.name])
+                ):
+                    alive.append(entry)
+                elif entry.committed is not None and not entry.committed.done():
+                    entry.committed.set_exception(
+                        FileOrDirectoryDoesNotExist(entry.name)
+                    )
             if not alive:
                 return False
+            for entry in alive:
+                entry.refresh_message_id()
             if len(alive) == 1:
                 entry = alive[0]
                 try:
@@ -263,11 +303,13 @@ class GithubConfig:
                         entry.name,
                         entry.file_message_id,
                     )
+                    self._confirm(entry)
                     return False
                 except Exception as ex:
                     if self._retry(entry, ex):
                         self.pending_refs.append(entry)
-                    return True
+                        return True
+                    return False
             try:
                 await self.write(
                     _put_file_refs,
@@ -286,6 +328,8 @@ class GithubConfig:
                 logger.info(
                     f"Created {len(alive)} file reference(s) in {self.repo_name}"
                 )
+                for entry in alive:
+                    self._confirm(entry)
                 return False
             except Exception as ex:
                 logger.warning(
@@ -300,23 +344,49 @@ class GithubConfig:
                         entry.name,
                         entry.file_message_id,
                     )
+                    self._confirm(entry)
                 except Exception as ex:
                     failures.append((entry, ex))
-            if not failures:
-                return False
-            self.pending_refs.extend(
-                entry for entry, ex in failures if self._retry(entry, ex)
-            )
-            return True
+            retry = [entry for entry, ex in failures if self._retry(entry, ex)]
+            self.pending_refs.extend(retry)
+            return bool(retry)
+
+    @staticmethod
+    def _confirm(entry: _PendingRef) -> None:
+        if entry.committed is not None and not entry.committed.done():
+            entry.committed.set_result(None)
 
     def _retry(self, entry: _PendingRef, ex: Exception) -> bool:
         entry.attempts += 1
+        # A caller still waiting on CLOSE gets the outcome of this round,
+        # not a reply for a reference that might later disappear.
+        if entry.committed is not None and not entry.committed.done():
+            logger.error(
+                f"Failed to create file reference {entry.name} in "
+                f"{self.repo_name}: {ex}"
+            )
+            entry.directory.files.remove(entry.file_ref)
+            if entry.committed is not None and not entry.committed.done():
+                entry.committed.set_exception(ex)
+            return False
+        # Nobody waits on the reference any more (the CLOSE reply gave up
+        # on its deadline, or there never was a waiter): the blob keeps
+        # retrying in the background, so a retransmission finds the file
+        # in the tree instead of a hole.
+        if entry.refresh_message_id():
+            logger.info(
+                f"File reference {entry.name} moved to a newer message "
+                f"while its blob waited; committing {entry.file_message_id}"
+            )
+            return True
         if entry.attempts >= DEFERRED_PUT_ATTEMPTS or not _is_transient(ex):
             logger.error(
                 f"Failed to create file reference {entry.name} in "
                 f"{self.repo_name}: {ex}"
             )
             entry.directory.files.remove(entry.file_ref)
+            if entry.committed is not None and not entry.committed.done():
+                entry.committed.set_exception(ex)
             return False
         logger.warning(
             f"Creating file reference {entry.name} failed ({ex}); trying again"
@@ -336,6 +406,8 @@ def _put_file_refs(
 
 
 class GithubDirectory(TGFSDirectory):
+    file_refs_persist_on_create = True
+
     def __init__(
         self,
         ghc: GithubConfig,
@@ -736,19 +808,28 @@ class GithubDirectory(TGFSDirectory):
     async def create_file_ref_async(
         self, name: str, file_message_id: int
     ) -> TGFSFileRef:
-        # The in-memory tree is only ever touched on the event loop; just
-        # the GitHub call goes to the writer thread.
         file_ref = super().create_file_ref(name, file_message_id)
-        try:
-            async with self._ghc.lock:
-                await self._ghc.write(self._put_file_ref, name, file_message_id)
-        except Exception as ex:
-            logger.error(
-                f"Failed to create file reference {name} in "
-                f"{self._ghc.repo_name}: {ex}"
+        committed: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+        self._ghc.schedule_ref(
+            _PendingRef(self, name, file_message_id, file_ref, committed=committed)
+        )
+        # The shared worker completes the write even if the client goes
+        # away during the commit. By this point the content already exists.
+        done, _ = await asyncio.wait({committed}, timeout=AWAITED_COMMIT_MAX_WAIT)
+        if not done:
+            # GitHub is too slow to answer the commit. Answer the client
+            # anyway: holding the reply past what it waits for gets the
+            # connection killed and the upload aborted mid-bulk. The
+            # reference stays in the tree and the worker keeps retrying,
+            # so a retransmission appends a version to the same file.
+            committed.cancel()
+            raise TechnicalError(
+                f"Timed out after {AWAITED_COMMIT_MAX_WAIT:g}s waiting for "
+                f"the file reference of {name} to be committed to "
+                f"{self._ghc.repo_name}; the content is stored and the "
+                f"commit retries in the background"
             )
-            self.files.remove(file_ref)
-            raise
+        committed.result()
         return file_ref
 
     async def create_file_ref_deferred(

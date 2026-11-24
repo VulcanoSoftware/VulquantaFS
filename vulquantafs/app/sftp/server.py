@@ -208,7 +208,11 @@ class TGFSSFTPServer(asyncssh.SFTPServer):
     """
 
     def __init__(
-        self, chan: asyncssh.SSHServerChannel, clients: Clients, config: Config
+        self,
+        chan: asyncssh.SSHServerChannel,
+        clients: Clients,
+        config: Config,
+        active_writes: Optional[set[ResolvedPath]] = None,
     ):
         super().__init__(chan)
         self._channel = chan
@@ -218,6 +222,8 @@ class TGFSSFTPServer(asyncssh.SFTPServer):
             "anonymous"
         )
         self._handles: List[Union[ReadHandle, WriteHandle]] = []
+        self._active_writes = set() if active_writes is None else active_writes
+        self._write_paths: dict[WriteHandle, ResolvedPath] = {}
 
     # ------------------------------------------------------------------
     # helpers
@@ -482,13 +488,16 @@ class TGFSSFTPServer(asyncssh.SFTPServer):
         if not exists and not pflags & FXF_CREAT:
             raise asyncssh.SFTPNoSuchFile(f"{resolved.as_global()} does not exist")
 
-        # Reserve the name right away so a listing during the upload shows it,
-        # exactly like the WebDAV PUT path does. The GitHub blob behind the
-        # reservation is written in the background: a slow or briefly offline
-        # GitHub must not hold the open -- and with it the client's transfer --
-        # hostage (FileZilla gives up after 20 s of silence).
-        await ops.touch(resolved.relative, defer_file_ref=True)
+        if not exists:
+            ops.cd(os.path.dirname(resolved.relative))
+        if resolved in self._active_writes:
+            raise asyncssh.SFTPFailure(
+                f"{resolved.as_global()} is already being written"
+            )
 
+        # Claim the path only in the SFTP server. Publishing an empty file at
+        # OPEN leaves a false overwrite target when the transfer aborts after
+        # any bytes have arrived. The upload creates a real file after EOF.
         sftp_cfg = self._config.vulquantafs.sftp
         handle = WriteHandle(
             ops=ops,
@@ -497,8 +506,10 @@ class TGFSSFTPServer(asyncssh.SFTPServer):
             buffer_dir=sftp_cfg.upload_buffer_dir,
             max_gap_bytes=sftp_cfg.max_ahead_gap_bytes,
             wait_disconnected=self._channel.wait_closed,
-            owns_reservation=not exists,
+            create_empty_on_close=not exists,
         )
+        self._active_writes.add(resolved)
+        self._write_paths[handle] = resolved
         self._handles.append(handle)
         return handle
 
@@ -549,6 +560,7 @@ class TGFSSFTPServer(asyncssh.SFTPServer):
                 return
             await file_obj.close()
         finally:
+            self._release_write(file_obj)
             if file_obj in self._handles:
                 self._handles.remove(file_obj)
 
@@ -694,6 +706,13 @@ class TGFSSFTPServer(asyncssh.SFTPServer):
                     await handle.close()
             except Exception as ex:  # pragma: no cover - best effort cleanup
                 logger.debug("Failed to clean up an SFTP handle: %s", ex)
+            finally:
+                self._release_write(handle)
+
+    def _release_write(self, handle: Union[ReadHandle, WriteHandle]) -> None:
+        if isinstance(handle, WriteHandle):
+            if (path := self._write_paths.pop(handle, None)) is not None:
+                self._active_writes.discard(path)
 
 
 def _is_within(path: str, other: str) -> bool:
@@ -726,8 +745,10 @@ def _pflags_from_v56(desired_access: int, flags: int) -> int:
 def make_sftp_factory(
     clients: Clients, config: Config
 ) -> Callable[[asyncssh.SSHServerChannel], TGFSSFTPServer]:
+    active_writes: set[ResolvedPath] = set()
+
     def factory(chan: asyncssh.SSHServerChannel) -> TGFSSFTPServer:
-        return TGFSSFTPServer(chan, clients, config)
+        return TGFSSFTPServer(chan, clients, config, active_writes)
 
     return factory
 

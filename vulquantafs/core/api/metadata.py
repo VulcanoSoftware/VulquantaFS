@@ -5,7 +5,7 @@ from typing import AsyncIterator, Iterable, List, Literal, Optional
 
 from vulquantafs.core.model import TGFSDirectory, TGFSFileRef, TGFSMetadata
 from vulquantafs.core.repository.interface import IMetaDataRepository
-from vulquantafs.errors import FileOrDirectoryDoesNotExist
+from vulquantafs.errors import FileOrDirectoryDoesNotExist, TechnicalError
 
 from .removal_journal import RemovalJournal
 
@@ -16,10 +16,8 @@ logger = logging.getLogger(__name__)
 # within a window of each other are merged into one store write, so a
 # burst of operations (a folder deleted one file at a time over SFTP,
 # FileZilla hammering with parallel connections) pays one mirror sync
-# instead of one per operation. A coalesced push failure is logged, not
-# raised: like the replicated layer's mirror failures, the operation that
-# lost its push keeps its local changes, and the next window's push or a
-# heal carries the tree over.
+# instead of one per operation. A coalesced push failure is logged and
+# only raised to callers that explicitly require persistence.
 MetadataPushMode = Literal["inline", "coalesced"]
 
 DEFAULT_PUSH_WINDOW_SECONDS = 0.3
@@ -49,6 +47,7 @@ class MetaDataApi:
         self.__pushed = 0
         self.__wake = asyncio.Event()
         self.__condition = asyncio.Condition()
+        self.__required: dict[int, asyncio.Future[None]] = {}
         self.__pusher: Optional[asyncio.Task] = None
         self.__write_lock = asyncio.Lock()
         self.__write_needed = 0
@@ -153,8 +152,8 @@ class MetaDataApi:
                 # rely on the tree having landed when the block exits.
                 await self.__write()
 
-    async def push(self) -> None:
-        if self.__batch_depth:
+    async def push(self, *, require_success: bool = False) -> None:
+        if self.__batch_depth and not require_success:
             self.__pending = True
             return
         if self.__push_mode != "coalesced":
@@ -162,8 +161,18 @@ class MetaDataApi:
             return
         target = self.__needed + 1
         self.__needed = target
+        required = None
+        if require_success:
+            required = asyncio.get_running_loop().create_future()
+            self.__required[target] = required
         self.__ensure_pusher()
         self.__wake.set()
+        if required is not None:
+            try:
+                await required
+            finally:
+                self.__required.pop(target, None)
+            return
         # Wait for the first push that covers this request. Pushes after
         # the window is over carry the callers that registered too late for
         # the running one; no caller waits indefinitely, every push
@@ -231,15 +240,26 @@ class MetaDataApi:
                 # window closed; registers that arrive during the write
                 # open the next window.
                 snapshot = self.__needed
-                try:
-                    await self.__write()
-                except Exception as ex:
-                    logger.error(f"Pushing the metadata failed: {ex}")
-                self.__pushed = snapshot
-                async with self.__condition:
-                    self.__condition.notify_all()
+                await self.__finish_push(snapshot)
         except asyncio.CancelledError:
             raise
+
+    async def __finish_push(self, snapshot: int) -> None:
+        error = None
+        try:
+            await self.__write()
+        except Exception as ex:
+            error = ex
+            logger.error("Pushing the metadata failed: %s", ex)
+        self.__pushed = snapshot
+        for target, future in self.__required.items():
+            if target <= snapshot and not future.done():
+                if error is None:
+                    future.set_result(None)
+                else:
+                    future.set_exception(TechnicalError(str(error)))
+        async with self.__condition:
+            self.__condition.notify_all()
 
     def get_root_directory(self) -> TGFSDirectory:
         return self.__metadata_repo.root()
@@ -314,11 +334,7 @@ class MetaDataApi:
         # operations that registered ahead of the close are real and have
         # to be recorded, whatever they are still worth.
         if self.__needed > self.__pushed:
-            try:
-                await self.__write()
-            except Exception as ex:
-                logger.error(f"Pushing the metadata while closing failed: {ex}")
-            self.__pushed = self.__needed
+            await self.__finish_push(self.__needed)
         async with self.__condition:
             self.__condition.notify_all()
         worker = self.__remove_worker

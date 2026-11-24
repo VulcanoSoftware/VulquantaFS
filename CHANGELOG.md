@@ -54,6 +54,32 @@ the fact on the commits that shipped them.
 
 ### Fixed
 
+- A Telegram hiccup at startup (the 12 simultaneous fresh bot sign-ins of
+  the fix-build preview all hit `RPC_CALL_FAIL` and the container exited)
+  no longer aborts the whole start. Transient login failures -- Telegram
+  internal errors, flood waits, and the `Request was unsuccessful N
+  time(s)` Telethon raises after exhausting its own retries -- are
+  retried per bot with capped exponential backoff (5 attempts, 5 s base)
+  and flood waits honoured up to 30 s; fresh sign-ins are staggered so
+  the bots do not hammer Telegram's auth endpoint together. A bot that
+  still cannot log in is excluded from startup as before; only a
+  permanent error (broken session, bad credentials) aborts the boot.
+- An SFTP close no longer waits for the reference commit indefinitely. A
+  GitHub read timeout plus the write thread's inline retries held the
+  shared commit batch for over 27 s during the second bulk retest
+  (FileZilla disconnects after 20 s of silence), killing uploads the
+  server persisted moments later. The close now answers after 15 s at the
+  latest; the commit keeps retrying in the background, and a blob whose
+  file was retransmitted meanwhile is written under that file's current
+  descriptor id.
+- A dropped or failed SFTP upload no longer leaves an empty destination
+  that makes FileZilla pause the queue with an overwrite prompt. Opening a
+  new file claims its path in memory; only close can publish it, and a
+  disconnect before an overwrite commits leaves the previous file in place.
+- The event-loop watchdog reports when the sampler itself missed its
+  schedule, so a frame sampled late is not mistaken for the cause of a stall.
+- Use Python's standard `asyncio` loop by default instead of automatically
+  enabling uvloop. Set `VULQUANTAFS_EVENT_LOOP=uvloop` to opt back in.
 - Starting up now reads only the metadata store that holds the most recent
   tree instead of reading every store. Git stores date their tree with
   their branch head, and that head is two small GETs away -- so the boot

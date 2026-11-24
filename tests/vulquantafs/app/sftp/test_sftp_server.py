@@ -260,13 +260,19 @@ class TestReadWrite:
         with pytest.raises(asyncssh.SFTPFailure):
             await admin.open(b"/notes/sub", 0x01, asyncssh.SFTPAttrs())
 
-    async def test_open_for_write_reserves_the_name(self, admin):
+    async def test_open_for_write_does_not_create_a_file(self, admin):
         handle = await admin.open(
             b"/notes/new.txt", 0x02 | 0x08 | 0x10, asyncssh.SFTPAttrs()
         )
 
         assert handle.path == "/new.txt"
-        admin._clients["notes"].file_api.upload.assert_awaited()
+        admin._clients["notes"].file_api.upload.assert_not_awaited()
+
+    async def test_open_for_write_rejects_a_missing_parent(self, admin):
+        with pytest.raises(asyncssh.SFTPNoSuchFile):
+            await admin.open(
+                b"/notes/missing/new.txt", 0x02 | 0x08, asyncssh.SFTPAttrs()
+            )
 
     async def test_exclusive_open_of_an_existing_file_fails(self, admin):
         with pytest.raises(asyncssh.SFTPFailure):

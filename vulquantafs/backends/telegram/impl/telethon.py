@@ -5,6 +5,7 @@ from itertools import cycle
 from typing import AsyncIterator, Awaitable, Callable, List, Optional, Sequence, TypeVar
 
 from telethon import TelegramClient
+from telethon import errors as tle
 from telethon import functions as tlf
 from telethon import types as tlt
 from telethon.client.downloads import MAX_CHUNK_SIZE
@@ -56,6 +57,10 @@ logger = logging.getLogger(__name__)
 DOWNLOAD_REQUEST_SIZE = MAX_CHUNK_SIZE
 EXTRA_CONNECTION_WARMUP_SECONDS = 5.0
 STARTUP_DISCONNECT_SECONDS = 2.0
+BOT_LOGIN_ATTEMPTS = 5
+BOT_LOGIN_RETRY_DELAY = 5.0
+BOT_LOGIN_STAGGER_SECONDS = 2.0
+FLOOD_WAIT_MAX_SLEEP = 30.0
 T = TypeVar("T")
 
 
@@ -531,6 +536,26 @@ class Session:
             f.write(session_string)
 
 
+def _is_transient_telegram_login_error(ex: BaseException) -> bool:
+    if isinstance(
+        ex,
+        (
+            tle.ServerError,
+            tle.RpcCallFailError,
+            tle.RpcMcgetFailError,
+            tle.FloodWaitError,
+            tle.FloodPremiumWaitError,
+            tle.SlowModeWaitError,
+        ),
+    ):
+        return True
+    # Telethon raises this plain ValueError once its own retries against
+    # Telegram's flaky internal errors (RPC_CALL_FAIL and friends) run
+    # out; every other ValueError points at a broken session or call and
+    # stays fatal.
+    return isinstance(ex, ValueError) and str(ex).startswith("Request was unsuccessful")
+
+
 async def _disconnect_after_startup_failure(client: TelegramClient) -> None:
     try:
         async with asyncio.timeout(STARTUP_DISCONNECT_SECONDS):
@@ -644,7 +669,7 @@ async def login_as_bots(config: Config) -> List[TelegramClient]:
     logger.info("Telegram: logging in %s bot(s) via Telethon", len(bot_tokens))
     connected: List[TelegramClient] = []
 
-    async def login(token: str) -> TelegramClient | None:
+    async def login(index: int, token: str) -> TelegramClient | None:
         bot_id, _ = token.split(":")
 
         session = Session(
@@ -652,45 +677,79 @@ async def login_as_bots(config: Config) -> List[TelegramClient]:
         )
 
         sess = session.get()
-        client = _RPCOnlyTelegramClient(
-            sess if sess is not None else StringSession(),
-            api_id,
-            api_hash,
-            receive_updates=False,
-        )
-        try:
-            async with asyncio.timeout(timeout):
-                # Bound the auth-key exchange, data-centre migration, and
-                # first RPC, not just the network connect.
-                await client.connect()
-                if sess is None:
-                    await client.start(bot_token=token)  # type: ignore
-                    session.save_multibot(client.session.save())  # type: ignore
-                me = await client.get_me()
-        except (TimeoutError, ConnectionError) as ex:
-            logger.warning(
-                "Telegram bot %s not ready (%s; login budget %gs); excluding it from startup",
-                bot_id,
-                type(ex).__name__,
-                timeout,
+        if sess is None:
+            # Fresh sign-ins authenticate one by one so the bot fleet
+            # never hammers Telegram's auth endpoint at the same time.
+            await asyncio.sleep(BOT_LOGIN_STAGGER_SECONDS * index)
+
+        attempts = 0
+        while True:
+            client = _RPCOnlyTelegramClient(
+                sess if sess is not None else StringSession(),
+                api_id,
+                api_hash,
+                receive_updates=False,
             )
-            await _disconnect_after_startup_failure(client)
-            return None
-        except (Exception, asyncio.CancelledError):
-            await _disconnect_after_startup_failure(client)
-            raise
+            try:
+                async with asyncio.timeout(timeout):
+                    # Bound the auth-key exchange, data-centre migration,
+                    # and first RPC, not just the network connect.
+                    await client.connect()
+                    if sess is None:
+                        await client.start(bot_token=token)  # type: ignore
+                        session.save_multibot(client.session.save())  # type: ignore
+                    me = await client.get_me()
+            except (TimeoutError, ConnectionError) as ex:
+                logger.warning(
+                    "Telegram bot %s not ready (%s; login budget %gs); excluding it from startup",
+                    bot_id,
+                    type(ex).__name__,
+                    timeout,
+                )
+                await _disconnect_after_startup_failure(client)
+                return None
+            except asyncio.CancelledError:
+                await _disconnect_after_startup_failure(client)
+                raise
+            except Exception as ex:
+                await _disconnect_after_startup_failure(client)
+                if not _is_transient_telegram_login_error(ex):
+                    raise
+                attempts += 1
+                if attempts >= BOT_LOGIN_ATTEMPTS:
+                    logger.warning(
+                        "Telegram bot %s not ready (%s after %s attempts); excluding it from startup",
+                        bot_id,
+                        type(ex).__name__,
+                        attempts,
+                    )
+                    return None
+                wait = getattr(ex, "seconds", None)
+                if not isinstance(wait, (int, float)) or wait <= 0:
+                    wait = BOT_LOGIN_RETRY_DELAY * 2 ** (attempts - 1)
+                wait = min(wait, FLOOD_WAIT_MAX_SLEEP)
+                logger.warning(
+                    "Telegram bot %s login failed (%s; attempt %s/%s); trying again in %gs",
+                    bot_id,
+                    type(ex).__name__,
+                    attempts,
+                    BOT_LOGIN_ATTEMPTS,
+                    wait,
+                )
+                await asyncio.sleep(wait)
+            else:
+                if isinstance(me, tlt.User) and me.username:
+                    logger.info(f"logged in as @{me.username}")
+                else:
+                    logger.warning("logged in as bot, but no username found")
 
-        if isinstance(me, tlt.User) and me.username:
-            logger.info(f"logged in as @{me.username}")
-        else:
-            logger.warning("logged in as bot, but no username found")
-
-        connected.append(client)
-        return client
+                connected.append(client)
+                return client
 
     try:
         results = await asyncio.gather(
-            *(login(token) for token in bot_tokens), return_exceptions=True
+            *(login(index, token) for index, token in enumerate(bot_tokens)),
+            return_exceptions=True,
         )
     except asyncio.CancelledError:
         await asyncio.gather(*(_disconnect_after_startup_failure(c) for c in connected))

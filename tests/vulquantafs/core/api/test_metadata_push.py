@@ -221,6 +221,25 @@ async def test_a_failed_push_does_not_raise_and_does_not_strand_the_callers():
     assert repo.pushes == 1
 
 
+async def test_only_strict_waiters_see_a_failed_write_and_can_retry():
+    repo = CountingRepo()
+    repo.fail = TechnicalError("every store failed")
+    api = MetaDataApi(repo, push_mode="coalesced", push_window=0)
+    try:
+        strict, ordinary = await asyncio.gather(
+            api.push(require_success=True), api.push(), return_exceptions=True
+        )
+        assert isinstance(strict, TechnicalError)
+        assert str(strict) == "every store failed"
+        assert ordinary is None
+        assert repo.pushes == 1
+        repo.fail = None
+        await api.push(require_success=True)
+        assert repo.pushes == 2
+    finally:
+        await api.close()
+
+
 async def test_a_batch_writes_at_block_exit_despite_the_coalescer():
     repo = CountingRepo()
     api = MetaDataApi(repo, push_mode="coalesced", push_window=5)

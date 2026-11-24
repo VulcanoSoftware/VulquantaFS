@@ -43,6 +43,36 @@ async def _ticks_while(coro, interval: float = 0.01) -> int:
 
 
 class TestCreateFileRefAsync:
+    async def test_concurrent_creates_wait_for_a_single_commit(self, ghc, monkeypatch):
+        from vulquantafs.core.repository.impl.metadata.github_repo import gh_directory
+
+        entered = asyncio.Event()
+        release = threading.Event()
+        loop = asyncio.get_running_loop()
+        paths: list[str] = []
+
+        def commit(repo, branch, overlay, message):
+            paths.extend(item._InputGitTreeElement__path for item in overlay)
+            loop.call_soon_threadsafe(entered.set)
+            assert release.wait(2)
+
+        monkeypatch.setattr(gh_directory, "commit_tree_overlay", commit)
+        directory = GithubDirectory(ghc, "d", None)
+        creates = [
+            asyncio.create_task(directory.create_file_ref_async(f"f{i}", i))
+            for i in range(4)
+        ]
+        try:
+            await asyncio.wait_for(entered.wait(), 2)
+            assert not any(task.done() for task in creates)
+        finally:
+            release.set()
+            refs = await asyncio.gather(*creates)
+
+        assert paths == [f"f{i}.{i}" for i in range(4)]
+        assert [ref.name for ref in refs] == [f"f{i}" for i in range(4)]
+        ghc.repo.create_file.assert_not_called()
+
     async def test_event_loop_keeps_running_during_a_slow_write(self, ghc):
         ghc.repo.create_file.side_effect = lambda **_: time.sleep(0.3)
         directory = GithubDirectory(ghc, "d", None)
@@ -66,29 +96,52 @@ class TestCreateFileRefAsync:
         assert seen[0].startswith("github-writes")
         assert seen[0] != threading.current_thread().name
 
-    async def test_writes_are_serialised(self, ghc):
-        """Two commits on one branch at once only conflict with each other."""
+    async def test_consecutive_batches_use_the_same_serial_writer(
+        self, ghc, monkeypatch
+    ):
+        from vulquantafs.core.repository.impl.metadata.github_repo import gh_directory
+
+        first_entered = asyncio.Event()
+        release = threading.Event()
+        loop = asyncio.get_running_loop()
         running = 0
         peak = 0
-        lock = threading.Lock()
+        batches: list[list[str]] = []
 
-        def create_file(**_):
+        def commit(repo, branch, refs):
             nonlocal running, peak
-            with lock:
-                running += 1
-                peak = max(peak, running)
-            time.sleep(0.05)
-            with lock:
+            running += 1
+            peak = max(peak, running)
+            try:
+                batches.append([path for path, _ in refs])
+                if len(batches) == 1:
+                    loop.call_soon_threadsafe(first_entered.set)
+                    assert release.wait(2)
+            finally:
                 running -= 1
 
-        ghc.repo.create_file.side_effect = create_file
+        monkeypatch.setattr(gh_directory, "_put_file_refs", commit)
         directory = GithubDirectory(ghc, "d", None)
-
-        await asyncio.gather(
-            *(directory.create_file_ref_async(f"f{i}", i) for i in range(6))
+        first = asyncio.gather(
+            *(directory.create_file_ref_async(f"f{i}", i) for i in range(3))
         )
+        try:
+            await asyncio.wait_for(first_entered.wait(), 2)
+            second = asyncio.gather(
+                *(directory.create_file_ref_async(f"f{i}", i) for i in range(3, 6))
+            )
+            await asyncio.sleep(0)
+            assert not second.done()
+        finally:
+            release.set()
+            await first
+        await second
 
         assert peak == 1
+        assert batches == [
+            [f"f{i}.{i}" for i in range(3)],
+            [f"f{i}.{i}" for i in range(3, 6)],
+        ]
         assert len(directory.files) == 6
 
     async def test_failure_removes_the_ref_again(self, ghc):
@@ -111,6 +164,98 @@ class TestCreateFileRefAsync:
             content="",
             branch="main",
         )
+
+    async def test_a_commit_past_the_deadline_answers_an_error(self, ghc, monkeypatch):
+        """A GitHub read timeout plus the write thread's inline retries
+        held the awaited commit for over 27 s in the second bulk retest,
+        past FileZilla's 20 s. The waiter gives up at its deadline instead:
+        the close answers an error, the tree keeps the reference, and the
+        blob still lands in the background."""
+        from github import GithubException
+
+        from vulquantafs.core.repository.impl.metadata.github_repo import (
+            gh_directory,
+        )
+
+        monkeypatch.setattr(gh_directory, "AWAITED_COMMIT_MAX_WAIT", 0.05)
+        monkeypatch.setattr(gh_directory, "DEFERRED_PUT_RETRY_DELAY", 0)
+        monkeypatch.setattr(gh_directory, "PUT_ATTEMPTS", 1)
+        monkeypatch.setattr(gh_directory, "PUT_RETRY_DELAY", 0)
+        proceed = threading.Event()
+        paths: list[str] = []
+
+        def create_file(**kwargs):
+            paths.append(kwargs["path"])
+            if len(paths) == 1:
+                assert proceed.wait(5)
+                raise GithubException(500, {}, {})
+
+        ghc.repo.create_file.side_effect = create_file
+        directory = GithubDirectory(ghc, "d", None)
+
+        start = time.monotonic()
+        with pytest.raises(Exception, match="Timed out"):
+            await directory.create_file_ref_async("f", 1)
+        assert time.monotonic() - start < 2
+
+        # The reference stays findable, so a retransmission appends a
+        # version to the same file instead of another create.
+        assert [fr.name for fr in directory.files] == ["f"]
+        directory.files[0].message_id = 99
+        proceed.set()
+
+        flusher = ghc.pending_refs_flusher
+        if flusher is not None:
+            await asyncio.gather(flusher, return_exceptions=True)
+
+        # The blob lands for the retransmitted file's descriptor id, not
+        # the stale one the create left behind.
+        assert paths == ["f.1", "f.99"]
+        assert [fr.name for fr in directory.files] == ["f"]
+
+    async def test_a_transient_failure_keeps_a_timed_out_reference(
+        self, ghc, monkeypatch
+    ):
+        """Once the waiter left on its deadline the blob is nobody's
+        reply any more, so GitHub's transient errors must not drop the
+        reference out of the tree a retransmission just appended to."""
+        from github import GithubException
+
+        from vulquantafs.core.repository.impl.metadata.github_repo import (
+            gh_directory,
+        )
+
+        monkeypatch.setattr(gh_directory, "AWAITED_COMMIT_MAX_WAIT", 0.05)
+        monkeypatch.setattr(gh_directory, "DEFERRED_PUT_RETRY_DELAY", 0)
+        monkeypatch.setattr(gh_directory, "PUT_ATTEMPTS", 1)
+        monkeypatch.setattr(gh_directory, "PUT_RETRY_DELAY", 0)
+        proceed = threading.Event()
+        attempts = 0
+
+        def create_file(**_):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                assert proceed.wait(5)
+            if attempts <= 2:
+                raise GithubException(500, {}, {})
+
+        ghc.repo.create_file.side_effect = create_file
+        directory = GithubDirectory(ghc, "d", None)
+
+        with pytest.raises(Exception, match="Timed out"):
+            await directory.create_file_ref_async("f", 1)
+        proceed.set()
+
+        flusher = ghc.pending_refs_flusher
+        if flusher is not None:
+            await asyncio.gather(flusher, return_exceptions=True)
+
+        # The rounds nobody waits for kept retrying and the reference
+        # survived the transient failures, so the retransmission finds
+        # the file in the tree.
+        assert attempts == 3
+        assert [fr.name for fr in directory.files] == ["f"]
 
 
 class TestCreateFileRefDeferred:

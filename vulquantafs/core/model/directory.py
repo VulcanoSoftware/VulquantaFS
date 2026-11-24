@@ -375,6 +375,10 @@ class TGFSDirectory:
     # backed by a remote repository overrides them to keep its blocking calls
     # off the loop.
 
+    # A plain directory has only changed the in-memory tree when the
+    # async create returns. Document-shaped stores still need a push.
+    file_refs_persist_on_create = False
+
     async def create_file_ref_async(
         self, name: str, file_message_id: int
     ) -> TGFSFileRef:

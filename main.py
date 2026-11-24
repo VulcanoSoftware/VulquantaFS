@@ -1,18 +1,12 @@
 import asyncio
 import logging
+import os
 from typing import List, Optional
 
 from vulquantafs.utils.logger import setup_logging
 from vulquantafs.utils.watchdog import EventLoopWatchdog
 
 setup_logging()
-
-try:
-    import uvloop  # type: ignore[import]
-
-    uvloop.install()
-except ImportError:
-    logging.warning("uvloop is not installed, using default event loop")
 
 from uvicorn.config import Config as UvicornConfig
 from uvicorn.server import Server
@@ -205,7 +199,25 @@ async def main():
         await watchdog.stop()
 
 
+def run() -> None:
+    """Run the shared server loop without changing the process-wide policy."""
+    logger = logging.getLogger(__name__)
+    loop_name = os.environ.get("VULQUANTAFS_EVENT_LOOP", "asyncio").strip().lower()
+    if loop_name == "uvloop":
+        try:
+            import uvloop
+        except ImportError:
+            logger.warning("uvloop is unavailable; falling back to asyncio")
+        else:
+            logger.info("Using uvloop event loop (explicitly enabled)")
+            uvloop.run(main())
+            return
+    elif loop_name != "asyncio":
+        raise SystemExit("VULQUANTAFS_EVENT_LOOP must be 'asyncio' or 'uvloop'")
+
+    logger.info("Using asyncio event loop")
+    asyncio.run(main())
+
+
 if __name__ == "__main__":
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    loop.run_until_complete(main())
+    run()
