@@ -1,4 +1,4 @@
-"""Tests for :mod:`tgdcfs.crypto.path_names`.
+"""Tests for :mod:`vulquantafs.crypto.path_names`.
 
 Covers the round-trip property, the *deterministic* property that makes the
 ciphertext usable as a stable path identifier (same plaintext -> same
@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import pytest
 
-from tgdcfs.crypto.path_names import (
+from vulquantafs.crypto.path_names import (
     PATH_NAME_PREFIX,
     PathNameEncryptionError,
     decrypt_path_name,
@@ -42,7 +42,7 @@ def test_derive_key_is_deterministic() -> None:
 
 
 def test_derive_key_is_domain_separated() -> None:
-    from tgdcfs.crypto.names import derive_name_key
+    from vulquantafs.crypto.names import derive_name_key
 
     master = b"\x07" * 32
     # The path-name key must differ from the document-name key (truncate the

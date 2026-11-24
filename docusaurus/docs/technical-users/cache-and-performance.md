@@ -6,19 +6,19 @@ description: Tuning disk cache, write-back uploads, parallel multi-source reads,
 
 # ⚡ Local Cache & Performance Tuning
 
-TGDCFS provides high-performance local disk caching, write-back uploads, parallel multi-source downloads, and granular transfer tuning.
+VulquantaFS provides high-performance local disk caching, write-back uploads, parallel multi-source downloads, and granular transfer tuning.
 
 ---
 
-## Local Disk Cache (`tgdcfs.cache`)
+## Local Disk Cache (`vulquantafs.cache`)
 
-The local cache lives inside `$TGDCFS_DATA_DIR/cache/`. It operates on **ciphertext** (below the encryption layer) and optimizes uploads and downloads.
+The local cache lives inside `$VULQUANTAFS_DATA_DIR/cache/`. It operates on **ciphertext** (below the encryption layer) and optimizes uploads and downloads.
 
 ```yaml
-tgdcfs:
+vulquantafs:
   cache:
     enabled: true
-    dir: "cache"              # Path relative to TGDCFS_DATA_DIR
+    dir: "cache"              # Path relative to VULQUANTAFS_DATA_DIR
     max_size_mb: 20480        # Total cache budget (20 GB)
     max_files: 0              # Max cached versions (0 = unlimited)
     max_file_size_mb: 4096    # Max version size staged whole
@@ -54,7 +54,7 @@ filesystems:
 
 ### How Write-Back Works
 1. Client upload writes to local disk cache at full local network speed.
-2. TGDCFS returns `201 Created` immediately to the client.
+2. VulquantaFS returns `201 Created` immediately to the client.
 3. Distribution workers upload the file from local disk to primary and mirror channels concurrently in the background.
 
 > 🔒 **Durability Note**: Between client HTTP 201 response and cloud store completion, data lives on local disk. If disk is cleared or lost before background distribution completes, the pending file falls back to its previous version.
@@ -75,19 +75,19 @@ filesystems:
 ```
 
 ### Multi-Source Worker Pipeline
-1. TGDCFS cuts the download request into logical pieces (`download_piece_size_kb: 4096`).
+1. VulquantaFS cuts the download request into logical pieces (`download_piece_size_kb: 4096`).
 2. Concurrent async workers fetch pieces simultaneously from `tg-main` AND `tg-spare`.
 3. Output pieces are reassembled in order through a reorder window (`read_parallel_window: 8`).
 4. **Result**: Download speed equals the combined bandwidth of participating channels!
 
 ---
 
-## Transfer Fine-Tuning (`tgdcfs.transfer`)
+## Transfer Fine-Tuning (`vulquantafs.transfer`)
 
 Fine-tune MTProto / REST connection pools and worker threads in `config.yaml`:
 
 ```yaml
-tgdcfs:
+vulquantafs:
   transfer:
     upload_workers_small: 3          # Workers for files < 10 MB
     upload_workers_big: 8            # Workers for files > 10 MB
@@ -101,7 +101,7 @@ tgdcfs:
 
 ---
 
-## Large Folders (`tgdcfs.listing`)
+## Large Folders (`vulquantafs.listing`)
 
 A detailed folder listing shows the size and dates of every file.
 The directory tree in the metadata only knows the names; size
@@ -118,12 +118,12 @@ headers to fill the gaps. This lets a recursive delete enumerate a cold
 directory without first inspecting each file's contents. Such values may
 appear blank in some clients. Explicit `STAT` and `LSTAT` still resolve them.
 If a client requires exact sizes and timestamps in the listing itself, set
-`tgdcfs.sftp.fast_readdir_min_files: 0`.
+`vulquantafs.sftp.fast_readdir_min_files: 0`.
 
 The optional `listing` block makes detailed listings cheaper.
 
 ```yaml
-tgdcfs:
+vulquantafs:
   listing:
     stat_in_metadata: false    # true: keep size and dates in the metadata
     validate_on_list: true     # false: check the content messages on read only
@@ -134,7 +134,7 @@ tgdcfs:
 entry in the metadata, so a listing reads no descriptor at all:
 
 * `pinned_message`: in `metadata.json`, as a `stat` field on each file.
-* `github_repo`: in one `.tgdcfsstats.json` per folder, next to the file
+* `github_repo`: in one `.vulquantafsstats.json` per folder, next to the file
   entries, keyed by descriptor message id. It is read on the folder's
   first listing after a start.
 
@@ -149,11 +149,11 @@ its stored values, and the next listing reads them again.
 
 Keep in mind:
 
-* **Every instance that writes must support it.** An older tgdcfs or tgfs
+* **Every instance that writes must support it.** An older vulquantafs or tgfs
   that overwrites a file leaves the stored size unchanged, and listings
   keep showing the old one. Instances that only read are fine; tgfs ignores
   the extra fields. tgfs logs an "Invalid name format" warning for each
-  `.tgdcfsstats.json` it finds in a `github_repo` metadata repository.
+  `.vulquantafsstats.json` it finds in a `github_repo` metadata repository.
 * **The metadata grows** by about 70 bytes per file. With
   `pinned_message` on a Discord primary the whole `metadata.json` has to
   fit one attachment; a tree of very many files can outgrow it there.

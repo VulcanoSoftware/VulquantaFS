@@ -1,33 +1,28 @@
 import asyncio
 import logging
+import os
 from typing import List, Optional
 
-logging.basicConfig(
-    level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
-)
+from vulquantafs.utils.logger import setup_logging
+from vulquantafs.utils.watchdog import EventLoopWatchdog
 
-try:
-    import uvloop  # type: ignore[import]
-
-    uvloop.install()
-except ImportError:
-    logging.warning("uvloop is not installed, using default event loop")
+setup_logging()
 
 from uvicorn.config import Config as UvicornConfig
 from uvicorn.server import Server
 
-from tgdcfs.app import create_app
-from tgdcfs.app.sftp import start_sftp_server
-from tgdcfs.backends.base import IStore
-from tgdcfs.backends.discord import factory as discord
-from tgdcfs.backends.telegram import factory as telegram
-from tgdcfs.config import Config, StoreConfig, get_config
-from tgdcfs.core import Client, Clients
-from tgdcfs.core.client import StoreFactory
-from tgdcfs.core.local_cache import CacheSweeper, LocalCache
-from tgdcfs.core.metadata_healing import MetadataHealWorker
-from tgdcfs.core.replication import ReplicationQueue, ReplicationWorker
-from tgdcfs.utils.message_cache import set_message_cache_size
+from vulquantafs.app import create_app
+from vulquantafs.app.sftp import start_sftp_server
+from vulquantafs.backends.base import IStore
+from vulquantafs.backends.discord import factory as discord
+from vulquantafs.backends.telegram import factory as telegram
+from vulquantafs.config import Config, StoreConfig, get_config
+from vulquantafs.core import Client, Clients
+from vulquantafs.core.client import StoreFactory
+from vulquantafs.core.local_cache import CacheSweeper, LocalCache
+from vulquantafs.core.metadata_healing import MetadataHealWorker
+from vulquantafs.core.replication import ReplicationQueue, ReplicationWorker
+from vulquantafs.utils.message_cache import set_message_cache_size
 
 
 async def create_store_factory(config: Config) -> StoreFactory:
@@ -60,9 +55,9 @@ async def create_store_factory(config: Config) -> StoreFactory:
 
 def create_cache(config: Config) -> Optional[LocalCache]:
     """The local cache when the config turns it on; loaded from disk."""
-    if not config.tgdcfs.cache.enabled:
+    if not config.vulquantafs.cache.enabled:
         return None
-    cache = LocalCache(config.tgdcfs.cache)
+    cache = LocalCache(config.vulquantafs.cache)
     cache.load()
     return cache
 
@@ -81,7 +76,7 @@ async def create_clients(
             filesystem,
             config,
             store_factory,
-            encryption_cfg=config.tgdcfs.encryption,
+            encryption_cfg=config.vulquantafs.encryption,
             replication=replication,
             cache=cache,
         )
@@ -153,8 +148,13 @@ async def run_server(app, host: str, port: int, name: str):
 async def main():
     logger = logging.getLogger(__name__)
     config = get_config()
+    # Size and dates read by listings since the last write (see the
+    # finally block): the watchdog reads the loop's pace off them while
+    # a stall is ongoing, before any handler could log it.
+    watchdog = EventLoopWatchdog()
+    watchdog.start()
     # Before the first store exists, so every channel starts at this size.
-    set_message_cache_size(config.tgdcfs.listing.message_cache_size)
+    set_message_cache_size(config.vulquantafs.listing.message_cache_size)
 
     replication = ReplicationQueue(config.replication_queue_file)
     cache = create_cache(config)
@@ -175,7 +175,10 @@ async def main():
 
     try:
         await run_server(
-            app, config.tgdcfs.server.host, config.tgdcfs.server.port, "TGDCFS"
+            app,
+            config.vulquantafs.server.host,
+            config.vulquantafs.server.port,
+            "VulquantaFS",
         )
     finally:
         for worker in workers:
@@ -193,9 +196,28 @@ async def main():
         if sftp_acceptor:
             sftp_acceptor.close()
             await sftp_acceptor.wait_closed()
+        await watchdog.stop()
+
+
+def run() -> None:
+    """Run the shared server loop without changing the process-wide policy."""
+    logger = logging.getLogger(__name__)
+    loop_name = os.environ.get("VULQUANTAFS_EVENT_LOOP", "asyncio").strip().lower()
+    if loop_name == "uvloop":
+        try:
+            import uvloop
+        except ImportError:
+            logger.warning("uvloop is unavailable; falling back to asyncio")
+        else:
+            logger.info("Using uvloop event loop (explicitly enabled)")
+            uvloop.run(main())
+            return
+    elif loop_name != "asyncio":
+        raise SystemExit("VULQUANTAFS_EVENT_LOOP must be 'asyncio' or 'uvloop'")
+
+    logger.info("Using asyncio event loop")
+    asyncio.run(main())
 
 
 if __name__ == "__main__":
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    loop.run_until_complete(main())
+    run()

@@ -9,7 +9,7 @@ backends:
       tokens:
         - hidden
     lib: pyrogram
-    # When ``true``, removing a file (or directory) through TGDCFS also issues
+    # When ``true``, removing a file (or directory) through VulquantaFS also issues
     # ``messages.deleteMessages`` for every backing message in the channel:
     # the JSON file-descriptor message and every content message of every
     # version. Default is ``false`` -- metadata is updated but the original
@@ -29,15 +29,15 @@ backends:
 
 # Stores: one channel of one backend, under a name of your choosing. The
 # name is only used in this file; the metadata refers to a store by
-# ``<backend prefix>:<channel>`` (here ``tg:tgdcfsdemo``), so renaming a
+# ``<backend prefix>:<channel>`` (here ``tg:vulquantafsdemo``), so renaming a
 # store is safe.
 stores:
   demo:
     backend: telegram
-    channel: 'tgdcfsdemo'
+    channel: 'vulquantafsdemo'
   # demo-mirror:
   #   backend: telegram
-  #   channel: 'tgdcfsdemomirror'
+  #   channel: 'vulquantafsdemomirror'
   # demo-discord:
   #   backend: discord
   #   channel: '123456789012345678'
@@ -61,7 +61,7 @@ stores:
 # ``write_ack``: primary (default; the PUT lasts until the primary has
 # the bytes) | cache (answer once the bytes are in the local cache and
 # distribute them to primary and mirrors in parallel afterwards; needs
-# ``tgdcfs.cache.enabled`` and is refused with ``strict: true``). Between
+# ``vulquantafs.cache.enabled`` and is refused with ``strict: true``). Between
 # the answer and the primary's copy the bytes live only on this host.
 # ``read_parallel``: read large files from every store that holds a
 # complete copy at once; ``read_sources`` restricts that to the named
@@ -85,7 +85,7 @@ filesystems:
     metadata:
       type: github_repo
       github_repo:
-        repo: 'tgdcfs-demo/tgdcfs-demo'
+        repo: 'vulquantafs-demo/vulquantafs-demo'
         commit: 'master'
         access_token: hidden
         # How the tree is stored: 'tree' (default) mirrors it into the
@@ -113,7 +113,7 @@ filesystems:
     #     store: demo-mirror
     #   - type: gitlab_repo
     #     gitlab_repo:
-    #       repo: 'tgdcfs-demo/tgdcfs-demo'
+    #       repo: 'vulquantafs-demo/vulquantafs-demo'
     #       branch: 'master'
     #       access_token: hidden
     #       # How the tree is stored: 'tree' (default, the same shape the
@@ -125,7 +125,7 @@ filesystems:
     #       # base_url: 'https://gitlab.example.com'  # self-hosted
     #       # file_path: 'metadata.json'
 
-tgdcfs:
+vulquantafs:
   users:
   jwt:
     secret: hidden
@@ -258,7 +258,7 @@ tgdcfs:
   # folders".
   #
   # ``stat_in_metadata: true`` keeps size and dates of every file in the
-  # metadata (``metadata.json``, or one ``.tgdcfsstats.json`` per folder
+  # metadata (``metadata.json``, or one ``.vulquantafsstats.json`` per folder
   # with ``github_repo``), so a listing reads no descriptor at all. Missing
   # values are read once and written back. Only turn it on when every
   # instance that writes to this file system supports it.
@@ -277,7 +277,7 @@ tgdcfs:
   # ---------------------------------------------------------------------------
   # Optional at-rest encryption.
   #
-  # When ``enabled: true``, every file uploaded through TGDCFS is encrypted with
+  # When ``enabled: true``, every file uploaded through VulquantaFS is encrypted with
   # AES-256-GCM in 64 KiB chunks *before* it leaves this process. The Telegram
   # channel never sees plaintext, so a compromised channel reveals only
   # ciphertext + a public salt per file.
@@ -306,7 +306,7 @@ tgdcfs:
     enabled: false
     encrypt_names: false
     # passphrase: "change-me-or-use-a-file"
-    passphrase_env: TGDCFS_MASTER_PASSPHRASE
+    passphrase_env: VULQUANTAFS_MASTER_PASSPHRASE
     # passphrase_file: secrets/master.passphrase
     master_salt_file: master.salt
     chunk_size: 65536

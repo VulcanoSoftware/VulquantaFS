@@ -1,12 +1,12 @@
 ---
 sidebar_position: 2
 title: Connecting Your Apps
-description: Step-by-step instructions for connecting WebDAV and SFTP apps to TGDCFS.
+description: Step-by-step instructions for connecting WebDAV and SFTP apps to VulquantaFS.
 ---
 
 # 🔌 Connecting Your Apps & Devices
 
-TGDCFS works with almost any file client or media player that supports **WebDAV** or **SFTP**. This page provides step-by-step instructions for popular software across Windows, macOS, iOS, and Android.
+VulquantaFS works with almost any file client or media player that supports **WebDAV** or **SFTP**. This page provides step-by-step instructions for popular software across Windows, macOS, iOS, and Android.
 
 ---
 
@@ -24,7 +24,7 @@ The following clients are officially tested and verified:
 
 ## 1. Connecting via WebDAV
 
-WebDAV allows your computer or phone to mount TGDCFS like a cloud folder or external drive.
+WebDAV allows your computer or phone to mount VulquantaFS like a cloud folder or external drive.
 
 ### Connection Details Needed
 - **Server URL**: `http://your-server-ip:1900/webdav` (the server itself speaks plain HTTP; use a TLS reverse proxy for HTTPS)
@@ -67,7 +67,7 @@ WebDAV allows your computer or phone to mount TGDCFS like a cloud folder or exte
 
 ## 2. Connecting via SFTP
 
-TGDCFS provides an SFTP server (SCP is accepted too) on port `2222` (or your configured port). File permissions, ownership and timestamps are accepted but not stored, and symbolic and hard links are not supported.
+VulquantaFS provides an SFTP server (SCP is accepted too) on port `2222` (or your configured port). File permissions, ownership and timestamps are accepted but not stored, and symbolic and hard links are not supported.
 
 ### Connection Details Needed
 - **Protocol**: SFTP (SSH File Transfer Protocol)
@@ -95,14 +95,14 @@ TGDCFS provides an SFTP server (SCP is accepted too) on port `2222` (or your con
 You can configure rclone interactively or add it directly to `~/.config/rclone/rclone.conf`:
 
 ```ini
-[tgdcfs-webdav]
+[vulquantafs-webdav]
 type = webdav
 url = http://your-server-ip:1900/webdav
 vendor = other
 user = your_username
 pass = your_encrypted_password
 
-[tgdcfs-sftp]
+[vulquantafs-sftp]
 type = sftp
 host = your-server-ip
 port = 2222
@@ -112,8 +112,8 @@ pass = your_encrypted_password
 
 Test your connection with:
 ```bash
-rclone ls tgdcfs-webdav:
-rclone ls tgdcfs-sftp:
+rclone ls vulquantafs-webdav:
+rclone ls vulquantafs-sftp:
 ```
 
 ---

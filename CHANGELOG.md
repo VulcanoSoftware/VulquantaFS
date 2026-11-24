@@ -1,6 +1,6 @@
 # Changelog
 
-All notable changes to tgdcfs are documented in this file.
+All notable changes to vulquantafs are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
@@ -9,8 +9,8 @@ configuration defaults; such changes are listed under **Changed** and marked
 as breaking where an existing setup needs attention.
 
 Every release is a Git tag `vX.Y.Z` with a matching
-[GitHub release](https://github.com/Xyvran/tgdcfs/releases), and the Docker
-images `xyvran/tgdcfs` and `xyvran/tgdcfs-fe` carry the tags `X.Y.Z` and `X.Y`
+[GitHub release](https://github.com/Xyvran/vulquantafs/releases), and the Docker
+images `xyvran/vulquantafs` and `xyvran/vulquantafs-fe` carry the tags `X.Y.Z` and `X.Y`
 next to the commit tag. Releases up to and including 0.6.1 were tagged after
 the fact on the commits that shipped them.
 
@@ -54,6 +54,32 @@ the fact on the commits that shipped them.
 
 ### Fixed
 
+- A Telegram hiccup at startup (the 12 simultaneous fresh bot sign-ins of
+  the fix-build preview all hit `RPC_CALL_FAIL` and the container exited)
+  no longer aborts the whole start. Transient login failures -- Telegram
+  internal errors, flood waits, and the `Request was unsuccessful N
+  time(s)` Telethon raises after exhausting its own retries -- are
+  retried per bot with capped exponential backoff (5 attempts, 5 s base)
+  and flood waits honoured up to 30 s; fresh sign-ins are staggered so
+  the bots do not hammer Telegram's auth endpoint together. A bot that
+  still cannot log in is excluded from startup as before; only a
+  permanent error (broken session, bad credentials) aborts the boot.
+- An SFTP close no longer waits for the reference commit indefinitely. A
+  GitHub read timeout plus the write thread's inline retries held the
+  shared commit batch for over 27 s during the second bulk retest
+  (FileZilla disconnects after 20 s of silence), killing uploads the
+  server persisted moments later. The close now answers after 15 s at the
+  latest; the commit keeps retrying in the background, and a blob whose
+  file was retransmitted meanwhile is written under that file's current
+  descriptor id.
+- A dropped or failed SFTP upload no longer leaves an empty destination
+  that makes FileZilla pause the queue with an overwrite prompt. Opening a
+  new file claims its path in memory; only close can publish it, and a
+  disconnect before an overwrite commits leaves the previous file in place.
+- The event-loop watchdog reports when the sampler itself missed its
+  schedule, so a frame sampled late is not mistaken for the cause of a stall.
+- Use Python's standard `asyncio` loop by default instead of automatically
+  enabling uvloop. Set `VULQUANTAFS_EVENT_LOOP=uvloop` to opt back in.
 - Starting up now reads only the metadata store that holds the most recent
   tree instead of reading every store. Git stores date their tree with
   their branch head, and that head is two small GETs away -- so the boot
@@ -230,8 +256,8 @@ the fact on the commits that shipped them.
   `scripts/sync_badges.py` only knew how to replace the upstream's names).
   `next.config.ts` now derives the Docker Hub image, the GHCR image and the
   Pages URL from `GITHUB_REPOSITORY` and `DOCKERHUB_NAMESPACE` at build
-  time, and the Pages workflow and the `tgdcfs-fe` image build pass them
-  in. The GHCR image is shown as `ghcr.io/<owner>/<repo>/tgdcfs`, the path
+  time, and the Pages workflow and the `vulquantafs-fe` image build pass them
+  in. The GHCR image is shown as `ghcr.io/<owner>/<repo>/vulquantafs`, the path
   the workflows actually publish to.
 
 ### Changed
@@ -264,8 +290,8 @@ the fact on the commits that shipped them.
   picker of a pinned-message store only offers the file system's own
   stores, and renaming a store keeps the pinned-message stores pointing
   at it.
-- The Docker images are published to GHCR (`ghcr.io/<owner>/tgdcfs` and
-  `ghcr.io/<owner>/tgdcfs-fe`) next to Docker Hub, with the same `latest`,
+- The Docker images are published to GHCR (`ghcr.io/<owner>/vulquantafs` and
+  `ghcr.io/<owner>/vulquantafs-fe`) next to Docker Hub, with the same `latest`,
   commit, `preview` and release tags. GHCR publishing uses the workflow's
   own `GITHUB_TOKEN`, so a fork without Docker Hub secrets still ships its
   images; Docker Hub publishing is skipped with a warning there instead of
@@ -282,20 +308,20 @@ the fact on the commits that shipped them.
 - This changelog, SemVer release tags and GitHub releases. A pushed tag
   `vX.Y.Z` publishes the release notes from this file and adds the version
   tags to the Docker images of that commit.
-- New config block `tgdcfs.listing` for folders with many files (see
+- New config block `vulquantafs.listing` for folders with many files (see
   "Large folders" in the README). `validate_on_list` (default `true`) can
   turn off the check of every file's content messages during a listing,
   which halves the store reads of a WebDAV `PROPFIND` or an SFTP `ls`.
   `message_cache_size` (default `1024`) sets how many messages are kept in
   memory per channel; it used to be fixed at 1024, so a folder with more
   files was read from the store again on every listing.
-- `tgdcfs.listing.stat_in_metadata` (default `false`) keeps each file's
+- `vulquantafs.listing.stat_in_metadata` (default `false`) keeps each file's
   size and dates in the metadata, so a listing reads no descriptor at all
   and a folder of 10,000 files opens without 20,000 store reads. Missing
   values are read on the first listing and written back in the
   background, also when the client gives up on the listing halfway. With
   `pinned_message` they are a `stat` field in `metadata.json`, with
-  `github_repo` one `.tgdcfsstats.json` per folder. Only turn it on when
+  `github_repo` one `.vulquantafsstats.json` per folder. Only turn it on when
   every instance that writes to the file system supports it.
 - Config generator: a "Large Folders" section for the `listing` block; it
   is written only with the values that differ from the defaults, and
@@ -468,7 +494,7 @@ the fact on the commits that shipped them.
   upload stream, so the staged copy was never read and only cost disk space
   and evictions. `stage_uploads` now only applies to `sync: inline` and
   `sync: background`.
-- The `xyvran/tgdcfs-fe` image is published again. Its static build ran
+- The `xyvran/vulquantafs-fe` image is published again. Its static build ran
   under arm64 emulation and hit the six-hour job limit; it now runs once on
   the build host, and only the nginx stage is built per platform.
 
@@ -510,7 +536,7 @@ the fact on the commits that shipped them.
   mirror that fails mid-stream is detached and backfilled later; a failing
   primary aborts the mirrors. Mirrors that copy server-side are still
   forwarded afterwards.
-- `tgdcfs.transfer.tee_buffer_mb` (default `64`): buffer per mirror in tee
+- `vulquantafs.transfer.tee_buffer_mb` (default `64`): buffer per mirror in tee
   mode.
 - Config generator: "Tee" in the Sync select, a "Tee Buffer per Mirror (MB)"
   field, and an on/off switch for the Telegram section like the Discord one,
@@ -574,7 +600,7 @@ the fact on the commits that shipped them.
 
 ### Added
 
-- Local cache on the data volume (`tgdcfs.cache`, off by default). It holds
+- Local cache on the data volume (`vulquantafs.cache`, off by default). It holds
   ciphertext only and never fails a transfer: a disk error or a full cache
   means the transfer runs without it.
   - Staged uploads (`stage_uploads`): mirrors that re-upload read the bytes
@@ -595,9 +621,9 @@ the fact on the commits that shipped them.
 - Multi-source downloads per file system (`read_parallel`, default off;
   `read_sources` to limit the stores): a download is split into pieces served
   by every store that holds a complete copy, with per-piece failover.
-- `tgdcfs.transfer.upload_parts_in_flight` (default 1): upload several
+- `vulquantafs.transfer.upload_parts_in_flight` (default 1): upload several
   Telegram parts at once from a seekable source such as the cache.
-- `tgdcfs.transfer.read_parallel_window`: reorder window for multi-source
+- `vulquantafs.transfer.read_parallel_window`: reorder window for multi-source
   reads.
 - Manager API: `GET /api/cache` (budget, entries, hits and misses, free disk
   space, last sweep) and `POST /api/cache/evict`. The mini app shows the cache
@@ -670,27 +696,27 @@ the fact on the commits that shipped them.
 
 ### Added
 
-- tgdcfs, bootstrapped from [tgfs](https://github.com/Xyvran/tgfs) at commit
+- vulquantafs, bootstrapped from [tgfs](https://github.com/Xyvran/tgfs) at commit
   `7464666`: Telegram as storage with WebDAV and SFTP access, at-rest
   encryption and GitHub or Telegram metadata.
-- Docker images `xyvran/tgdcfs` and `xyvran/tgdcfs-fe`; container user and
-  data directory `/home/tgdcfs/.tgdcfs`.
+- Docker images `xyvran/vulquantafs` and `xyvran/vulquantafs-fe`; container user and
+  data directory `/home/vulquantafs/.vulquantafs`.
 
 ### Changed
 
-- Renamed from tgfs: package `tgdcfs`, environment variables `TGDCFS_*` and
-  data directory `~/.tgdcfs`. The old `TGFS_*` variables and a top-level
+- Renamed from tgfs: package `vulquantafs`, environment variables `VULQUANTAFS_*` and
+  data directory `~/.vulquantafs`. The old `TGFS_*` variables and a top-level
   `tgfs:` config block still work with a deprecation warning.
 - Files and metadata written by tgfs are read unchanged; the on-disk
   encryption format keeps its tgfs constants.
 
-[Unreleased]: https://github.com/Xyvran/tgdcfs/compare/v0.6.1...HEAD
-[0.6.1]: https://github.com/Xyvran/tgdcfs/compare/v0.6.0...v0.6.1
-[0.6.0]: https://github.com/Xyvran/tgdcfs/compare/v0.5.1...v0.6.0
-[0.5.1]: https://github.com/Xyvran/tgdcfs/compare/v0.5.0...v0.5.1
-[0.5.0]: https://github.com/Xyvran/tgdcfs/compare/v0.4.1...v0.5.0
-[0.4.1]: https://github.com/Xyvran/tgdcfs/compare/v0.4.0...v0.4.1
-[0.4.0]: https://github.com/Xyvran/tgdcfs/compare/v0.3.0...v0.4.0
-[0.3.0]: https://github.com/Xyvran/tgdcfs/compare/v0.2.0...v0.3.0
-[0.2.0]: https://github.com/Xyvran/tgdcfs/compare/v0.1.0...v0.2.0
-[0.1.0]: https://github.com/Xyvran/tgdcfs/releases/tag/v0.1.0
+[Unreleased]: https://github.com/Xyvran/vulquantafs/compare/v0.6.1...HEAD
+[0.6.1]: https://github.com/Xyvran/vulquantafs/compare/v0.6.0...v0.6.1
+[0.6.0]: https://github.com/Xyvran/vulquantafs/compare/v0.5.1...v0.6.0
+[0.5.1]: https://github.com/Xyvran/vulquantafs/compare/v0.5.0...v0.5.1
+[0.5.0]: https://github.com/Xyvran/vulquantafs/compare/v0.4.1...v0.5.0
+[0.4.1]: https://github.com/Xyvran/vulquantafs/compare/v0.4.0...v0.4.1
+[0.4.0]: https://github.com/Xyvran/vulquantafs/compare/v0.3.0...v0.4.0
+[0.3.0]: https://github.com/Xyvran/vulquantafs/compare/v0.2.0...v0.3.0
+[0.2.0]: https://github.com/Xyvran/vulquantafs/compare/v0.1.0...v0.2.0
+[0.1.0]: https://github.com/Xyvran/vulquantafs/releases/tag/v0.1.0

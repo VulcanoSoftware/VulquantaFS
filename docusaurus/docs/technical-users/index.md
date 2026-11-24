@@ -1,18 +1,18 @@
 ---
 sidebar_position: 1
 title: Technical Architecture Overview
-description: High-level technical architecture of TGDCFS for sysadmins and self-hosters.
+description: High-level technical architecture of VulquantaFS for sysadmins and self-hosters.
 ---
 
 # 🛠️ Technical Architecture Overview
 
-**TGDCFS** is a cloud filesystem bridge written in Python 3.13+ using **FastAPI**, **Uvicorn**, **Telethon** (or **Pyrogram**, via `backends.telegram.lib`), **AsyncSSH**, and **discord.py**. It presents Telegram and Discord channels as unified **WebDAV** and **SFTP** storage backends.
+**VulquantaFS** is a cloud filesystem bridge written in Python 3.13+ using **FastAPI**, **Uvicorn**, **Telethon** (or **Pyrogram**, via `backends.telegram.lib`), **AsyncSSH**, and **discord.py**. It presents Telegram and Discord channels as unified **WebDAV** and **SFTP** storage backends.
 
 ---
 
 ## Core System Abstractions
 
-TGDCFS divides storage into three fundamental abstractions: **Backends**, **Stores**, and **File Systems**.
+VulquantaFS divides storage into three fundamental abstractions: **Backends**, **Stores**, and **File Systems**.
 
 ```
 +-------------------------------------------------------------------------+
@@ -42,7 +42,7 @@ TGDCFS divides storage into three fundamental abstractions: **Backends**, **Stor
 ```
 
 ### 1. Backends
-A **Backend** is the underlying cloud protocol driver. TGDCFS supports two backends:
+A **Backend** is the underlying cloud protocol driver. VulquantaFS supports two backends:
 - **Telegram Backend**: Uploads chunked files in messages of up to 2,097,152,000 bytes (512 KiB × 4000) using MTProto RPC calls (`saveBigFilePart`). Parts of up to 4,194,304,000 bytes are used only when a Telegram *user account* is configured under `backends.telegram.account` with `used_to_upload: true` and that account has Telegram Premium; bots alone are limited to the smaller size.
 - **Discord Backend**: Uploads files into attachments up to `max_file_size_bytes` (default 10 MB; set it to match your server: 20 MB unboosted, 50 MB at boost level 2, 100 MB at level 3) via HTTP REST endpoints.
 
@@ -60,7 +60,7 @@ A **File System** represents a top-level directory exposed to WebDAV and SFTP us
 
 ## Metadata Strategies
 
-TGDCFS maintains directory trees, file attributes, modification times, and chunk mapping in a **Metadata Repository**. You can choose between two metadata backends:
+VulquantaFS maintains directory trees, file attributes, modification times, and chunk mapping in a **Metadata Repository**. You can choose between two metadata backends:
 
 | Metadata Type | Description | Best Used For |
 |---|---|---|

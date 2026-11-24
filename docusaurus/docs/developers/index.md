@@ -1,12 +1,12 @@
 ---
 sidebar_position: 1
 title: Developer Overview & Architecture Tour
-description: Deep-dive architecture tour of the TGDCFS codebase for developers and contributors.
+description: Deep-dive architecture tour of the VulquantaFS codebase for developers and contributors.
 ---
 
 # 💻 Developer Overview & Architecture Tour
 
-Welcome to the **TGDCFS Developer Guide**! This documentation is written for software engineers who want to understand the inner workings of TGDCFS, add new features, fix bugs, or contribute to the project.
+Welcome to the **VulquantaFS Developer Guide**! This documentation is written for software engineers who want to understand the inner workings of VulquantaFS, add new features, fix bugs, or contribute to the project.
 
 ---
 
@@ -27,13 +27,13 @@ Welcome to the **TGDCFS Developer Guide**! This documentation is written for sof
 ## Codebase Directory Structure
 
 ```
-tgdcfs/
+vulquantafs/
 ├── main.py                     # Server entrypoint (Uvicorn + FastAPI + SFTP initialization)
 ├── config-test.yaml            # Test configuration file
 ├── demo-config.yaml            # Full annotated example config
 ├── pyproject.toml              # Dependencies, build metadata, tool settings
 ├── makefile                    # Quick development commands (make mypy, make ruff)
-├── tgdcfs/                     # Main Python package
+├── vulquantafs/                     # Main Python package
 │   ├── config.py               # Config loading, schema v2, legacy tgfs translation
 │   ├── backends/               # Backend drivers & store abstractions
 │   │   ├── base.py             # IStore interface & StoreCapabilities
@@ -55,7 +55,7 @@ tgdcfs/
 │   └── tasks/                  # Task store & async task execution runner
 ├── tests/                      # Full test suite (79 modules)
 │   ├── fakes/                  # In-memory fake stores for offline testing
-│   ├── tgdcfs/                 # Unit tests mirroring the package layout
+│   ├── vulquantafs/                 # Unit tests mirroring the package layout
 │   │   ├── app/                #   WebDAV, SFTP, manager and cache app tests
 │   │   ├── auth/               #   Basic/Bearer authentication tests
 │   │   ├── backends/           #   Telegram & Discord store tests
@@ -71,7 +71,7 @@ tgdcfs/
 │   ├── encrypt_metadata_names.py # One-off name decryption helper
 │   ├── measure_transfer.py     # Download piece transfer benchmarking tool
 │   └── sync_badges.py          # Regenerates the README badge block
-├── tgdcfs-gh-pages/            # Next.js web frontend & Telegram Mini App
+├── vulquantafs-gh-pages/            # Next.js web frontend & Telegram Mini App
 └── docusaurus/                 # Docusaurus documentation website
 ```
 
@@ -79,7 +79,7 @@ tgdcfs/
 
 ## Key Core Interfaces & Components
 
-### 1. `IStore` Interface (`tgdcfs/backends/base.py`)
+### 1. `IStore` Interface (`vulquantafs/backends/base.py`)
 `IStore` is the foundational abstraction that decouples repository logic from specific cloud backends:
 
 ```python
@@ -102,10 +102,10 @@ class IStore(metaclass=ABCMeta):
     async def get_pinned_message(self) -> MessageRespWithDocument: ...
 ```
 
-### 2. `StoreFileContentRepository` (`tgdcfs/core/repository/`)
+### 2. `StoreFileContentRepository` (`vulquantafs/core/repository/`)
 Handles raw byte stream operations, chunking, range slicing, local cache integration, and multi-source read dispatch.
 
-### 3. `ReplicationQueue` & `ReplicationWorker` (`tgdcfs/core/replication.py`)
+### 3. `ReplicationQueue` & `ReplicationWorker` (`vulquantafs/core/replication.py`)
 Provides persistent asynchronous file replication across Telegram and Discord stores, persisting queue items to `replication_queue.json`.
 
 ---

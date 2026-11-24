@@ -1,4 +1,5 @@
 import asyncio
+import sys
 from typing import Any, Dict
 
 import pytest
@@ -7,11 +8,12 @@ from main import (
     create_clients,
     create_store_factory,
     main,
+    run,
     run_server,
     start_replication_workers,
 )
-from tgdcfs.config import Config
-from tgdcfs.core.replication import ReplicationQueue
+from vulquantafs.config import Config
+from vulquantafs.core.replication import ReplicationQueue
 
 CONFIG: Dict[str, Any] = {
     "backends": {
@@ -29,12 +31,60 @@ CONFIG: Dict[str, Any] = {
         "media": {"primary": "tg-main", "mirrors": ["tg-spare"]},
         "notes": {"primary": "tg-spare", "allow_shared_store": True},
     },
-    "tgdcfs": {
+    "vulquantafs": {
         "users": {},
         "jwt": {"secret": "jwt_secret", "algorithm": "HS256", "life": 3600},
         "server": {"host": "0.0.0.0", "port": 8080},
     },
 }
+
+
+@pytest.mark.parametrize("selection", [None, "asyncio", "uvloop"])
+def test_run_selects_the_event_loop_and_closes_it(selection, monkeypatch, mocker):
+    if selection is None:
+        monkeypatch.delenv("VULQUANTAFS_EVENT_LOOP", raising=False)
+    else:
+        monkeypatch.setenv("VULQUANTAFS_EVENT_LOOP", selection)
+    if selection == "uvloop":
+        uvloop = pytest.importorskip("uvloop")
+
+    loops = []
+
+    async def capture_loop():
+        loops.append(asyncio.get_running_loop())
+
+    mocker.patch("main.main", side_effect=capture_loop)
+    policy = asyncio.get_event_loop_policy()
+    run()
+
+    (loop,) = loops
+    if selection == "uvloop":
+        assert isinstance(loop, uvloop.Loop)
+    else:
+        assert isinstance(loop, asyncio.BaseEventLoop)
+    assert loop.is_closed()
+    assert asyncio.get_event_loop_policy() is policy
+
+
+def test_run_falls_back_when_uvloop_is_unavailable(monkeypatch, mocker, caplog):
+    monkeypatch.setenv("VULQUANTAFS_EVENT_LOOP", "uvloop")
+    monkeypatch.setitem(sys.modules, "uvloop", None)
+    start = mocker.patch("main.main")
+
+    run()
+
+    start.assert_awaited_once()
+    assert "falling back to asyncio" in caplog.text
+
+
+def test_run_rejects_an_invalid_event_loop(monkeypatch, mocker):
+    monkeypatch.setenv("VULQUANTAFS_EVENT_LOOP", "typo")
+    start = mocker.patch("main.main")
+
+    with pytest.raises(SystemExit, match="VULQUANTAFS_EVENT_LOOP"):
+        run()
+
+    start.assert_not_called()
 
 
 class TestMain:
@@ -61,7 +111,7 @@ class TestMain:
             filesystem, cfg, factory, encryption_cfg=None, replication=None, cache=None
         ):
             assert cfg is config
-            assert encryption_cfg is config.tgdcfs.encryption
+            assert encryption_cfg is config.vulquantafs.encryption
             created[filesystem.name] = await factory(cfg.stores[filesystem.primary])
             return mocker.Mock(name=filesystem.name)
 
@@ -196,10 +246,10 @@ class TestMain:
         mock_run_server = mocker.patch("main.run_server")
         mocker.patch("main.start_replication_workers", return_value=[])
         mock_config = mocker.Mock()
-        mock_config.tgdcfs.server.host = "0.0.0.0"
-        mock_config.tgdcfs.server.port = 9000
-        mock_config.tgdcfs.cache.enabled = False
-        mock_config.tgdcfs.listing.message_cache_size = 1024
+        mock_config.vulquantafs.server.host = "0.0.0.0"
+        mock_config.vulquantafs.server.port = 9000
+        mock_config.vulquantafs.cache.enabled = False
+        mock_config.vulquantafs.listing.message_cache_size = 1024
         mock_config.replication_queue_file = None
 
         mock_clients = mocker.Mock()
@@ -226,5 +276,7 @@ class TestMain:
         assert mock_create_clients.call_args.args[0] is mock_config
         mock_create_app.assert_called_once()
         assert mock_create_app.call_args.args[:2] == (mock_clients, mock_config)
-        mock_run_server.assert_called_once_with(mock_app, "0.0.0.0", 9000, "TGDCFS")
+        mock_run_server.assert_called_once_with(
+            mock_app, "0.0.0.0", 9000, "VulquantaFS"
+        )
         stats.close.assert_awaited_once()

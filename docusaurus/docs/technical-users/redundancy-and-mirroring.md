@@ -6,16 +6,16 @@ description: Multi-channel RAID-1 style store redundancy, sync modes, replicas, 
 
 # 🔄 Redundancy, Mirroring & Disaster Recovery
 
-TGDCFS provides RAID-1 style channel redundancy. A single **File System** can mirror data across multiple Telegram and Discord channels.
+VulquantaFS provides RAID-1 style channel redundancy. A single **File System** can mirror data across multiple Telegram and Discord channels.
 
 ---
 
 ## Aligned Copies vs Replicas
 
-When mirroring files between stores, TGDCFS handles differences in part limits automatically:
+When mirroring files between stores, VulquantaFS handles differences in part limits automatically:
 
 - **Aligned Copies**: Used when the mirror is in the same backend as the primary, or when every part of the primary fits in one message of the mirror (e.g., Telegram to Telegram, or a Discord primary to a Telegram mirror). Every message in the primary store maps 1-to-1 with a message in the mirror store (`mirrors` map).
-- **Replicas**: Used when the mirror is in another backend and the primary's parts do not fit one of its messages (e.g., a 2 GiB Telegram primary mirrored to a 20 MB Discord channel). TGDCFS cuts the file into Discord-sized pieces and tracks them in a compact `replicas` map.
+- **Replicas**: Used when the mirror is in another backend and the primary's parts do not fit one of its messages (e.g., a 2 GiB Telegram primary mirrored to a 20 MB Discord channel). VulquantaFS cuts the file into Discord-sized pieces and tracks them in a compact `replicas` map.
 
 ---
 
@@ -60,7 +60,7 @@ This requires at least one streaming mirror to remain writable. `inline`, `backg
 When a read from the primary fails, the primary is considered dead for 60 seconds (`primary_dead` on `/api/filesystems`) and reads prefer the mirrors in that window.
 
 If a message chunk or store becomes unreachable (e.g. FloodWait rate limit or network issue):
-- TGDCFS automatically fails over to available mirror stores or replicas chunk-by-chunk.
+- VulquantaFS automatically fails over to available mirror stores or replicas chunk-by-chunk.
 - Read operations resume seamlessly at the exact byte where the failure occurred.
 
 ---
@@ -69,9 +69,9 @@ If a message chunk or store becomes unreachable (e.g. FloodWait rate limit or ne
 
 If a primary store channel is banned, deleted, or permanently lost, follow this step-by-step promotion runbook to swap a mirror store into the primary role:
 
-### Step 1: Stop TGDCFS Service
+### Step 1: Stop VulquantaFS Service
 ```bash
-docker stop tgdcfs  # or sudo systemctl stop tgdcfs
+docker stop vulquantafs  # or sudo systemctl stop vulquantafs
 ```
 
 ### Step 2: Edit `config.yaml`
@@ -92,11 +92,11 @@ filesystems:
     mirrors: []  # or keep tg-main if temporarily disabled
 ```
 
-### Step 3: Restart TGDCFS
+### Step 3: Restart VulquantaFS
 ```bash
-docker start tgdcfs  # or sudo systemctl start tgdcfs
+docker start vulquantafs  # or sudo systemctl start vulquantafs
 ```
-*Note: there is no relocation step on boot. When a file's descriptor is read, TGDCFS re-expresses it relative to the new primary, so files remain readable from `tg-backup` right away; the content copies are made by the backfill in the next step. This requires that `tg-backup` holds a copy of the metadata: with `pinned_message` metadata a mirror whose messages are too small for the metadata blob (a Discord mirror of a Telegram primary) has none, and promotion then needs `github_repo` metadata.*
+*Note: there is no relocation step on boot. When a file's descriptor is read, VulquantaFS re-expresses it relative to the new primary, so files remain readable from `tg-backup` right away; the content copies are made by the backfill in the next step. This requires that `tg-backup` holds a copy of the metadata: with `pinned_message` metadata a mirror whose messages are too small for the metadata blob (a Discord mirror of a Telegram primary) has none, and promotion then needs `github_repo` metadata.*
 
 ### Step 4: Execute Backfill Task
 Trigger backfill via curl to ensure all version descriptors are updated and copies are promoted:

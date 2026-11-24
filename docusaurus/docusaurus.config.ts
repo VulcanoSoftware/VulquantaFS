@@ -6,17 +6,19 @@ import type * as Preset from '@docusaurus/preset-classic';
 // under the same repository's coordinates: https://<owner>.github.io/<repo>/docs/.
 // Everything below follows GITHUB_REPOSITORY (set by the Pages workflow), so a
 // fork publishes its own docs without editing this file.
-const [owner, repo] = (process.env.GITHUB_REPOSITORY || 'Xyvran/tgdcfs').split('/');
+const [owner, repo] = (process.env.GITHUB_REPOSITORY || 'Xyvran/vulquantafs').split('/');
 const ownerLower = owner.toLowerCase();
-const repoLower = repo.toLowerCase();
+// GitHub Pages serves under the repository's exact name, capitals
+// included: /VulquantaFS/ answers and the all-lowercase spelling is a 404.
+// Docker Hub namespaces are the exception -- those are always lowercase.
 const pagesHost = `https://${ownerLower}.github.io`;
-const pagesUrl = `${pagesHost}/${repoLower}`;
+const pagesUrl = `${pagesHost}/${repo}`;
 const dockerHubNamespace = (process.env.DOCKERHUB_NAMESPACE || ownerLower).toLowerCase();
 
-const baseUrl = process.env.DOCS_BASE_URL || `/${repoLower}/docs/`;
+const baseUrl = process.env.DOCS_BASE_URL || `/${repo}/docs/`;
 
 const config: Config = {
-  title: 'TGDCFS',
+  title: 'VulquantaFS',
   tagline: 'Telegram & Discord as WebDAV and SFTP Storage Backends',
   favicon: 'img/favicon.ico',
 
@@ -62,9 +64,9 @@ const config: Config = {
       respectPrefersColorScheme: true,
     },
     navbar: {
-      title: 'TGDCFS Documentation',
+      title: 'VulquantaFS Documentation',
       logo: {
-        alt: 'TGDCFS Logo',
+        alt: 'VulquantaFS Logo',
         src: 'img/logo.svg',
       },
       items: [
@@ -139,12 +141,12 @@ const config: Config = {
             },
             {
               label: 'Docker Hub',
-              href: `https://hub.docker.com/r/${dockerHubNamespace}/tgdcfs`,
+              href: `https://hub.docker.com/r/${dockerHubNamespace}/vulquantafs`,
             },
           ],
         },
       ],
-      copyright: `Copyright © ${new Date().getFullYear()} TGDCFS Project. Built with Docusaurus.`,
+      copyright: `Copyright © ${new Date().getFullYear()} VulquantaFS Project. Built with Docusaurus.`,
     },
     prism: {
       theme: prismThemes.github,

@@ -1,0 +1,544 @@
+"use client";
+
+import { Apps, ArrowBack, Settings } from "@mui/icons-material";
+import {
+  Box,
+  Button,
+  Checkbox,
+  FormControlLabel,
+  Step,
+  StepContent,
+  StepLabel,
+  Stepper,
+  TextField,
+  ToggleButton,
+  ToggleButtonGroup,
+  Typography,
+} from "@mui/material";
+import Link from "next/link";
+import { useState, useEffect } from "react";
+import { DOCKERHUB_IMAGE } from "../lib/coordinates";
+import { CustomizePanel } from "../appearance/CustomizePanel";
+
+export default function GettingStarted() {
+  const [activeStep, setActiveStep] = useState(0);
+  const [pathStyle, setPathStyle] = useState<"unix" | "windows">("unix");
+  const [dockerConfig, setDockerConfig] = useState({
+    vulquantafsPort: 1900,
+    sftpEnabled: false,
+    sftpPort: 2222,
+    mountedVolume: "/home/user/.vulquantafs",
+  });
+
+  // Auto-detect OS and set default path style
+  useEffect(() => {
+    if (typeof window !== "undefined") {
+      const userAgent = window.navigator.userAgent;
+      const isWindows = userAgent.includes("Windows");
+      setPathStyle(isWindows ? "windows" : "unix");
+
+      // Set default path based on OS
+      setDockerConfig((prev) => ({
+        ...prev,
+        mountedVolume: isWindows
+          ? "C:\\Users\\user\\.vulquantafs"
+          : "/home/user/.vulquantafs",
+      }));
+    }
+  }, []);
+
+  return (
+    <div className="dcfs-page">
+      <div className="container mx-auto px-6 py-12 max-w-4xl">
+        <header className="text-center mb-12">
+          <Link
+            href="/"
+            className="dcfs-pill mb-6"
+          >
+            <ArrowBack className="w-5 h-5 mr-2" />
+            Back to Home
+          </Link>
+          <h1 className="text-4xl font-bold text-white mb-4 dcfs-gradient-text">
+            Getting Started with VulquantaFS
+          </h1>
+          <p className="text-xl text-slate-300">
+            Follow these steps to set up your file system on Telegram, Discord
+            or both
+          </p>
+        </header>
+
+        <div className="dcfs-glass dcfs-fade-in p-8">
+          <Stepper activeStep={activeStep} orientation="vertical">
+            <Step>
+              <StepLabel
+                onClick={() => setActiveStep(0)}
+                sx={{ cursor: "pointer" }}
+              >
+                <Typography
+                  variant="h6"
+                  className="text-white"
+                >
+                  Create a Telegram App
+                </Typography>
+              </StepLabel>
+              <StepContent>
+                <Typography
+                  className="text-slate-300"
+                  sx={{ marginBottom: 3 }}
+                >
+                  First, you need to create a Telegram app to get your API
+                  credentials.
+                </Typography>
+                <ol
+                  className="list-decimal list-inside text-slate-300"
+                  style={{ marginBottom: "24px" }}
+                >
+                  <li style={{ marginBottom: "12px" }}>
+                    Go to{" "}
+                    <a
+                      href="https://my.telegram.org/apps"
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="dcfs-link underline"
+                    >
+                      https://my.telegram.org/apps
+                    </a>
+                  </li>
+                  <li style={{ marginBottom: "12px" }}>
+                    Login with your phone number
+                  </li>
+                  <li style={{ marginBottom: "12px" }}>
+                    Create a new Telegram app by filling in the required details
+                  </li>
+                </ol>
+                <div style={{ marginTop: "24px" }}>
+                  <Button
+                    variant="contained"
+                    onClick={() => setActiveStep(1)}
+                    sx={{ mr: 1 }}
+                  >
+                    Continue
+                  </Button>
+                </div>
+              </StepContent>
+            </Step>
+
+            <Step>
+              <StepLabel
+                onClick={() => setActiveStep(1)}
+                sx={{ cursor: "pointer" }}
+              >
+                <Typography
+                  variant="h6"
+                  className="text-white"
+                >
+                  Create a Private Telegram Channel
+                </Typography>
+              </StepLabel>
+              <StepContent>
+                <Typography
+                  className="text-slate-300"
+                  sx={{ marginBottom: 3 }}
+                >
+                  Create a private Telegram channel where VulquantaFS will store your
+                  files. In VulquantaFS a channel is a <b>store</b>; a <b>file
+                  system</b> has one primary store and any number of mirror
+                  stores that receive a copy of every file. A second channel
+                  as a mirror protects you against losing the first one.
+                </Typography>
+                <Typography
+                  className="text-slate-300"
+                  sx={{ marginBottom: 3 }}
+                >
+                  Discord channels are stores too. To use one, create an
+                  application at{" "}
+                  <a
+                    href="https://discord.com/developers/applications"
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="dcfs-link underline"
+                  >
+                    discord.com/developers
+                  </a>
+                  , add a bot with the Message Content intent, invite it with
+                  View Channel, Send Messages, Manage Messages, Read Message
+                  History, Attach Files and Pin Messages, and copy the
+                  channel id (developer mode). Bots may attach 10 to 100 MB
+                  per message depending on the server&apos;s boost level, so
+                  Discord suits a mirror or a small library better than bulk
+                  media.
+                </Typography>
+                <div style={{ marginTop: "24px" }}>
+                  <Button
+                    variant="contained"
+                    onClick={() => setActiveStep(2)}
+                    sx={{ mr: 1 }}
+                  >
+                    Continue
+                  </Button>
+                </div>
+              </StepContent>
+            </Step>
+
+            <Step>
+              <StepLabel
+                onClick={() => setActiveStep(2)}
+                sx={{ cursor: "pointer" }}
+              >
+                <Typography
+                  variant="h6"
+                  className="text-white"
+                >
+                  Create a Telegram Bot
+                </Typography>
+              </StepLabel>
+              <StepContent>
+                <Typography
+                  className="text-slate-300"
+                  sx={{ marginBottom: 3 }}
+                >
+                  Next, create a (or many) Telegram bot that handles channel
+                  messages on behalf of you.
+                </Typography>
+                <ol
+                  className="list-decimal list-inside text-slate-300"
+                  style={{ marginBottom: "24px" }}
+                >
+                  <li style={{ marginBottom: "12px" }}>
+                    Open&nbsp;
+                    <a
+                      href="https://t.me/botfather"
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="dcfs-chip text-sm"
+                    >
+                      @BotFather
+                    </a>
+                  </li>
+                  <li style={{ marginBottom: "12px" }}>
+                    Send{" "}
+                    <code className="px-2 py-1 rounded">
+                      /newbot
+                    </code>{" "}
+                    to create a new bot
+                  </li>
+                  <li style={{ marginBottom: "12px" }}>
+                    Add your bot to every Telegram channel you use as a store,
+                    mirrors included, and <b>make it an admin</b>.
+                  </li>
+                </ol>
+                <div style={{ marginTop: "24px" }}>
+                  <Button
+                    variant="contained"
+                    onClick={() => setActiveStep(3)}
+                    sx={{ mr: 1 }}
+                  >
+                    Continue
+                  </Button>
+                </div>
+              </StepContent>
+            </Step>
+
+            <Step>
+              <StepLabel
+                onClick={() => setActiveStep(3)}
+                sx={{ cursor: "pointer" }}
+              >
+                <Typography
+                  variant="h6"
+                  className="text-white"
+                >
+                  Generate Configuration
+                </Typography>
+              </StepLabel>
+              <StepContent>
+                <Typography
+                  className="text-slate-300"
+                  sx={{ marginBottom: 3 }}
+                >
+                  Use our config generator to create your VulquantaFS configuration
+                  file: name your stores, define the file systems on top of
+                  them and pick where the directory metadata lives. A config
+                  written for tgfs also still loads.
+                </Typography>
+                <Typography
+                  className="text-slate-300"
+                  sx={{ marginBottom: 3 }}
+                >
+                  Two optional sections are worth a look once the basics
+                  work. The <b>local cache</b> stages every upload on the
+                  data volume so mirrors are filled from disk instead of
+                  downloading the file from the primary again, keeps
+                  entries for repeated reads, and lets a file system
+                  acknowledge uploads as soon as they are on the local disk
+                  (write acknowledgement &quot;cache&quot;; the bytes then live
+                  only on this host until they reach the primary). With
+                  <b>parallel reads</b> a large download pulls pieces from
+                  the primary and every mirror at once. Both are off by
+                  default; the README explains sizing and the trade-offs.
+                </Typography>
+                <div style={{ marginBottom: "24px" }}>
+                  <Link
+                    href="/config-generator"
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="dcfs-chip"
+                  >
+                    <Settings className="w-5 h-5 mr-2" />
+                    Open Config Generator
+                  </Link>
+                </div>
+                <div style={{ marginTop: "24px" }}>
+                  <Button
+                    variant="contained"
+                    onClick={() => setActiveStep(4)}
+                    sx={{ mr: 1 }}
+                  >
+                    Continue
+                  </Button>
+                </div>
+              </StepContent>
+            </Step>
+
+            <Step>
+              <StepLabel
+                onClick={() => setActiveStep(4)}
+                sx={{ cursor: "pointer" }}
+              >
+                <Typography
+                  variant="h6"
+                  className="text-white"
+                >
+                  Run VulquantaFS Server
+                </Typography>
+              </StepLabel>
+              <StepContent>
+                <Typography
+                  className="text-slate-300"
+                  sx={{ marginBottom: 3 }}
+                >
+                  Configure the Docker settings for running VulquantaFS:
+                </Typography>
+
+                <Box
+                  sx={{
+                    marginBottom: 3,
+                    display: "flex",
+                    gap: 2,
+                    flexDirection: "column",
+                  }}
+                >
+                  <Box sx={{ display: "flex", gap: 4 }}>
+                    <TextField
+                      label="VulquantaFS Port"
+                      type="number"
+                      value={dockerConfig.vulquantafsPort}
+                      onChange={(e) =>
+                        setDockerConfig((prev) => ({
+                          ...prev,
+                          vulquantafsPort: parseInt(e.target.value) || 1900,
+                        }))
+                      }
+                    />
+                    <TextField
+                      label="Path of config.yaml"
+                      value={dockerConfig.mountedVolume}
+                      onChange={(e) =>
+                        setDockerConfig((prev) => ({
+                          ...prev,
+                          mountedVolume: e.target.value,
+                        }))
+                      }
+                      slotProps={{
+                        input: {
+                          endAdornment: (
+                            <span className="text-slate-400">
+                              {pathStyle === "windows"
+                                ? "\\config.yaml"
+                                : "/config.yaml"}
+                            </span>
+                          ),
+                        },
+                      }}
+                      sx={{ flex: 1 }}
+                    />
+                  </Box>
+
+                  <Box sx={{ display: "flex", alignItems: "center", gap: 4 }}>
+                    <FormControlLabel
+                      label="Publish the SFTP port too"
+                      control={
+                        <Checkbox
+                          checked={dockerConfig.sftpEnabled}
+                          onChange={(e) =>
+                            setDockerConfig((prev) => ({
+                              ...prev,
+                              sftpEnabled: e.target.checked,
+                            }))
+                          }
+                        />
+                      }
+                    />
+                    {dockerConfig.sftpEnabled && (
+                      <TextField
+                        label="SFTP Port"
+                        type="number"
+                        size="small"
+                        value={dockerConfig.sftpPort}
+                        onChange={(e) =>
+                          setDockerConfig((prev) => ({
+                            ...prev,
+                            sftpPort: parseInt(e.target.value) || 2222,
+                          }))
+                        }
+                      />
+                    )}
+                  </Box>
+                  {dockerConfig.sftpEnabled && (
+                    <Typography variant="body2" color="text.secondary">
+                      Only needed when <code>vulquantafs.sftp.enabled</code> is set in
+                      your config.yaml. Use the same port there.
+                    </Typography>
+                  )}
+
+                  <Box sx={{ display: "flex", alignItems: "center", gap: 2 }}>
+                    <Typography variant="body2" color="text.secondary">
+                      Path Style:
+                    </Typography>
+                    <ToggleButtonGroup
+                      value={pathStyle}
+                      exclusive
+                      onChange={(_, newStyle) => {
+                        if (newStyle) {
+                          setPathStyle(newStyle);
+                          // Update the path format when style changes
+                          setDockerConfig((prev) => ({
+                            ...prev,
+                            mountedVolume:
+                              newStyle === "windows"
+                                ? "C:\\Users\\user\\.vulquantafs"
+                                : "/home/user/.vulquantafs",
+                          }));
+                        }
+                      }}
+                      size="small"
+                    >
+                      <ToggleButton value="unix">Unix</ToggleButton>
+                      <ToggleButton value="windows">Windows</ToggleButton>
+                    </ToggleButtonGroup>
+                  </Box>
+                </Box>
+                <div
+                  className="dcfs-codeblock p-4"
+                  style={{ marginBottom: "24px" }}
+                >
+                  <code className="text-sm text-slate-300 block break-all">
+                    docker run -it -v {dockerConfig.mountedVolume}
+                    :/home/vulquantafs/.vulquantafs -p {dockerConfig.vulquantafsPort}:
+                    {dockerConfig.vulquantafsPort}
+                    {dockerConfig.sftpEnabled
+                      ? ` -p ${dockerConfig.sftpPort}:${dockerConfig.sftpPort}`
+                      : ""}{" "}
+                    {DOCKERHUB_IMAGE}
+                  </code>
+                </div>
+
+                <div style={{ marginTop: "24px" }}>
+                  <Button
+                    variant="contained"
+                    onClick={() => setActiveStep(5)}
+                    sx={{ mr: 1 }}
+                  >
+                    Continue
+                  </Button>
+                </div>
+              </StepContent>
+            </Step>
+
+            <Step>
+              <StepLabel
+                onClick={() => setActiveStep(5)}
+                sx={{ cursor: "pointer" }}
+              >
+                <Typography
+                  variant="h6"
+                  className="text-white"
+                >
+                  Start Using VulquantaFS
+                </Typography>
+              </StepLabel>
+              <StepContent>
+                <Typography
+                  className="text-slate-300"
+                  sx={{ marginBottom: 3 }}
+                >
+                  Once everything is set up, you can access your files through
+                  these tested WebDAV clients:
+                </Typography>
+                <ul
+                  className="list-disc list-inside text-slate-300"
+                  style={{ marginBottom: "32px" }}
+                >
+                  <li style={{ marginBottom: "12px" }}>
+                    <a
+                      href="https://rclone.org/"
+                      target="_blank"
+                      rel="noopener noreferrer"
+                    >
+                      rclone
+                    </a>
+                  </li>
+                  <li style={{ marginBottom: "12px" }}>
+                    <a
+                      href="https://cyberduck.io/"
+                      target="_blank"
+                      rel="noopener noreferrer"
+                    >
+                      CyberDuck
+                    </a>
+                  </li>
+                  <li style={{ marginBottom: "12px" }}>
+                    <a
+                      href="https://winscp.net/"
+                      target="_blank"
+                      rel="noopener noreferrer"
+                    >
+                      WinSCP
+                    </a>
+                  </li>
+                  <li style={{ marginBottom: "12px" }}>
+                    <a
+                      href="https://readdle.com/documents"
+                      target="_blank"
+                      rel="noopener noreferrer"
+                    >
+                      Documents
+                    </a>
+                    &nbsp;by Readdle
+                  </li>
+                </ul>
+                <Typography
+                  className="text-slate-300"
+                  sx={{ marginBottom: 3 }}
+                >
+                  You can also access your files through the official Telegram
+                  Mini App:
+                </Typography>
+                <div style={{ marginBottom: "24px" }}>
+                  <Link
+                    href="https://t.me/vulquantafsprdbot/manager"
+                    className="dcfs-chip"
+                  >
+                    <Apps className="w-5 h-5 mr-2" />
+                    Try Mini App
+                  </Link>
+                </div>
+              </StepContent>
+            </Step>
+          </Stepper>
+        </div>
+      </div>
+      <CustomizePanel />
+    </div>
+  );
+}

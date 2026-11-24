@@ -21,9 +21,9 @@ import asyncio
 from dataclasses import dataclass, field
 from typing import Dict, Iterable, List, Optional, Set
 
-from tgdcfs.backends.base import IStore, StoreCapabilities
-from tgdcfs.errors import MessageNotFound, NoPinnedMessage, TechnicalError
-from tgdcfs.reqres import (
+from vulquantafs.backends.base import IStore, StoreCapabilities
+from vulquantafs.errors import MessageNotFound, NoPinnedMessage, TechnicalError
+from vulquantafs.reqres import (
     Document,
     DownloadFileResp,
     MessageResp,

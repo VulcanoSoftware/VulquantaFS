@@ -1,5 +1,5 @@
 [project]
-name = "tgdcfs"
+name = "vulquantafs"
 version = "0.6.1"
 package-mode = false
 description = ""

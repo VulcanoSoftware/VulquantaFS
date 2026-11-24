@@ -2,7 +2,7 @@
 
 ## Why
 
-TGDCFS published its store over exactly one surface: a single uvicorn process
+VulquantaFS published its store over exactly one surface: a single uvicorn process
 with WebDAV mounted at `/webdav` and the manager REST API at `/api`. That
 covers WebDAV-capable clients and nothing else, while SFTP is what a great
 many file managers, backup tools and mount helpers reach for first.
@@ -16,11 +16,11 @@ accounts, same guarantees — not a reduced side door.
         SFTP client                       WebDAV client
              |                                  |
       asyncssh listener                 uvicorn / FastAPI
-   (tgdcfs/app/sftp/server.py)          (tgdcfs/app/__init__.py)
+   (vulquantafs/app/sftp/server.py)          (vulquantafs/app/__init__.py)
              |                                  |
              +--------------+   +---------------+
                             |   |
-                       tgdcfs/core/ops.py  (Ops)
+                       vulquantafs/core/ops.py  (Ops)
                             |
               FileApi / DirectoryApi / MetaDataApi
                             |
@@ -45,17 +45,17 @@ leaving the running interface untouched.
 
 The namespace matches WebDAV exactly: the root is synthetic and lists one
 entry per configured client, and `/<client>/<path>` addresses that client's
-tree. `split_global_path()` in `tgdcfs/app/utils.py` is shared between the two.
+tree. `split_global_path()` in `vulquantafs/app/utils.py` is shared between the two.
 
-Authentication reuses `tgdcfs.auth.basic.authenticate`, so the same
-`tgdcfs.users` block drives both interfaces, including the anonymous
+Authentication reuses `vulquantafs.auth.basic.authenticate`, so the same
+`vulquantafs.users` block drives both interfaces, including the anonymous
 read-only fallback when no users are configured. Write enforcement mirrors
 `READONLY_METHODS`: everything that mutates goes through `_require_write()`
 and raises `SFTPPermissionDenied` for a readonly user.
 
 Public key authentication is the one thing SFTP adds. It is off unless
 `authorized_keys_dir` is configured, and even then the account must exist
-in `tgdcfs.users` — the config stays the single source of truth for who may
+in `vulquantafs.users` — the config stays the single source of truth for who may
 write.
 
 ## The two hard parts
@@ -117,13 +117,22 @@ less free space than a single upload may stage there. Every streamed
 upload logs its start and its end (path, bytes, duration, MiB/s), and a
 failure logs the reason.
 
-`Ops.touch()` is called at open time so the name shows up in a listing
-while the upload is still running, matching the WebDAV `PUT` path. The
-GitHub blob behind the reservation is written in the background: a slow
-or briefly offline GitHub must not hold the open -- and with it the
-client's transfer -- hostage, since FileZilla gives up after 20 s of
-silence. The deferred write retries for about ten minutes; if it never
-lands the reference leaves the tree again and the failure is logged.
+SFTP keeps the name of an open upload in memory, not in the file tree.
+Other SFTP sessions cannot open the same path for writing until the handle
+is closed or aborted. A new file can only enter the tree after the storage
+backend accepts its complete stream; an explicit close without writes
+creates an empty file. CLOSE waits for the new reference to be persisted,
+but never longer than 15 s: a GitHub read timeout plus the write thread's
+inline retries can hold the shared commit batch for half a minute, and a
+client gives up after 20 s of silence. A close past that bound is answered
+with an error while the commit keeps retrying in the background, so a
+retransmission appends a version to the same reference instead of finding
+a server that never answers. GitHub reference commits are batched across
+concurrent uploads, and a mirror sync is queued separately when the
+primary already holds the reference. An interrupted upload does not leave
+an empty placeholder that triggers FileZilla's overwrite prompt on
+reconnect. A disconnect after a commit but before the reply can still
+leave a valid destination.
 
 ## Lifecycle
 
@@ -135,7 +144,7 @@ the HTTP interface running — the second interface must never be able to
 take down the first.
 
 The host key is generated on first start (ed25519, mode 0600) and lives in
-the TGDCFS data directory, because a key that changes on every restart makes
+the VulquantaFS data directory, because a key that changes on every restart makes
 clients refuse to connect.
 
 ## Known limits
@@ -150,7 +159,7 @@ All of these are shared with WebDAV and documented in the README:
 
 ## Tests
 
-`tests/tgdcfs/app/sftp/` covers the pieces in isolation (path translation,
+`tests/vulquantafs/app/sftp/` covers the pieces in isolation (path translation,
 attribute mapping, both handles, the server methods against a mocked
 `Client`, and authentication) plus `test_integration.py`, which drives a
 real asyncssh client against a listener on an ephemeral port. The
