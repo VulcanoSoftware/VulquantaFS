@@ -54,6 +54,14 @@ the fact on the commits that shipped them.
 
 ### Fixed
 
+- An SFTP close no longer waits for the reference commit indefinitely. A
+  GitHub read timeout plus the write thread's inline retries held the
+  shared commit batch for over 27 s during the second bulk retest
+  (FileZilla disconnects after 20 s of silence), killing uploads the
+  server persisted moments later. The close now answers after 15 s at the
+  latest; the commit keeps retrying in the background, and a blob whose
+  file was retransmitted meanwhile is written under that file's current
+  descriptor id.
 - A dropped or failed SFTP upload no longer leaves an empty destination
   that makes FileZilla pause the queue with an overwrite prompt. Opening a
   new file claims its path in memory; only close can publish it, and a

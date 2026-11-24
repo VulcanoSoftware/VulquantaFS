@@ -121,12 +121,18 @@ SFTP keeps the name of an open upload in memory, not in the file tree.
 Other SFTP sessions cannot open the same path for writing until the handle
 is closed or aborted. A new file can only enter the tree after the storage
 backend accepts its complete stream; an explicit close without writes
-creates an empty file. CLOSE waits for the new reference to be persisted.
-GitHub reference commits are batched across concurrent uploads, and a
-mirror sync is queued separately when the primary already holds the
-reference. An interrupted upload does not leave an empty placeholder
-that triggers FileZilla's overwrite prompt on reconnect. A disconnect
-after a commit but before the reply can still leave a valid destination.
+creates an empty file. CLOSE waits for the new reference to be persisted,
+but never longer than 15 s: a GitHub read timeout plus the write thread's
+inline retries can hold the shared commit batch for half a minute, and a
+client gives up after 20 s of silence. A close past that bound is answered
+with an error while the commit keeps retrying in the background, so a
+retransmission appends a version to the same reference instead of finding
+a server that never answers. GitHub reference commits are batched across
+concurrent uploads, and a mirror sync is queued separately when the
+primary already holds the reference. An interrupted upload does not leave
+an empty placeholder that triggers FileZilla's overwrite prompt on
+reconnect. A disconnect after a commit but before the reply can still
+leave a valid destination.
 
 ## Lifecycle
 
