@@ -19,6 +19,7 @@ from datetime import datetime, timezone
 from typing import Dict, List, Optional
 from unittest.mock import Mock, patch
 from urllib.parse import unquote
+from weakref import WeakValueDictionary
 
 import pytest
 import requests
@@ -27,6 +28,7 @@ from github import GithubException, InputGitTreeElement
 from vulquantafs.config import GitlabRepoConfig
 from vulquantafs.core.model import TGFSDirectory, TGFSMetadata
 from vulquantafs.core.repository.impl.metadata import breaker as breaker_mod
+from vulquantafs.core.repository.impl.metadata import gitlab_throttle
 from vulquantafs.core.repository.impl.metadata import gitlab_tree as gitlab_tree_mod
 from vulquantafs.core.repository.impl.metadata.breaker import (
     StoreCircuitBreaker,
@@ -41,13 +43,36 @@ from vulquantafs.core.repository.impl.metadata.gitlab_tree import (
     GitlabTreeRepoMetadataRepository,
 )
 from vulquantafs.core.repository.interface import IMetaDataRepository
-from vulquantafs.errors import NoStoredMetadata, TechnicalError
 from vulquantafs.crypto.metadata_blob import (
     derive_metadata_blob_key,
     encrypt_metadata_blob,
 )
+from vulquantafs.errors import NoStoredMetadata, TechnicalError
 
 PER_PAGE = 100
+
+
+@pytest.fixture(autouse=True)
+def separate_gates(monkeypatch):
+    monkeypatch.setattr(gitlab_throttle, "_GATES", WeakValueDictionary())
+
+
+@pytest.fixture
+def retry_clock(monkeypatch):
+    from types import SimpleNamespace
+
+    sleeps = []
+
+    def sleep(delay):
+        sleeps.append(delay)
+
+    monkeypatch.setattr(
+        gitlab_throttle,
+        "time",
+        SimpleNamespace(monotonic=lambda: sum(sleeps), sleep=sleep, time=time.time),
+    )
+    monkeypatch.setattr(gitlab_throttle.random, "uniform", lambda _low, _high: 1)
+    return sleeps
 
 
 def blob_sha(content: str) -> str:
@@ -522,6 +547,7 @@ def gitlab_config(**overrides) -> GitlabRepoConfig:
         "branch": "main",
         "access_token": "glpat-token",
         "base_url": "https://gitlab.example.com",
+        "requests_per_second": 1e8,
     }
     data.update(overrides)
     return GitlabRepoConfig.from_dict(data)
@@ -1141,10 +1167,79 @@ class TestGitlabTreeStore:
         await layer.init()
         await settled_initial_push(layer)
 
-        # One shared tree object, store-backed for the mirror.
+        # One shared object, but the mirror cannot install write hooks.
         assert layer.metadata is tree
-        assert isinstance(tree.dir, GithubDirectory)
+        assert not isinstance(tree.dir, GithubDirectory)
         assert gitlab.file_content("main", "docs/readme.42") == ""
+
+    async def test_bulk_uploads_batch_and_catch_up_after_cooldown(
+        self, retry_clock, rate_limited_gitlab
+    ):
+        from vulquantafs.core.repository.impl.metadata.replicated import (
+            MetadataStore,
+            ReplicatedMetadataRepository,
+        )
+
+        class Primary(IMetaDataRepository):
+            async def get(self):
+                raise NotImplementedError
+
+            async def push(self):
+                self.saved = {ref.name for ref in self.root().find_files()}
+
+        fake = rate_limited_gitlab
+        _commit_file_creation(fake, "seed.42")
+        primary = Primary()
+        mirror = self.repository(fake)
+        layer = ReplicatedMetadataRepository(
+            [MetadataStore("local", primary, True), MetadataStore("gitlab", mirror)]
+        )
+        layer.metadata = TGFSMetadata(TGFSDirectory.root_dir())
+        before = fake.attempts
+        try:
+            for i in range(1200):
+                await layer.root().create_file_ref_async(f"upload-{i}", i + 1)
+                await layer.push()
+            assert len(primary.saved) == 1200
+            assert fake.attempts == before
+
+            # Mark the first and second attempts at the same flush 429.
+            fake.limited = 2
+            fake.retry_after = None
+            await layer.heal()
+            assert layer.stale_stores() == ["gitlab"]
+            assert fake.attempts == before + 1
+            for _ in range(3):
+                await layer.heal()
+            assert fake.attempts == before + 1
+            retry_clock.append(1.0)
+            await layer.heal()
+            assert fake.attempts == before + 2
+            retry_clock.append(1.0)
+            await layer.heal()
+            assert fake.attempts == before + 2
+            retry_clock.append(1.0)
+
+            # One more upload during the limit is not skipped by the batch.
+            await layer.root().create_file_ref_async("last", 1201)
+            await layer.push()
+            await layer.heal()
+            assert layer.stale_stores() == []
+            assert fake.file_content("main", "last.1201") == ""
+            posts = [
+                body
+                for method, url, _, body in fake.requests
+                if method == "POST" and url.endswith("/repository/commits")
+            ]
+            assert [len(body["actions"]) for body in posts] == [500, 500, 202]
+            assert layer.metadata is not None
+            assert await mirror.head_revision() == pytest.approx(
+                layer.metadata.revision, abs=1e-6, rel=0
+            )
+            readback = await mirror.get()
+            assert {ref.name for ref in readback.dir.find_files()} == primary.saved
+        finally:
+            await layer.close()
 
 
 class TestDeadlineAnswers:
@@ -1210,42 +1305,37 @@ class TestRateLimitRetries:
         assert fake.attempts == 4
 
     async def test_the_retry_honours_the_prescribed_wait(
-        self, monkeypatch, rate_limited_gitlab
+        self, retry_clock, rate_limited_gitlab
     ):
         fake = rate_limited_gitlab
         self.seed(fake)
         fake.limited = 1
         fake.retry_after = "7"
-        sleeps: List[float] = []
-        monkeypatch.setattr(gitlab_tree_mod.time, "sleep", sleeps.append)
         repo = GitlabRepository(gitlab_config())
 
         repo.probe()
 
-        assert sleeps == [7.0]
+        assert retry_clock == [7.0]
         assert fake.attempts == 2
 
     async def test_without_retry_after_it_backs_off_exponentially(
-        self, monkeypatch, rate_limited_gitlab
+        self, retry_clock, rate_limited_gitlab
     ):
         fake = rate_limited_gitlab
         self.seed(fake)
         fake.retry_after = None
-        sleeps: List[float] = []
-        monkeypatch.setattr(gitlab_tree_mod.time, "sleep", sleeps.append)
         repo = GitlabRepository(gitlab_config())
 
         repo.probe()
 
-        assert sleeps == [1.0, 2.0]
+        assert retry_clock == [1.0, 2.0]
         assert fake.attempts == 3
 
     async def test_a_persistent_429_raises_after_the_last_attempt(
-        self, monkeypatch, rate_limited_gitlab
+        self, retry_clock, rate_limited_gitlab
     ):
         fake = rate_limited_gitlab
         fake.limited = 100
-        monkeypatch.setattr(gitlab_tree_mod.time, "sleep", lambda _s: None)
         repo = GitlabRepository(gitlab_config())
 
         with pytest.raises(GithubException) as ex:
@@ -1253,6 +1343,8 @@ class TestRateLimitRetries:
 
         assert ex.value.status == 429
         assert fake.attempts == gitlab_tree_mod.RATE_LIMIT_RETRIES
+        assert retry_clock == [1.0, 2.0, 4.0, 8.0]
+        assert repo.gate.in_cooldown()
 
 
 async def _wait_closed(store: StoreCircuitBreaker, timeout: float = 10.0) -> None:
@@ -1781,7 +1873,7 @@ class TestSharedBackoff:
         monkeypatch.setattr(requests.Session, "request", fake_request)
 
         started = time.monotonic()
-        repo._publish_pause(1.5)
+        repo.gate.finish(repo.gate.acquire(), 429, {"Retry-After": "1.5"})
 
         results: List[requests.Response] = []
         thread = threading.Thread(
@@ -1826,7 +1918,7 @@ class TestSharedBackoff:
         assert len(fake.requests) == sent
 
         fake.limited = False
-        raw._paused_until = 0
+        raw.gate._paused_until = 0
         metadata = await store.get()
         assert len(metadata.dir.find_files()) == 220
         pages = [

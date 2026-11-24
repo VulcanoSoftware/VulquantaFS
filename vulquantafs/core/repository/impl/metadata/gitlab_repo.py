@@ -25,6 +25,7 @@ import aiohttp
 
 from vulquantafs.config import GitlabRepoConfig
 from vulquantafs.core.model import TGFSMetadata
+from vulquantafs.core.repository.impl.metadata.gitlab_throttle import gate_for
 from vulquantafs.core.repository.interface import IMetaDataRepository
 from vulquantafs.crypto.metadata_blob import (
     decrypt_metadata_blob,
@@ -40,6 +41,8 @@ REQUEST_TIMEOUT_SECONDS = 60.0
 
 
 class GitlabRepoMetadataRepository(IMetaDataRepository):
+    batch_mirror_writes = True
+
     def __init__(
         self,
         config: GitlabRepoConfig,
@@ -48,6 +51,7 @@ class GitlabRepoMetadataRepository(IMetaDataRepository):
     ):
         super().__init__()
         self._config = config
+        self._gate = gate_for(config.base_url, config.requests_per_second)
         # AES-256-GCM key for the blob when at-rest encryption is enabled;
         # ``None`` stores the document as plain JSON. The legacy key opens
         # blobs left behind by tgdcfs before the rebrand.
@@ -85,13 +89,22 @@ class GitlabRepoMetadataRepository(IMetaDataRepository):
             await self._session.close()
         self._session = None
 
+    def write_in_cooldown(self) -> bool:
+        return self._gate.in_cooldown()
+
     async def _request(
         self, method: str, url: str, *, json_body: Optional[dict] = None
     ) -> Optional[dict]:
         """One API call; ``None`` for a 404, the parsed body otherwise."""
         session = await self._ensure_session()
+        ticket = await self._gate.acquire_async()
+        answered = False
         try:
             async with session.request(method, url, json=json_body) as resp:
+                limited = self._gate.finish(ticket, resp.status, resp.headers)
+                answered = True
+                if limited is not None:
+                    raise limited
                 if resp.status == 404:
                     return None
                 body = await resp.text()
@@ -105,6 +118,9 @@ class GitlabRepoMetadataRepository(IMetaDataRepository):
             raise TechnicalError(f"GitLab API request failed: {ex}") from ex
         except json.JSONDecodeError as ex:
             raise TechnicalError(f"GitLab API returned invalid JSON: {ex}") from ex
+        finally:
+            if not answered:
+                self._gate.finish(ticket, None, {})
 
     async def get(self) -> TGFSMetadata:
         params = f"?ref={quote(self._config.branch, safe='')}"

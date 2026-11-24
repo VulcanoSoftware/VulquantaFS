@@ -1,13 +1,10 @@
-"""Periodic healing of the redundant metadata stores.
+"""Periodic catch-up of the redundant metadata stores.
 
-A metadata push writes every store; a store that is down is skipped and
-marked stale, and later pushes keep skipping it -- a store that just
-failed may answer slowly (a rate limit's cooldown, a full-tree re-sync
-over ten thousand files) and a bulk upload must never wait it out. So
-this worker re-writes the stale stores on a fixed interval until they
-take the tree again. A store that just came back is therefore
-brought in line without waiting for user activity, and a restart fails
-over to whichever store still answers.
+Healthy GitLab mirrors batch normal pushes here; failed stores are marked
+stale and retried on the same interval. Bulk uploads need not wait for a
+mirror's rate-limit cooldown or full-tree sync as long as another store
+took the write. A lagging store is brought in line without waiting for
+user activity, and a restart can fail over to whichever store still answers.
 
 File stores have their own healing (the replication queue and the
 backfill); this is exclusively about the metadata stores.

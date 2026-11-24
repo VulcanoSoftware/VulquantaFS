@@ -7,7 +7,7 @@ import json
 import logging
 import time
 from concurrent.futures import ThreadPoolExecutor
-from typing import Iterable, NamedTuple, Optional, Sequence, Set, cast
+from typing import Callable, Iterable, NamedTuple, Optional, Sequence, Set, cast
 
 from github import Github, GithubException, InputGitTreeElement
 from github.ContentFile import ContentFile
@@ -156,6 +156,14 @@ class GithubRepoMetadataRepository(IMetaDataRepository):
     def metadata(self, value: Optional[TGFSMetadata]) -> None:
         self._metadata = None if value is None else self._as_github_tree(value)
 
+    def bind_shared_tree(self, metadata: Optional[TGFSMetadata]) -> None:
+        # Using the normal setter here turns a plain primary's nodes into
+        # write-through nodes bound to the mirror, bypassing replication.
+        self._metadata = metadata
+
+    def export_for_primary(self, metadata: TGFSMetadata) -> TGFSMetadata:
+        return TGFSMetadata.from_dict(metadata.to_dict())
+
     def _as_github_tree(self, metadata: TGFSMetadata) -> TGFSMetadata:
         if isinstance(metadata.dir, GithubDirectory):
             return metadata
@@ -203,6 +211,13 @@ class GithubRepoMetadataRepository(IMetaDataRepository):
             )
 
     async def push(self) -> None:
+        if self.metadata is not None and not isinstance(
+            self.metadata.dir, GithubDirectory
+        ):
+            # Booted on a fallback; the plain tree intentionally has no
+            # write-through hooks to a possibly unreachable primary.
+            await self.push_full()
+            return
         # The incremental writes already landed while the tree was mutated;
         # what is left is the batched file-reference deletions.
         if not self._ghc.pending_drops:
@@ -345,12 +360,15 @@ class GithubRepoMetadataRepository(IMetaDataRepository):
         # GitHub round trips run on the writer thread.
         async with self._ghc.lock:
             desired_blobs = self._desired_blobs()
-            await self._ghc.write(self._sync_tree_commit, desired_blobs)
+            await self._ghc.write(self._full_sync_writer(), desired_blobs)
             # The sync reconciled the whole tree; every pending blob delete
             # it covered is durable now -- and a tree a file reference was
             # dropped from wrote them all out.
             self._ghc.pending_drops.clear()
             self._ghc.pending_drops_since = 0.0
+
+    def _full_sync_writer(self) -> Callable[[Set[str]], None]:
+        return self._sync_tree_commit
 
     def _desired_blobs(self) -> Set[str]:
         """The blob paths the in-memory tree implies."""
@@ -385,7 +403,7 @@ class GithubRepoMetadataRepository(IMetaDataRepository):
         """On-repo path of ``directory``; per-directory encrypted state is
         preserved for a tree of ``GithubDirectory`` nodes, a plain tree
         (loaded from another metadata store) follows the configured key."""
-        if isinstance(directory, GithubDirectory):
+        if isinstance(directory, GithubDirectory) and directory._ghc is self._ghc:
             return directory._github_path
         segments: list[str] = []
         node: Optional[TGFSDirectory] = directory
@@ -401,7 +419,7 @@ class GithubRepoMetadataRepository(IMetaDataRepository):
     def _ref_blob_path(
         self, directory: TGFSDirectory, path: str, fr: TGFSFileRef
     ) -> str:
-        if isinstance(directory, GithubDirectory):
+        if isinstance(directory, GithubDirectory) and directory._ghc is self._ghc:
             segment = directory._file_ref_storage_name(fr.name, fr.message_id)
         else:
             segment = f"{self._encode_segment(fr.name)}.{fr.message_id}"

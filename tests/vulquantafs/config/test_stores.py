@@ -706,6 +706,7 @@ class TestGitlabRepoConfig:
         assert config.access_token == "glpat-token"
         assert config.base_url == "https://gitlab.com"
         assert config.file_path == "metadata.json"
+        assert config.requests_per_second == 4.0
 
     def test_overrides(self):
         config = GitlabRepoConfig.from_dict(
@@ -715,10 +716,17 @@ class TestGitlabRepoConfig:
                 "access_token": "glpat-token",
                 "base_url": "https://gitlab.example.com/",
                 "file_path": "/backups/meta.json",
+                "requests_per_second": 1.5,
             }
         )
         assert config.base_url == "https://gitlab.example.com"
         assert config.file_path == "backups/meta.json"
+        assert config.requests_per_second == 1.5
+
+    @pytest.mark.parametrize("rate", [0, -1, float("inf"), float("nan")])
+    def test_invalid_request_rate(self, rate):
+        with pytest.raises(ValueError, match="requests_per_second"):
+            GitlabRepoConfig.from_dict({"requests_per_second": rate})
 
     @pytest.mark.parametrize("missing", ["repo", "branch", "access_token"])
     def test_required_fields(self, missing):

@@ -103,6 +103,8 @@ class IFDRepository(metaclass=ABCMeta):
 
 
 class IMetaDataRepository(metaclass=ABCMeta):
+    batch_mirror_writes: bool = False
+
     def __init__(self):
         self.metadata: Optional[TGFSMetadata] = None
         # Whether the loaded tree carries stats; worked out on first ask.
@@ -110,6 +112,17 @@ class IMetaDataRepository(metaclass=ABCMeta):
 
     async def init(self):
         self.metadata = await self.get()
+
+    def bind_shared_tree(self, metadata: Optional[TGFSMetadata]) -> None:
+        """Use a shared tree without installing store-specific write hooks."""
+        self.metadata = metadata
+
+    def export_for_primary(self, metadata: TGFSMetadata) -> TGFSMetadata:
+        """Return a tree whose mutations aren't tied to this mirror."""
+        return metadata
+
+    def write_in_cooldown(self) -> bool:
+        return False
 
     @abstractmethod
     async def push(self) -> None:

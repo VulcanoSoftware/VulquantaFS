@@ -19,6 +19,7 @@ from vulquantafs.errors import MetadataNotInitialized, NoStoredMetadata, Technic
 class FakeResponse:
     def __init__(self, status: int, body: str = ""):
         self.status = status
+        self.headers: dict[str, str] = {}
         self._body = body
 
     async def text(self) -> str:
@@ -54,6 +55,7 @@ def gitlab_config(**overrides) -> GitlabRepoConfig:
         "repo": "group/project",
         "branch": "main",
         "access_token": "glpat-token",
+        "requests_per_second": 1e8,
     }
     data.update(overrides)
     return GitlabRepoConfig.from_dict(data)
