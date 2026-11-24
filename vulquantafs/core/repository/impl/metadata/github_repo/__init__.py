@@ -39,6 +39,7 @@ from .gh_directory import (
     TREE_OVERLAY_ACTION_LIMIT,
     GithubConfig,
     GithubDirectory,
+    _put_file_refs,
     commit_tree_overlay,
 )
 from .stats_file import STATS_COMMIT_PREFIX, STATS_FILE_NAME
@@ -81,6 +82,8 @@ def _blob_sha(content: str) -> str:
 
 
 class GithubRepoMetadataRepository(IMetaDataRepository):
+    supports_upload_journal = True
+
     def __init__(
         self,
         config: GithubRepoConfig,
@@ -369,6 +372,57 @@ class GithubRepoMetadataRepository(IMetaDataRepository):
 
     def _full_sync_writer(self) -> Callable[[Set[str]], None]:
         return self._sync_tree_commit
+
+    async def push_upload_refs(
+        self, refs: Sequence[TGFSFileRef], *, full: bool = False
+    ) -> None:
+        root = self.root()
+        if full or not isinstance(root, GithubDirectory):
+            # A plain tree loaded from another replica has no write-through
+            # paths. Replay conflicts also need to reconcile obsolete blobs.
+            await self.push_full()
+            return
+        async with self._ghc.lock:
+            # An overlay is safe to replay even if GitHub moved the branch
+            # but its reply was lost. Only a confirmed ref edit clears the
+            # outbox; do not use the legacy single-file 422 heuristic.
+            await self._ghc.write(
+                self._write_upload_refs,
+                [
+                    (
+                        self._ref_blob_path(
+                            ref.location, self._dir_storage_path(ref.location), ref
+                        ),
+                        ref.name,
+                    )
+                    for ref in refs
+                ],
+            )
+
+    def _write_upload_refs(self, refs: Sequence[tuple[str, str]]) -> None:
+        repo, branch = self._ghc.repo, self._ghc.commit
+        try:
+            _put_file_refs(repo, branch, refs)
+        except GithubException as ex:
+            if ex.status not in (404, 409):
+                raise
+            # The branch may not have been created yet (for example the
+            # first root-level uploads to a new metadata repository).
+            try:
+                self._initial_sync_commit({path for path, _name in refs})
+            except GithubException as initial:
+                if initial.status != 409:
+                    raise
+                # GitHub's Git Data API cannot create a tree in a completely
+                # empty repository. Bootstrap it through the Contents API.
+                repo.create_file(
+                    path=refs[0][0],
+                    message="Create initial VulquantaFS file reference",
+                    content="",
+                    branch=branch,
+                )
+                if len(refs) > 1:
+                    _put_file_refs(repo, branch, refs[1:])
 
     def _desired_blobs(self) -> Set[str]:
         """The blob paths the in-memory tree implies."""

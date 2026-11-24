@@ -231,7 +231,7 @@ async def backfill_file(
             distributed |= await _distribute_pending(client, fr, fd, version, report)
         if distributed:
             resp = await fd_repo.save(fd, fr)
-            _sync_ref(fr, resp)
+            await _sync_ref(client, fr, resp)
         if mirror_group is None:
             cache = getattr(client, "cache", None)
             if cache is not None:
@@ -316,7 +316,7 @@ async def backfill_file(
         # Commit point: the (possibly updated) mirrors map is persisted
         # in the FD message, and the FD itself gets its mirror copies.
         resp = await fd_repo.save(fd, fr)
-        _sync_ref(fr, resp)
+        await _sync_ref(client, fr, resp)
         descriptors_missing = (
             fd_missing
             - {key for key, mid in fr.mirrors.items() if mid > 0}
@@ -331,12 +331,18 @@ async def backfill_file(
             report.fds_mirrored += 1
 
 
-def _sync_ref(fr: TGFSFileRef, resp: "FDRepositoryResp") -> None:
+async def _sync_ref(
+    client: "Client", fr: TGFSFileRef, resp: "FDRepositoryResp"
+) -> None:
     if (
         resp.mirrors != fr.mirrors
         or resp.message_id != fr.message_id
         or resp.store != fr.store
     ):
+        if client.metadata_api and (
+            fr.message_id != resp.message_id or fr.store != resp.store
+        ):
+            await client.metadata_api.flush_uploads(ref=fr)
         fr.message_id = resp.message_id
         fr.mirrors = dict(resp.mirrors)
         fr.store = resp.store

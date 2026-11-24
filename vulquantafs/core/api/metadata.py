@@ -1,6 +1,7 @@
 import asyncio
 import logging
 from contextlib import asynccontextmanager
+from itertools import islice
 from typing import AsyncIterator, Iterable, List, Literal, Optional
 
 from vulquantafs.core.model import TGFSDirectory, TGFSFileRef, TGFSMetadata
@@ -8,6 +9,7 @@ from vulquantafs.core.repository.interface import IMetaDataRepository
 from vulquantafs.errors import FileOrDirectoryDoesNotExist, TechnicalError
 
 from .removal_journal import RemovalJournal
+from .upload_journal import UploadJournal
 
 logger = logging.getLogger(__name__)
 
@@ -24,6 +26,9 @@ DEFAULT_PUSH_WINDOW_SECONDS = 0.3
 REMOVE_FLUSH_INTERVAL = 2.0
 REMOVE_RETRY_INTERVAL = 30.0
 REMOVE_CLOSE_TIMEOUT = 5.0
+UPLOAD_BATCH_WINDOW_SECONDS = 0.3
+UPLOAD_BATCH_SIZE = 256
+UPLOAD_MAX_RETRY_SECONDS = 60.0
 
 
 class MetaDataApi:
@@ -33,6 +38,7 @@ class MetaDataApi:
         push_mode: MetadataPushMode = "inline",
         push_window: float = DEFAULT_PUSH_WINDOW_SECONDS,
         removal_journal: RemovalJournal | None = None,
+        upload_journal: UploadJournal | None = None,
     ):
         self.__metadata_repo = metadata_repo
         self.__batch_depth = 0
@@ -57,21 +63,158 @@ class MetaDataApi:
         self.__remove_checkpoint = 0
         self.__remove_worker: asyncio.Task[None] | None = None
         self.__remove_closing = False
+        self.__uploads = upload_journal
+        self.__pending_uploads: dict[int, TGFSFileRef] = {}
+        self.__upload_full_sync = False
+        self.__upload_lock = asyncio.Lock()
+        self.__upload_worker: asyncio.Task[None] | None = None
 
     async def init(self) -> None:
         await self.__metadata_repo.init()
-        if self.__removals is None:
+        if self.__removals is not None:
+            self.__remove_checkpoint, fingerprints = self.__removals.load()
+            if fingerprints:
+                pending = [self.get_root_directory()]
+                while pending:
+                    directory = pending.pop()
+                    pending.extend(directory.find_dirs())
+                    for ref in tuple(directory.find_files()):
+                        if self.__removals.fingerprint(ref) in fingerprints:
+                            directory.unlink_file_ref(ref)
+                self.__schedule_removal_flush()
+        self.__restore_uploads()
+
+    def __restore_uploads(self) -> None:
+        if self.__uploads is None:
             return
-        self.__remove_checkpoint, fingerprints = self.__removals.load()
-        if fingerprints:
-            pending = [self.get_root_directory()]
-            while pending:
-                directory = pending.pop()
-                pending.extend(directory.find_dirs())
-                for ref in tuple(directory.find_files()):
-                    if self.__removals.fingerprint(ref) in fingerprints:
-                        directory.unlink_file_ref(ref)
-            self.__schedule_removal_flush()
+        for entry in self.__uploads.load():
+            directory = self.get_root_directory()
+            for part in filter(None, entry.parent.split("/")):
+                try:
+                    directory = directory.find_dir(part)
+                except FileOrDirectoryDoesNotExist:
+                    directory = directory.restore_dir(part)
+            found = directory.find_files([entry.name])
+            if found and found[0].message_id == entry.message_id:
+                ref = found[0]
+            else:
+                if found:
+                    # Prefer a locally acknowledged upload over a stale
+                    # failover copy. A full reconciliation removes the
+                    # old descriptor path, not just adds the new one.
+                    self.__upload_full_sync = True
+                    directory.unlink_file_ref(found[0])
+                ref = directory.attach_file_ref(entry.name, entry.message_id)
+            ref.mirrors = entry.mirrors
+            ref.store = entry.store
+            self.__pending_uploads[entry.id] = ref
+        if self.__pending_uploads:
+            self.__schedule_upload_flush()
+
+    def stage_upload(
+        self,
+        directory: TGFSDirectory,
+        name: str,
+        message_id: int,
+        mirrors: dict[str, int],
+        store: str | None,
+    ) -> TGFSFileRef | None:
+        """Durably acknowledge an already-stored upload, without remote I/O."""
+        if self.__uploads is None or self.__remove_closing:
+            return None
+        node = directory
+        while node.parent is not None:
+            if not any(child is node for child in node.parent.find_dirs([node.name])):
+                raise FileOrDirectoryDoesNotExist(directory.absolute_path)
+            node = node.parent
+        if node is not self.get_root_directory():
+            raise FileOrDirectoryDoesNotExist(directory.absolute_path)
+        ref = directory.attach_file_ref(name, message_id)
+        ref.mirrors = dict(mirrors)
+        ref.store = store
+        try:
+            id_ = self.__uploads.add(ref)
+        except BaseException:
+            directory.unlink_file_ref(ref)
+            raise
+        directory._touch_modified()
+        self.__pending_uploads[id_] = ref
+        self.__schedule_upload_flush()
+        return ref
+
+    def __schedule_upload_flush(self) -> None:
+        if self.__upload_worker is None or self.__upload_worker.done():
+            self.__upload_worker = asyncio.create_task(
+                self.__drain_uploads(), name="metadata-upload-journal"
+            )
+
+    async def __drain_uploads(self) -> None:
+        retry = 1.0
+        while self.__pending_uploads and not self.__remove_closing:
+            if len(self.__pending_uploads) < UPLOAD_BATCH_SIZE:
+                await asyncio.sleep(UPLOAD_BATCH_WINDOW_SECONDS)
+            try:
+                await self.__flush_upload_batch()
+                retry = 1.0
+            except Exception as ex:
+                logger.warning(
+                    "Acknowledged uploads remain in the local journal; "
+                    "retrying in %.0fs: %s",
+                    retry,
+                    ex,
+                )
+                await asyncio.sleep(retry)
+                retry = min(retry * 2, UPLOAD_MAX_RETRY_SECONDS)
+
+    async def __flush_upload_batch(
+        self,
+        *,
+        ref: TGFSFileRef | None = None,
+        directory: TGFSDirectory | None = None,
+    ) -> bool:
+        async with self.__upload_lock:
+            if not self.__pending_uploads or self.__uploads is None:
+                return False
+            entries: Iterable[tuple[int, TGFSFileRef]] = self.__pending_uploads.items()
+            if ref is not None or directory is not None:
+                entries = (
+                    (id_, pending)
+                    for id_, pending in entries
+                    if pending is ref
+                    or (
+                        directory is not None
+                        and directory.is_ancestor_of(pending.location)
+                    )
+                )
+            batch = dict(islice(entries, UPLOAD_BATCH_SIZE))
+            if not batch:
+                return False
+            await self.__metadata_repo.push_upload_refs(
+                list(batch.values()), full=self.__upload_full_sync
+            )
+            self.__upload_full_sync = False
+            self.__uploads.clear(batch)
+            for id_ in batch:
+                del self.__pending_uploads[id_]
+            self.request_push()
+            return True
+
+    async def flush_uploads(
+        self,
+        *,
+        ref: TGFSFileRef | None = None,
+        directory: TGFSDirectory | None = None,
+    ) -> None:
+        """Order a conflicting mutation after the journaled create."""
+        # No matching references means nothing to wait for, including when
+        # an unrelated batch is already holding the journal lock.
+        while any(
+            pending is ref
+            or (directory is not None and directory.is_ancestor_of(pending.location))
+            for pending in self.__pending_uploads.values()
+        ):
+            if not await self.__flush_upload_batch(ref=ref, directory=directory):
+                return
 
     def defer_removal(self, ref: TGFSFileRef) -> bool:
         """Record the unlink durably before replying, without remote I/O."""
@@ -307,6 +450,15 @@ class MetaDataApi:
 
     async def close(self) -> None:
         self.__remove_closing = True
+        upload_worker = self.__upload_worker
+        self.__upload_worker = None
+        if upload_worker is not None:
+            upload_worker.cancel()
+            await asyncio.gather(upload_worker, return_exceptions=True)
+        if self.__uploads is not None:
+            # Unconfirmed entries must survive shutdown and be replayed
+            # even when the remote store is still unreachable.
+            self.__uploads.close()
         pusher = self.__pusher
         self.__pusher = None
         if pusher is not None and not pusher.done():

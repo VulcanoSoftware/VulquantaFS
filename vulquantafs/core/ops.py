@@ -208,7 +208,10 @@ class Ops:
         return file_to_remove
 
     async def _upload(
-        self, dirname: str, file_msg: UploadableFileMessage
+        self,
+        dirname: str,
+        file_msg: UploadableFileMessage,
+        journal_file_ref: bool = False,
     ) -> TGFSFileDesc:
         size = file_msg.get_size()
         task_tracker = await create_upload_task(
@@ -218,7 +221,12 @@ class Ops:
 
         file_msg.task_tracker = task_tracker
         try:
-            res = await self._client.file_api.upload(self.cd(dirname), file_msg)
+            if journal_file_ref:
+                res = await self._client.file_api.upload(
+                    self.cd(dirname), file_msg, journal_file_ref=True
+                )
+            else:
+                res = await self._client.file_api.upload(self.cd(dirname), file_msg)
             await task_tracker.mark_completed()
             return res
         except Exception as ex:
@@ -253,7 +261,12 @@ class Ops:
         )
 
     async def upload_from_stream(
-        self, stream: AsyncIterator[bytes], size: int, remote: str
+        self,
+        stream: AsyncIterator[bytes],
+        size: int,
+        remote: str,
+        *,
+        journal_file_ref: bool = False,
     ) -> TGFSFileDesc:
         """Upload ``stream`` as ``remote``.
 
@@ -272,6 +285,7 @@ class Ops:
                 stream=stream,
                 size=size,
             ),
+            journal_file_ref=journal_file_ref,
         )
 
     async def import_from_existing_file_message(

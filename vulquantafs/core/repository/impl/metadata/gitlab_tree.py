@@ -1330,6 +1330,7 @@ class GitlabTreeRepoMetadataRepository(GithubRepoMetadataRepository):
     """
 
     batch_mirror_writes = True
+    supports_upload_journal = False
 
     def __init__(
         self,

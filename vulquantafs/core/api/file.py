@@ -387,6 +387,7 @@ class FileApi:
         the metadata instead.
         """
         from_dir = fr.location
+        await self._metadata_api.flush_uploads(ref=fr)
         moved_fr = await from_dir.relocate_file_ref_async(fr, where, name)
         await self._metadata_api.push()
         self.stats.changed(from_dir, pushed=True)
@@ -398,8 +399,17 @@ class FileApi:
         where: TGFSDirectory,
         file_msg: FileMessage,
         defer_file_ref: bool = False,
+        journal_file_ref: bool = False,
     ) -> TGFSFileDesc:
         resp = await self._file_desc_api.create_file_desc(file_msg)
+        if journal_file_ref and resp.store in (None, self._store_key):
+            staged = self._metadata_api.stage_upload(
+                where, file_msg.name, resp.message_id, resp.mirrors, resp.store
+            )
+            if staged is not None:
+                await self.stats.record(staged, resp.fd)
+                await self._written(staged, resp.fd)
+                return resp.fd
         if defer_file_ref:
             fr = await where.create_file_ref_deferred(file_msg.name, resp.message_id)
         else:
@@ -451,6 +461,11 @@ class FileApi:
             or fr.mirrors != resp.mirrors
             or fr.store != resp.store
         ):
+            if fr.message_id != resp.message_id or resp.store not in (
+                None,
+                self._store_key,
+            ):
+                await self._metadata_api.flush_uploads(ref=fr)
             fr.message_id = resp.message_id
             fr.mirrors = dict(resp.mirrors)
             fr.store = resp.store
@@ -507,6 +522,7 @@ class FileApi:
             message_ids, mirror_ids = await self.collect_deletable_message_ids(
                 [fr], version_ids if clean_cache else None
             )
+            await self._metadata_api.flush_uploads(ref=fr)
             if (
                 defer_metadata
                 and not self._deletes_backend_messages()
@@ -542,12 +558,15 @@ class FileApi:
         file_msg: FileMessage,
         version_id: Optional[str] = None,
         defer_file_ref: bool = False,
+        journal_file_ref: bool = False,
     ) -> TGFSFileDesc:
         try:
             fr = under.find_file(file_msg.name)
             return await self._update_existing_file(fr, file_msg, version_id)
         except FileOrDirectoryDoesNotExist:
-            return await self._create_new_file(under, file_msg, defer_file_ref)
+            return await self._create_new_file(
+                under, file_msg, defer_file_ref, journal_file_ref
+            )
 
     async def desc(
         self, fr: TGFSFileRef, include_all_versions: bool = False

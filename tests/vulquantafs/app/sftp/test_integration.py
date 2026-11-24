@@ -16,6 +16,7 @@ from unittest.mock import call
 
 import asyncssh
 import pytest
+from github import GithubException
 
 from tests.vulquantafs.app.sftp.mocked_stats import mocked_stats
 from vulquantafs.app.sftp.server import make_server_factory, make_sftp_factory
@@ -23,6 +24,7 @@ from vulquantafs.config import GithubRepoConfig, SFTPConfig
 from vulquantafs.core import Client
 from vulquantafs.core.api import DirectoryApi, FileApi, MetaDataApi
 from vulquantafs.core.api.removal_journal import RemovalJournal
+from vulquantafs.core.api.upload_journal import UploadJournal
 from vulquantafs.core.model import (
     TGFSDirectory,
     TGFSFileDesc,
@@ -32,7 +34,7 @@ from vulquantafs.core.model import (
 from vulquantafs.core.repository.impl.metadata.github_repo import (
     GithubRepoMetadataRepository,
 )
-from vulquantafs.core.repository.interface import IMetaDataRepository
+from vulquantafs.core.repository.interface import FDRepositoryResp, IMetaDataRepository
 from vulquantafs.reqres import UploadableFileMessage
 
 CONTENT = bytes(range(256)) * 400  # 100 KiB
@@ -93,7 +95,13 @@ def build_client(mocker, name: str, channel: FakeChannel) -> Client:
 
         return stream()
 
-    async def upload(directory, file_msg, version_id=None, defer_file_ref=False):
+    async def upload(
+        directory,
+        file_msg,
+        version_id=None,
+        defer_file_ref=False,
+        journal_file_ref=False,
+    ):
         # `touch` sends a FileMessageEmpty, which carries no readable body;
         # a live upload (SFTP) has an unknown size and is drained to EOF.
         data = bytearray()
@@ -374,6 +382,162 @@ async def test_rmdir_stays_responsive_and_does_not_wait_for_history(mocker, user
     ]
     ref.edit.assert_called_once_with("next")
     assert not media.mock_calls
+
+
+@pytest.mark.parametrize("branch_exists", [True, False])
+async def test_stalled_github_writer_does_not_fail_sftp_close_and_uploads_replay(
+    mocker, users, tmp_path, branch_exists
+):
+    """Two real SFTP sessions, byte-for-byte readback, and restart replay."""
+    payloads = {1: b"a" * 524_400, 2: b"b" * 524_400}
+    contents = {}
+    descriptors: dict[int, TGFSFileDesc] = {}
+    journal_path = str(tmp_path / "uploads.sqlite3")
+    journal_key = b"a" * 32
+    mocker.patch(
+        "vulquantafs.core.ops.create_upload_task", new_callable=mocker.AsyncMock
+    )
+    mocker.patch(
+        "vulquantafs.app.sftp.server.authenticate",
+        side_effect=lambda username, password: _authenticate(users, username, password),
+    )
+
+    async def store_message(file_msg):
+        chunks = bytearray()
+        while chunk := await file_msg.read(64 * 1024):
+            chunks.extend(chunk)
+        if file_msg.name == "backend-failure.txt":
+            raise OSError("storage unavailable")
+        message_id = len(descriptors) + 1
+        desc = TGFSFileDesc(name=file_msg.name, created_at=CREATED_AT)
+        desc.add_version(
+            TGFSFileVersion(
+                id=f"v{message_id}",
+                updated_at=UPDATED_AT,
+                _size=len(chunks),
+                message_ids=[message_id],
+            )
+        )
+        descriptors[message_id] = desc
+        contents[message_id] = bytes(chunks)
+        return FDRepositoryResp(message_id, desc)
+
+    async def download(fv, begin, end, _name):
+        data = contents[fv.message_ids[0]]
+
+        async def stream():
+            yield data[begin : None if end < 0 else end + 1]
+
+        return stream()
+
+    async def make_client(folder_exists):
+        github = mocker.Mock()
+        github.get_git_ref.return_value.object.sha = "head"
+        github.create_git_commit.return_value.sha = "new-head"
+        repo = GithubRepoMetadataRepository(
+            GithubRepoConfig(
+                repo="test/metadata", commit="main", access_token="unused"
+            ),
+            repo=github,
+        )
+        tree = TGFSDirectory.root_dir()
+        if folder_exists:
+            tree.create_dir("batch")
+        mocker.patch.object(
+            repo, "get", new_callable=mocker.AsyncMock, return_value=TGFSMetadata(tree)
+        )
+        journal = UploadJournal(journal_path, journal_key)
+        api = MetaDataApi(repo, upload_journal=journal)
+        await api.init()
+        store = mocker.Mock(key="tg:42")
+        file_desc_api = mocker.Mock(
+            create_file_desc=mocker.AsyncMock(side_effect=store_message),
+            get_file_desc=mocker.AsyncMock(
+                side_effect=lambda fr, *_args, **_kwargs: descriptors[fr.message_id]
+            ),
+            download_file_at_version=mocker.AsyncMock(side_effect=download),
+            content_length=mocker.AsyncMock(side_effect=lambda fv: fv.size),
+        )
+        client = mocker.Mock(spec=Client)
+        client.name = "notes"
+        client.metadata_api = api
+        client.fc_repo = file_desc_api
+        client.file_api = FileApi(api, file_desc_api, store)
+        client.dir_api = DirectoryApi(api, client.file_api, store)
+        acceptor = await asyncssh.listen(
+            host="127.0.0.1",
+            port=0,
+            server_factory=make_server_factory(build_config(mocker, users)),
+            server_host_keys=[asyncssh.generate_private_key("ssh-ed25519")],
+            sftp_factory=make_sftp_factory(
+                {"notes": client}, build_config(mocker, users)
+            ),
+        )
+        return acceptor, repo, api, journal, github
+
+    async def upload(acceptor, name, payload):
+        async with await connect(acceptor) as conn, conn.start_sftp_client() as sftp:
+            async with sftp.open(f"/notes/batch/{name}", "wb") as file:
+                await file.write(payload)
+
+    async def readback(acceptor):
+        async with await connect(acceptor) as conn, conn.start_sftp_client() as sftp:
+            for i, payload in payloads.items():
+                async with sftp.open(f"/notes/batch/file-{i}.txt", "rb") as file:
+                    assert await file.read() == payload
+
+    first_server, first_repo, first_api, journal, github = await make_client(True)
+    try:
+        # Model a stats commit holding the same writer lock. Do not release
+        # it until both CLOSE replies and the immediate reads finish.
+        async with first_repo._ghc.lock:
+            async with asyncio.timeout(4):
+                await asyncio.gather(
+                    *(
+                        upload(first_server, f"file-{i}.txt", content)
+                        for i, content in payloads.items()
+                    )
+                )
+                with pytest.raises(asyncssh.SFTPFailure):
+                    await upload(first_server, "backend-failure.txt", b"not durable")
+                await readback(first_server)
+            assert sorted(entry.name for entry in journal.load()) == [
+                "file-1.txt",
+                "file-2.txt",
+            ]
+            assert b"file-1.txt" not in (tmp_path / "uploads.sqlite3").read_bytes()
+            assert not github.mock_calls
+            await first_api.close()
+    finally:
+        first_server.close()
+        await first_server.wait_closed()
+        await first_api.close()
+        first_repo._ghc.writer.shutdown()
+
+    # GitHub did not see either file or their parent on the second boot.
+    server, repo, api, journal, github = await make_client(False)
+    if not branch_exists:
+        github.get_git_ref.side_effect = GithubException(404, "Not Found", None)
+    try:
+        await readback(server)
+        await asyncio.wait_for(
+            api.flush_uploads(directory=api.get_root_directory()), timeout=4
+        )
+        assert journal.load() == []
+        changes = github.create_git_tree.call_args.args[0]
+        assert {element._identity["path"] for element in changes} == {
+            f"batch/{record.name}.{message_id}"
+            for message_id, record in descriptors.items()
+        }
+        if branch_exists:
+            github.get_git_ref.return_value.edit.assert_called_once_with("new-head")
+        else:
+            github.create_git_ref.assert_called_once_with("refs/heads/main", "new-head")
+    finally:
+        server.close()
+        await server.wait_closed()
+        await api.close()
+        repo._ghc.writer.shutdown()
 
 
 def _authenticate(users, username, password):

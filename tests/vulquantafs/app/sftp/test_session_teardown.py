@@ -43,7 +43,7 @@ def make_ops_class(recorder: Recorder):
         def stat_file(path):
             raise FileOrDirectoryDoesNotExist(path)
 
-        async def upload_from_stream(stream, size, remote):
+        async def upload_from_stream(stream, size, remote, *, journal_file_ref=False):
             received = 0
             recorder.started.set()
             try:

@@ -46,7 +46,7 @@ import time
 from dataclasses import dataclass
 from typing import AsyncIterator, Iterable, List, Optional, Sequence, Set
 
-from vulquantafs.core.model import TGFSDirectory, TGFSMetadata
+from vulquantafs.core.model import TGFSDirectory, TGFSFileRef, TGFSMetadata
 from vulquantafs.core.repository.interface import IMetaDataRepository
 from vulquantafs.errors import (
     MetadataBlobTooLarge,
@@ -357,6 +357,19 @@ class ReplicatedMetadataRepository(IMetaDataRepository):
 
     async def push(self) -> None:
         await self._push()
+
+    @property
+    def supports_upload_journal(self) -> bool:
+        return self._stores[0].repo.supports_upload_journal
+
+    async def push_upload_refs(
+        self, refs: Sequence[TGFSFileRef], *, full: bool = False
+    ) -> None:
+        # The outbox drains via the primary; mirror copies continue
+        # through the normal (and, for GitLab, batched) replication path.
+        primary = self._stores[0]
+        async with self._store_locks[primary.key]:
+            await primary.repo.push_upload_refs(refs, full=full)
 
     async def push_removals(self) -> None:
         # The journal flusher may not clear an entry until every store,

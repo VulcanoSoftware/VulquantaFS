@@ -22,6 +22,7 @@ from vulquantafs.core.api import (
     MetaDataApi,
 )
 from vulquantafs.core.api.removal_journal import RemovalJournal
+from vulquantafs.core.api.upload_journal import UploadJournal
 from vulquantafs.core.local_cache import LocalCache
 from vulquantafs.core.mirror import MirrorGroup, MirrorStore
 from vulquantafs.core.model import TGFSFileRef
@@ -246,6 +247,13 @@ class Client:
                 )
                 if filesystem.metadata_mirrors
                 or metadata_cfg.type != MetadataType.PINNED_MESSAGE
+                else None
+            ),
+            upload_journal=(
+                UploadJournal(
+                    expand_path(f"uploads/{journal_id}.sqlite3"), metadata_blob_key
+                )
+                if metadata_repo.supports_upload_journal
                 else None
             ),
         )

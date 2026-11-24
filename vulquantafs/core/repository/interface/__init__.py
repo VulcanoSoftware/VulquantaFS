@@ -1,6 +1,6 @@
 from abc import ABCMeta, abstractmethod
 from dataclasses import dataclass, field
-from typing import Dict, Iterable, Iterator, List, Optional
+from typing import Dict, Iterable, Iterator, List, Optional, Sequence
 
 from vulquantafs.core.model import (
     TGFSDirectory,
@@ -123,6 +123,15 @@ class IMetaDataRepository(metaclass=ABCMeta):
 
     def write_in_cooldown(self) -> bool:
         return False
+
+    @property
+    def supports_upload_journal(self) -> bool:
+        return False
+
+    async def push_upload_refs(
+        self, refs: Sequence[TGFSFileRef], *, full: bool = False
+    ) -> None:
+        await self.push_full()
 
     @abstractmethod
     async def push(self) -> None:

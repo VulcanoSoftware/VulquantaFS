@@ -7,11 +7,13 @@ that covers its change; push failures are logged, not raised.
 """
 
 import asyncio
+import sqlite3
 
 import pytest
 
-from vulquantafs.core.api.metadata import MetaDataApi
+from vulquantafs.core.api.metadata import UPLOAD_BATCH_SIZE, MetaDataApi
 from vulquantafs.core.api.removal_journal import RemovalJournal
+from vulquantafs.core.api.upload_journal import UploadJournal
 from vulquantafs.core.model import TGFSDirectory, TGFSMetadata
 from vulquantafs.core.repository.interface import IMetaDataRepository
 from vulquantafs.errors import NoStoredMetadata, TechnicalError
@@ -95,6 +97,97 @@ async def test_removals_replay_from_a_stale_remote_after_restart(tmp_path):
     await api.flush_removals()
     assert journal.load() == (0, set())
     await api.close()
+
+
+async def test_failed_journal_write_rolls_back_the_file_reference(
+    tmp_path, monkeypatch
+):
+    class Repo(CountingRepo):
+        async def get(self):
+            return TGFSMetadata(TGFSDirectory.root_dir())
+
+    journal = UploadJournal(str(tmp_path / "uploads.sqlite3"), None)
+    api = MetaDataApi(Repo(), upload_journal=journal)
+    await api.init()
+    root = api.get_root_directory()
+
+    def disk_full(_ref):
+        raise sqlite3.OperationalError("database or disk is full")
+
+    monkeypatch.setattr(journal, "add", disk_full)
+    try:
+        with pytest.raises(sqlite3.OperationalError, match="disk is full"):
+            api.stage_upload(root, "not-acknowledged", 1, {}, None)
+        assert not root.find_files()
+        assert journal.load() == []
+    finally:
+        await api.close()
+
+
+async def test_upload_batches_retry_without_losing_uploads_staged_in_flight(tmp_path):
+    class Repo(CountingRepo):
+        async def get(self):
+            return TGFSMetadata(TGFSDirectory.root_dir())
+
+        async def push_upload_refs(self, refs, *, full=False):
+            attempts.append([ref.message_id for ref in refs])
+            if len(attempts) == 1:
+                entered.set()
+                await release.wait()
+                raise OSError("primary unavailable")
+            if len(attempts) == 4:
+                done.set()
+
+    entered, release, done = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    attempts: list[list[int]] = []
+    path = tmp_path / "uploads.sqlite3"
+    journal = UploadJournal(str(path), None)
+    api = MetaDataApi(Repo(), upload_journal=journal)
+    await api.init()
+    root = api.get_root_directory()
+    try:
+        first = UPLOAD_BATCH_SIZE
+        for id_ in range(first):
+            api.stage_upload(root, str(id_), id_, {}, None)
+        await asyncio.wait_for(entered.wait(), 2)
+        total = 2 * first + 48
+        for id_ in range(first, total):
+            api.stage_upload(root, str(id_), id_, {}, None)
+        assert len(journal.load()) == total
+        assert path.stat().st_mode & 0o777 == 0o600
+        release.set()
+        await asyncio.wait_for(done.wait(), 5)
+        assert attempts[0] == attempts[1] == list(range(first))
+        assert [id_ for batch in attempts[1:] for id_ in batch] == list(range(total))
+        assert [len(batch) for batch in attempts[1:]] == [first, first, 48]
+        assert not journal.load()
+    finally:
+        await api.close()
+
+
+async def test_mutation_flush_targets_only_its_subtree(tmp_path):
+    class Repo(CountingRepo):
+        async def get(self):
+            return TGFSMetadata(TGFSDirectory.root_dir())
+
+        async def push_upload_refs(self, refs, *, full=False):
+            pushed.extend(ref.name for ref in refs)
+
+    pushed: list[str] = []
+    journal = UploadJournal(str(tmp_path / "uploads.sqlite3"), None)
+    api = MetaDataApi(Repo(), upload_journal=journal)
+    await api.init()
+    root = api.get_root_directory()
+    moving = root.create_dir("moving")
+    try:
+        api.stage_upload(root, "unrelated", 1, {}, None)
+        api.stage_upload(moving, "in-subtree", 2, {}, None)
+        await api.flush_uploads(directory=moving)
+        moving.move_to(root, "moved")
+        assert pushed == ["in-subtree"]
+        assert [row.name for row in journal.load()] == ["unrelated"]
+    finally:
+        await api.close()
 
 
 async def test_inline_mode_pushes_directly():
