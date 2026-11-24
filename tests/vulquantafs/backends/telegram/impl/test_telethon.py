@@ -24,6 +24,7 @@ from vulquantafs.backends.telegram.impl.telethon import (
     _is_transient_telegram_login_error,
     Session,
     login_as_account,
+    TELEGRAM_DATACENTERS,
     login_as_bots,
     open_extra_connections,
 )
@@ -1480,9 +1481,53 @@ class TestLoginAsBots:
         assert await login_as_bots(mock_config_single_token) == [client]
 
         assert client.start.await_count == 3
-        assert (
-            "Telegram bot 789 login failed (RpcCallFailError; attempt 1/" in caplog.text
+        assert "Telegram bot 789 login failed on DC" in caplog.text
+        assert "(RpcCallFailError; attempt 1/" in caplog.text
+
+    async def test_each_retry_fails_over_to_a_new_untried_dc(
+        self, mock_config_single_token, mocker, caplog
+    ):
+        session = mocker.patch("vulquantafs.backends.telegram.impl.telethon.Session")
+        session.return_value.get.return_value = None
+        calls: list = []
+        clients = []
+
+        def make_client(*args, **kwargs):
+            client = mocker.AsyncMock(spec=TelegramClient)
+            client.session = mocker.Mock()
+            client.session.save.return_value = "session_string"
+            client.session.set_dc.side_effect = lambda *a: calls.append(("set_dc", a))
+            client.connect = mocker.AsyncMock(
+                side_effect=lambda: calls.append(("connect", None))
+            )
+            client.disconnect = mocker.AsyncMock()
+            client.get_me = mocker.AsyncMock(return_value=mocker.Mock(username="b"))
+            client.start = mocker.AsyncMock(
+                side_effect=RpcCallFailError(request=None)
+            )
+            clients.append(client)
+            return client
+
+        mocker.patch(
+            "vulquantafs.backends.telegram.impl.telethon._RPCOnlyTelegramClient",
+            side_effect=make_client,
         )
+        mocker.patch("vulquantafs.backends.telegram.impl.telethon.BOT_LOGIN_RETRY_DELAY", 0)
+
+        with pytest.raises(TechnicalError):
+            await login_as_bots(mock_config_single_token)
+
+        set_dc_calls = [a for kind, a in calls if kind == "set_dc"]
+        assert len(set_dc_calls) == 5
+        assert {a for a in set_dc_calls} == {
+            (dc_id, ip, port) for dc_id, ip, port in TELEGRAM_DATACENTERS
+        }
+        # set_dc always precedes the connect of that same attempt
+        kinds = [kind for kind, _ in calls]
+        assert kinds[0] == "set_dc"
+        assert all(c.disconnect.await_count == 1 for c in clients)
+        assert "login failed on DC" in caplog.text
+        assert any(ip in caplog.text for _, ip, _ in TELEGRAM_DATACENTERS)
 
     async def test_telethon_giving_up_is_retried_too(
         self, mock_config_single_token, mocker

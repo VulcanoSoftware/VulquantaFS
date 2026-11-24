@@ -1,8 +1,18 @@
 import asyncio
 import logging
 import os
+import random
 from itertools import cycle
-from typing import AsyncIterator, Awaitable, Callable, List, Optional, Sequence, TypeVar
+from typing import (
+    AsyncIterator,
+    Awaitable,
+    Callable,
+    List,
+    Optional,
+    Sequence,
+    Tuple,
+    TypeVar,
+)
 
 from telethon import TelegramClient
 from telethon import errors as tle
@@ -61,6 +71,14 @@ BOT_LOGIN_ATTEMPTS = 5
 BOT_LOGIN_RETRY_DELAY = 5.0
 BOT_LOGIN_STAGGER_SECONDS = 2.0
 FLOOD_WAIT_MAX_SLEEP = 30.0
+# Official Telegram production data centres as (dc_id, ip, port).
+TELEGRAM_DATACENTERS: Tuple[Tuple[int, str, int], ...] = (
+    (1, "149.154.175.53", 443),
+    (2, "149.154.167.51", 443),
+    (3, "149.154.175.100", 443),
+    (4, "149.154.167.91", 443),
+    (5, "91.108.56.130", 443),
+)
 T = TypeVar("T")
 
 
@@ -682,6 +700,13 @@ async def login_as_bots(config: Config) -> List[TelegramClient]:
             # never hammers Telegram's auth endpoint at the same time.
             await asyncio.sleep(BOT_LOGIN_STAGGER_SECONDS * index)
 
+        # A fresh sign-in has no auth key yet, so it may start on any data
+        # centre. Shuffle once per login sequence: the first DC is random
+        # and each retry moves on to one that has not been tried yet.
+        # A stored session's auth key belongs to its own DC, so moving it
+        # elsewhere would only invalidate it; it keeps the DC it was saved on.
+        dc_order = random.sample(TELEGRAM_DATACENTERS, len(TELEGRAM_DATACENTERS))
+
         attempts = 0
         while True:
             client = _RPCOnlyTelegramClient(
@@ -690,6 +715,12 @@ async def login_as_bots(config: Config) -> List[TelegramClient]:
                 api_hash,
                 receive_updates=False,
             )
+            if sess is None:
+                dc_id, dc_ip, dc_port = dc_order[attempts % len(dc_order)]
+                client.session.set_dc(dc_id, dc_ip, dc_port)  # type: ignore[attr-defined]
+            else:
+                dc_id = sess.dc_id
+                dc_ip = sess.server_address
             try:
                 async with asyncio.timeout(timeout):
                     # Bound the auth-key exchange, data-centre migration,
@@ -701,10 +732,12 @@ async def login_as_bots(config: Config) -> List[TelegramClient]:
                     me = await client.get_me()
             except (TimeoutError, ConnectionError) as ex:
                 logger.warning(
-                    "Telegram bot %s not ready (%s; login budget %gs); excluding it from startup",
+                    "Telegram bot %s not ready (%s; login budget %gs; DC%s %s); excluding it from startup",
                     bot_id,
                     type(ex).__name__,
                     timeout,
+                    dc_id,
+                    dc_ip,
                 )
                 await _disconnect_after_startup_failure(client)
                 return None
@@ -718,10 +751,12 @@ async def login_as_bots(config: Config) -> List[TelegramClient]:
                 attempts += 1
                 if attempts >= BOT_LOGIN_ATTEMPTS:
                     logger.warning(
-                        "Telegram bot %s not ready (%s after %s attempts); excluding it from startup",
+                        "Telegram bot %s not ready (%s after %s attempts; last DC%s %s); excluding it from startup",
                         bot_id,
                         type(ex).__name__,
                         attempts,
+                        dc_id,
+                        dc_ip,
                     )
                     return None
                 wait = getattr(ex, "seconds", None)
@@ -729,8 +764,10 @@ async def login_as_bots(config: Config) -> List[TelegramClient]:
                     wait = BOT_LOGIN_RETRY_DELAY * 2 ** (attempts - 1)
                 wait = min(wait, FLOOD_WAIT_MAX_SLEEP)
                 logger.warning(
-                    "Telegram bot %s login failed (%s; attempt %s/%s); trying again in %gs",
+                    "Telegram bot %s login failed on DC%s %s (%s; attempt %s/%s); trying again in %gs",
                     bot_id,
+                    dc_id,
+                    dc_ip,
                     type(ex).__name__,
                     attempts,
                     BOT_LOGIN_ATTEMPTS,
