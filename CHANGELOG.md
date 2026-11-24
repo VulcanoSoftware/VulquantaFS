@@ -54,6 +54,18 @@ the fact on the commits that shipped them.
 
 ### Fixed
 
+- An SFTP close no longer fails an upload whose content is already
+  stored when the metadata store hiccups. A GitHub write that timed out
+  opened the store's breaker, and the reference create answered that
+  refusal to the client: FileZilla reported "the service is unreachable"
+  or waited out its 20 s of inactivity, retransmitted the file and asked
+  to overwrite a copy the server had persisted seconds earlier. A
+  transport-level failure now keeps the reference in the tree, answers
+  the close and retries it in the background -- ten attempts, five
+  seconds apart -- while only a refusal the store decided on still fails
+  the close. The awaited commit also answers after 5 s instead of 15 s,
+  so the reply fits the client's window next to a slow store
+  confirmation.
 - A Telegram hiccup at startup (the 12 simultaneous fresh bot sign-ins of
   the fix-build preview all hit `RPC_CALL_FAIL` and the container exited)
   no longer aborts the whole start. Transient login failures -- Telegram

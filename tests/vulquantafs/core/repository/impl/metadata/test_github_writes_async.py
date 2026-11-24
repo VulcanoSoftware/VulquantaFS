@@ -12,6 +12,7 @@ import time
 from unittest.mock import Mock
 
 import pytest
+import requests
 from github import Github
 from github.Repository import Repository
 
@@ -165,12 +166,14 @@ class TestCreateFileRefAsync:
             branch="main",
         )
 
-    async def test_a_commit_past_the_deadline_answers_an_error(self, ghc, monkeypatch):
+    async def test_a_commit_past_the_deadline_still_answers_the_close(
+        self, ghc, monkeypatch
+    ):
         """A GitHub read timeout plus the write thread's inline retries
         held the awaited commit for over 27 s in the second bulk retest,
-        past FileZilla's 20 s. The waiter gives up at its deadline instead:
-        the close answers an error, the tree keeps the reference, and the
-        blob still lands in the background."""
+        past FileZilla's 20 s. The waiter gives up at its deadline and the
+        close stands: the content is stored, the tree keeps the reference,
+        and the blob still lands in the background."""
         from github import GithubException
 
         from vulquantafs.core.repository.impl.metadata.github_repo import (
@@ -194,9 +197,9 @@ class TestCreateFileRefAsync:
         directory = GithubDirectory(ghc, "d", None)
 
         start = time.monotonic()
-        with pytest.raises(Exception, match="Timed out"):
-            await directory.create_file_ref_async("f", 1)
+        ref = await directory.create_file_ref_async("f", 1)
         assert time.monotonic() - start < 2
+        assert ref.name == "f"
 
         # The reference stays findable, so a retransmission appends a
         # version to the same file instead of another create.
@@ -213,49 +216,62 @@ class TestCreateFileRefAsync:
         assert paths == ["f.1", "f.99"]
         assert [fr.name for fr in directory.files] == ["f"]
 
-    async def test_a_transient_failure_keeps_a_timed_out_reference(
+    async def test_a_transient_failure_keeps_a_waited_reference(
         self, ghc, monkeypatch
     ):
-        """Once the waiter left on its deadline the blob is nobody's
-        reply any more, so GitHub's transient errors must not drop the
-        reference out of the tree a retransmission just appended to."""
-        from github import GithubException
-
+        """A store that is unreachable while the client waits for its
+        CLOSE must not fail the upload: the content is already stored, so
+        the close stands and the blob keeps retrying in the background --
+        the retest showed every such close as a failed transfer that
+        FileZilla retransmitted into an overwrite prompt."""
         from vulquantafs.core.repository.impl.metadata.github_repo import (
             gh_directory,
         )
 
-        monkeypatch.setattr(gh_directory, "AWAITED_COMMIT_MAX_WAIT", 0.05)
+        monkeypatch.setattr(gh_directory, "AWAITED_COMMIT_MAX_WAIT", 5)
         monkeypatch.setattr(gh_directory, "DEFERRED_PUT_RETRY_DELAY", 0)
         monkeypatch.setattr(gh_directory, "PUT_ATTEMPTS", 1)
         monkeypatch.setattr(gh_directory, "PUT_RETRY_DELAY", 0)
-        proceed = threading.Event()
         attempts = 0
 
         def create_file(**_):
             nonlocal attempts
             attempts += 1
             if attempts == 1:
-                assert proceed.wait(5)
-            if attempts <= 2:
-                raise GithubException(500, {}, {})
+                raise requests.exceptions.ConnectionError(
+                    "('Connection aborted.', TimeoutError('The write "
+                    "operation timed out'))"
+                )
 
         ghc.repo.create_file.side_effect = create_file
         directory = GithubDirectory(ghc, "d", None)
 
-        with pytest.raises(Exception, match="Timed out"):
-            await directory.create_file_ref_async("f", 1)
-        proceed.set()
+        start = time.monotonic()
+        ref = await directory.create_file_ref_async("f", 1)
+        assert time.monotonic() - start < 2
+        assert ref.name == "f"
+        assert [fr.name for fr in directory.files] == ["f"]
 
         flusher = ghc.pending_refs_flusher
         if flusher is not None:
             await asyncio.gather(flusher, return_exceptions=True)
 
-        # The rounds nobody waits for kept retrying and the reference
-        # survived the transient failures, so the retransmission finds
-        # the file in the tree.
-        assert attempts == 3
+        # The background round landed the blob and the reference stayed.
+        assert attempts == 2
         assert [fr.name for fr in directory.files] == ["f"]
+
+    async def test_a_refused_write_still_fails_the_close(self, ghc):
+        """A store that answers and says no is a real failure: the
+        reference leaves the tree and the close reports it."""
+        from github import GithubException
+
+        ghc.repo.create_file.side_effect = GithubException(422, {}, {})
+        directory = GithubDirectory(ghc, "d", None)
+
+        with pytest.raises(GithubException):
+            await directory.create_file_ref_async("f", 1)
+
+        assert directory.files == []
 
 
 class TestCreateFileRefDeferred:

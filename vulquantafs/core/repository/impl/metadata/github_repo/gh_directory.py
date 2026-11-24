@@ -48,14 +48,15 @@ DEFERRED_COMMIT_WINDOW = 1.0
 # Completed uploads wait for their reference. Briefly collect concurrent CLOSE
 # requests without adding the full background window to each small file.
 AWAITED_COMMIT_WINDOW = 0.025
-# ... but never longer than this. A GitHub read timeout plus the write
-# thread's inline retries can hold the shared batch for half a minute and
-# more; a client that does not hear its CLOSE reply within about 20 s drops
-# the connection and aborts the upload. Past this bound the caller hears a
-# failure instead while the commit keeps retrying in the background, so a
-# retransmission appends a version to the same reference instead of finding
-# a server that never answers.
-AWAITED_COMMIT_MAX_WAIT = 15.0
+# ... but never longer than this. The reply has to fit the ~20 s a client
+# waits for its CLOSE, and the store confirmation of the content (a Discord
+# poll, a Telegram retransmission) already eats most of that window: a
+# GitHub read timeout plus the write thread's inline retries once held the
+# shared batch for over 27 s. Past this bound the close answers anyway --
+# the content is stored and the reference is in the tree -- while the
+# commit keeps retrying in the background, so a slow store cannot turn a
+# finished upload into a failure.
+AWAITED_COMMIT_MAX_WAIT = 5.0
 
 # GitHub refuses a tree whose request carries a whole repository: the
 # rewrites sent every blob as an element and large metadata repositories
@@ -358,9 +359,30 @@ class GithubConfig:
 
     def _retry(self, entry: _PendingRef, ex: Exception) -> bool:
         entry.attempts += 1
-        # A caller still waiting on CLOSE gets the outcome of this round,
-        # not a reply for a reference that might later disappear.
+        transient = _is_transient(ex)
+        # A caller still waiting on CLOSE gets the outcome of this round --
+        # but only a refusal the store decided on takes the reference back
+        # out and fails the close. A transport-level failure (a store that
+        # is unreachable, a write that timed out) says nothing about the
+        # reference: the content is already stored, so the close stands and
+        # the blob keeps retrying in the background. The store's next full
+        # re-sync carries the reference even if this worker runs out of
+        # attempts, so the file never turns up missing from the listing.
         if entry.committed is not None and not entry.committed.done():
+            if transient:
+                logger.warning(
+                    f"Creating file reference {entry.name} failed ({ex}); the "
+                    f"upload stands and the write retries in the background"
+                )
+                entry.committed.set_result(None)
+                if entry.attempts >= DEFERRED_PUT_ATTEMPTS:
+                    logger.error(
+                        f"File reference {entry.name} is still not in "
+                        f"{self.repo_name} after {entry.attempts} attempts; "
+                        f"the store's next full re-sync carries it"
+                    )
+                    return False
+                return True
             logger.error(
                 f"Failed to create file reference {entry.name} in "
                 f"{self.repo_name}: {ex}"
@@ -817,19 +839,22 @@ class GithubDirectory(TGFSDirectory):
         # away during the commit. By this point the content already exists.
         done, _ = await asyncio.wait({committed}, timeout=AWAITED_COMMIT_MAX_WAIT)
         if not done:
-            # GitHub is too slow to answer the commit. Answer the client
-            # anyway: holding the reply past what it waits for gets the
-            # connection killed and the upload aborted mid-bulk. The
-            # reference stays in the tree and the worker keeps retrying,
-            # so a retransmission appends a version to the same file.
+            # GitHub is too slow to answer the commit within the time the
+            # client waits for its CLOSE. The content is stored and the
+            # reference is in the tree, so the close stands: failing it only
+            # makes the client retransmit a file the server already holds
+            # (the retest turned every one of those into an overwrite
+            # prompt). The worker keeps committing the blob in the
+            # background.
             committed.cancel()
-            raise TechnicalError(
-                f"Timed out after {AWAITED_COMMIT_MAX_WAIT:g}s waiting for "
-                f"the file reference of {name} to be committed to "
-                f"{self._ghc.repo_name}; the content is stored and the "
-                f"commit retries in the background"
+            logger.warning(
+                f"The file reference of {name} was not committed to "
+                f"{self._ghc.repo_name} within "
+                f"{AWAITED_COMMIT_MAX_WAIT:g}s; the write retries in the "
+                f"background"
             )
-        committed.result()
+        else:
+            committed.result()
         return file_ref
 
     async def create_file_ref_deferred(
