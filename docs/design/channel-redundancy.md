@@ -1,15 +1,15 @@
 # Design: Channel Redundancy (RAID-1-style Mirroring)
 
 Status: implemented. This document describes the design; see the code
-for the authoritative behavior (`tgdcfs/core/mirror.py`,
-`tgdcfs/core/backfill.py`, and the `redundancy` config block).
+for the authoritative behavior (`vulquantafs/core/mirror.py`,
+`vulquantafs/core/backfill.py`, and the `redundancy` config block).
 
 ## Goal
 
-Protect files stored by TGDCFS against the loss of a Telegram channel
+Protect files stored by VulquantaFS against the loss of a Telegram channel
 (ban, accidental deletion, takeover). Every file uploaded to a primary
 channel should additionally exist in one or more *mirror channels*, and
-TGDCFS should be able to keep serving files when the primary channel
+VulquantaFS should be able to keep serving files when the primary channel
 becomes unavailable.
 
 ## Why RAID-1 (mirror), not RAID-5 (parity)
@@ -43,7 +43,7 @@ Two constraints follow directly:
 
 ## What must be mirrored
 
-A file in TGDCFS consists of three layers, all of which currently live in
+A file in VulquantaFS consists of three layers, all of which currently live in
 the primary channel:
 
 | Layer | Where it lives today | Mirror strategy |
@@ -109,7 +109,7 @@ telegram:
 
 ### 1. Telegram layer — new primitive
 
-Add to `ITDLibClient` (tgdcfs/telegram/interface.py) and both impls:
+Add to `ITDLibClient` (vulquantafs/telegram/interface.py) and both impls:
 
 ```python
 async def forward_messages(self, req: ForwardMessagesReq) -> List[SendMessageResp]:
@@ -185,7 +185,7 @@ avoids paying a failed RPC on every read once a channel is gone.
 (primary ids + everything in `mirrors`) and delete in each channel.
 Honors the existing `delete_messages_on_remove` flag.
 
-### 7. Repair & backfill job (tgdcfs/tasks/)
+### 7. Repair & backfill job (vulquantafs/tasks/)
 
 A background task, also exposed in the manager UI:
 
@@ -206,7 +206,7 @@ no second implementation to maintain.
 
 ### Enumeration: the metadata tree is the work list
 
-There is no need to scan the channel history. Everything TGDCFS serves is
+There is no need to scan the channel history. Everything VulquantaFS serves is
 reachable from the directory metadata:
 
 ```
@@ -218,7 +218,7 @@ TGFSDirectory (root)
 A depth-first walk over `TGFSDirectory` yields every file ref; loading
 each FD (`TGMsgFDRepository.get`) yields every version and its part
 message ids. Messages *not* referenced by metadata are invisible to
-TGDCFS anyway and are deliberately out of scope (an optional "orphan
+VulquantaFS anyway and are deliberately out of scope (an optional "orphan
 sweep" over channel history could be a later addition).
 
 ### Unit of work: one file version, idempotent
@@ -289,10 +289,10 @@ data; the commit point makes duplicates the *worst* outcome.
 - **Import via Mini App**: imported messages live in the primary; the
   backfill job mirrors them like any other file.
 
-## Config generator (tgdcfs-gh-pages)
+## Config generator (vulquantafs-gh-pages)
 
 The interactive config generator
-(`tgdcfs-gh-pages/app/config-generator/`) builds the YAML clientside and
+(`vulquantafs-gh-pages/app/config-generator/`) builds the YAML clientside and
 must learn the new `redundancy` block:
 
 - **Data model** (`page.tsx`): extend `ChannelConfig` with
@@ -334,7 +334,7 @@ must learn the new `redundancy` block:
   example, requirements (bot admin rights, `noforwards` off), and the
   promotion runbook (what to change in the config when the primary is
   banned).
-- **Getting-started page** (`tgdcfs-gh-pages/app/getting-started/`):
+- **Getting-started page** (`vulquantafs-gh-pages/app/getting-started/`):
   short subsection pointing at the config generator's redundancy
   section.
 - **Wiki (technical detail)**: document the `mirrors` field in the FD
@@ -408,7 +408,7 @@ metadata write goes to all of them.
 6. Delete fan-out.
 7. Backfill/repair task + manager UI hook.
 8. Config generator: `redundancy` block, per-channel mirror fields,
-   validation, inline help (tgdcfs-gh-pages).
+   validation, inline help (vulquantafs-gh-pages).
 9. Docs: README section, getting-started, wiki (FD `mirrors` format),
    example configs, promotion runbook.
 

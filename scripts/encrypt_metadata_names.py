@@ -1,6 +1,6 @@
 """One-off migration: encrypt existing plaintext names in the metadata repo.
 
-Renames every directory folder and file-reference in the TGDCFS GitHub
+Renames every directory folder and file-reference in the VulquantaFS GitHub
 metadata repo to its deterministic AES-SIV encrypted form, so a repo that
 was populated *before* name encryption was enabled matches what the running
 server now writes. Idempotent: already-encrypted components are left as-is,
@@ -10,7 +10,7 @@ ORDER MATTERS: deploy the path-name-encryption feature first (so the server
 decrypts on read), *then* run this. The whole rewrite is one commit and a
 backup tag is created first, so it is fully reversible.
 
-Usage (inside the tgdcfs container or any env with the config + deps):
+Usage (inside the vulquantafs container or any env with the config + deps):
 
     python -m scripts.encrypt_metadata_names            # dry run (default)
     python -m scripts.encrypt_metadata_names --apply    # perform the rename
@@ -25,9 +25,9 @@ import sys
 
 from github import Github, InputGitTreeElement
 
-from tgdcfs.config import get_config
-from tgdcfs.crypto.bootstrap import load_master_key
-from tgdcfs.crypto.path_names import (
+from vulquantafs.config import get_config
+from vulquantafs.crypto.bootstrap import load_master_key
+from vulquantafs.crypto.path_names import (
     derive_path_name_key,
     encrypt_path_name,
     is_encrypted_path_name,
@@ -65,14 +65,15 @@ def main() -> int:
     args = ap.parse_args()
 
     cfg = get_config()
-    enc_cfg = cfg.tgdcfs.encryption
+    enc_cfg = cfg.vulquantafs.encryption
     if not enc_cfg.enabled:
         print("encryption is not enabled in config; nothing to do.")
         return 1
     key = derive_path_name_key(load_master_key(enc_cfg).key)
 
     gh_repo_cfg = next(
-        (m.github_repo for m in cfg.tgdcfs.metadata.values() if m.github_repo), None
+        (m.github_repo for m in cfg.vulquantafs.metadata.values() if m.github_repo),
+        None,
     )
     if gh_repo_cfg is None:
         print("no github_repo metadata backend configured.")

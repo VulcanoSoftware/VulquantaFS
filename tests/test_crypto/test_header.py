@@ -1,10 +1,10 @@
-"""Unit tests for :mod:`tgdcfs.crypto.header`."""
+"""Unit tests for :mod:`vulquantafs.crypto.header`."""
 
 from __future__ import annotations
 
 import pytest
 
-from tgdcfs.crypto.header import (
+from vulquantafs.crypto.header import (
     HEADER_SIZE,
     Algorithm,
     FileHeader,

@@ -1,0 +1,1838 @@
+"""The GitLab tree-mirror store: the facade over GitLab REST v4 and the
+``GithubRepoMetadataRepository`` engine running on top of it.
+
+The fake below models the parts of the GitLab API the facade uses --
+branches, commits-by-actions, tree listings with pagination, blobs, the
+files API and compare -- closely enough that the store's real code paths
+(incremental writes, the diff sync, the document migration) run against
+it unchanged.
+"""
+
+import asyncio
+import base64
+import hashlib
+import json
+import pathlib
+import threading
+import time
+from datetime import datetime, timezone
+from typing import Dict, List, Optional
+from unittest.mock import Mock, patch
+from urllib.parse import unquote
+
+import pytest
+import requests
+from github import GithubException, InputGitTreeElement
+
+from vulquantafs.config import GitlabRepoConfig
+from vulquantafs.core.model import TGFSDirectory, TGFSMetadata
+from vulquantafs.core.repository.impl.metadata import breaker as breaker_mod
+from vulquantafs.core.repository.impl.metadata import gitlab_tree as gitlab_tree_mod
+from vulquantafs.core.repository.impl.metadata.breaker import (
+    StoreCircuitBreaker,
+    StoreUnreachable,
+    is_unreachable_error,
+)
+from vulquantafs.core.repository.impl.metadata.github_repo.gh_directory import (
+    GithubDirectory,
+)
+from vulquantafs.core.repository.impl.metadata.gitlab_tree import (
+    GitlabRepository,
+    GitlabTreeRepoMetadataRepository,
+)
+from vulquantafs.core.repository.interface import IMetaDataRepository
+from vulquantafs.errors import NoStoredMetadata, TechnicalError
+from vulquantafs.crypto.metadata_blob import (
+    derive_metadata_blob_key,
+    encrypt_metadata_blob,
+)
+
+PER_PAGE = 100
+
+
+def blob_sha(content: str) -> str:
+    data = content.encode()
+    # Git's object id, so tree listings and blob reads agree with the
+    # shas the facade compares.
+    return hashlib.sha1(
+        b"blob %d\0" % len(data) + data, usedforsecurity=False
+    ).hexdigest()
+
+
+class FakeResponse:
+    def __init__(self, status: int, body, headers: Optional[dict] = None):
+        self.status_code = status
+        self._body = body
+        self.headers = headers or {}
+        self.text = body if isinstance(body, str) else json.dumps(body)
+        self.content = self.text.encode()
+
+    def json(self):
+        return json.loads(self.text) if self.text else {}
+
+
+async def settled_initial_push(layer) -> None:
+    """Wait for the background push init() scheduled before asserting."""
+    initial = layer._initial_push
+    assert initial is not None
+    await initial
+
+
+class FakeGitlab:
+    """An in-memory GitLab project: branches as file dicts, commits as
+    (sha, message, date, changed paths, resulting files)."""
+
+    def __init__(self, seed: Optional[Dict[str, str]] = None, empty_project=False):
+        # A project only has a default branch once it holds a commit; an
+        # empty project reports none.
+        self.default_branch: Optional[str] = (
+            "master" if seed and not empty_project else None
+        )
+        self.project = {
+            "created_at": "2024-01-01T00:00:00Z",
+            "last_activity_at": "2024-06-01T12:00:00Z",
+            "default_branch": self.default_branch,
+        }
+        self.commits: Dict[str, dict] = {}
+        self.blobs: Dict[str, str] = {}
+        self.branch_files: Dict[str, Dict[str, str]] = {}
+        self.branch_heads: Dict[str, str] = {}
+        self.requests: List[tuple] = []
+        if seed and self.default_branch is not None:
+            self.commit(
+                self.default_branch,
+                "seed",
+                [
+                    {
+                        "action": "create",
+                        "file_path": p,
+                        "content": c,
+                        "encoding": "text",
+                    }
+                    for p, c in seed.items()
+                ],
+            )
+
+    # -- git model ------------------------------------------------------------
+
+    def commit(
+        self,
+        branch: str,
+        message: str,
+        actions: List[dict],
+        start_files: Optional[Dict[str, str]] = None,
+        parent: Optional[str] = None,
+    ) -> str:
+        files = (
+            dict(self.branch_files.get(branch, {}))
+            if start_files is None
+            else dict(start_files)
+        )
+        changed = []
+        for action in actions:
+            path = action["file_path"]
+            kind = action["action"]
+            if kind == "delete":
+                if path not in files:
+                    raise _Conflict("A file with this name does not exist")
+                del files[path]
+            else:
+                if kind == "create" and path in files:
+                    raise _Conflict(
+                        f"A file with the same name already exists in {branch}"
+                    )
+                if kind == "update" and path not in files:
+                    raise _Conflict("A file with this name does not exist")
+                content = action["content"]
+                if action.get("encoding") == "base64":
+                    content = base64.b64decode(content).decode()
+                sha = blob_sha(content)
+                self.blobs[sha] = content
+                files[path] = sha
+            changed.append(path)
+        sha = hashlib.sha1(
+            (message + str(sorted(files.items())) + str(len(self.commits))).encode()
+        ).hexdigest()
+        self.commits[sha] = {
+            "id": sha,
+            "message": message,
+            "committed_date": f"2024-06-{len(self.commits) % 28 + 1:02d}" "T00:00:00Z",
+            "changed": changed,
+            "files": files,
+            "parent": parent if parent is not None else self.branch_heads.get(branch),
+        }
+        self.branch_files[branch] = files
+        self.branch_heads[branch] = sha
+        if self.default_branch is None:
+            # The first commit determines the default branch, like GitLab.
+            self.default_branch = branch
+            self.project["default_branch"] = branch
+        return sha
+
+    def create_branch(self, branch: str, start: str) -> None:
+        start_files = self._files_for(start)
+        self.branch_files[branch] = dict(start_files)
+        self.branch_heads[branch] = self._resolve_ref(start)
+
+    def _resolve_ref(self, ref: str) -> str:
+        if ref in self.branch_heads:
+            return self.branch_heads[ref]
+        if ref in self.commits:
+            return ref
+        raise _NotFound()
+
+    def _files_for(self, ref: str) -> Dict[str, str]:
+        if ref in self.branch_files:
+            return self.branch_files[ref]
+        if ref in self.commits:
+            return self.commits[ref]["files"]
+        raise _NotFound()
+
+    def file_content(self, branch: str, path: str) -> Optional[str]:
+        files = self.branch_files.get(branch, {})
+        sha = files.get(path)
+        return None if sha is None else self.blobs[sha]
+
+    # -- HTTP routing -----------------------------------------------------------
+
+    def handle(self, method: str, url: str, params: dict, body) -> FakeResponse:
+        self.requests.append((method, url, dict(params or {}), body))
+        try:
+            status, resp = self._route(method, url, params or {}, body)
+        except _NotFound:
+            status, resp = 404, {"message": "404 Not Found"}
+        except _Conflict as ex:
+            status, resp = 400, {"message": str(ex)}
+        headers = {}
+        if isinstance(resp, list):
+            page = int((params or {}).get("page", 1))
+            more = page * PER_PAGE < len(resp)
+            if more:
+                headers["X-Next-Page"] = str(page + 1)
+            headers["X-Total-Pages"] = str(max(1, -(-len(resp) // PER_PAGE)))
+            resp = resp[(page - 1) * PER_PAGE : page * PER_PAGE]
+        return FakeResponse(status, resp, headers)
+
+    def _route(self, method, url, params, body):
+        rest = url.split("/api/v4/projects/", 1)[1]
+        project, _, rest = rest.partition("/")
+        # The facade quotes paths (and project ids) with ``safe=""``; the
+        # slashes of a file path come back encoded too.
+        rest = unquote(rest)
+        if rest == "":
+            return 200, self.project
+        if rest == "repository/branches":
+            self._resolve_ref(body["ref"])
+            if body["branch"] in self.branch_heads:
+                raise _Conflict("Branch already exists")
+            self.create_branch(body["branch"], body["ref"])
+            return 200, {"name": body["branch"]}
+        if rest.startswith("repository/branches/"):
+            branch = rest[len("repository/branches/") :]
+            return 200, {"commit": {"id": self._resolve_ref(branch)}}
+        if rest == "repository/tree":
+            return 200, self._tree(params)
+        if rest == "repository/commits":
+            if method == "POST":
+                branch = body["branch"]
+                if branch not in self.branch_heads:
+                    raise _Conflict("Invalid branch name")
+                if body.get("force"):
+                    # A force commit replaces the branch's history with a
+                    # commit whose base is start_sha.
+                    sha = self.commit(
+                        branch,
+                        body["commit_message"],
+                        body["actions"],
+                        start_files=self._files_for(body["start_sha"]),
+                        parent=body.get("start_sha"),
+                    )
+                else:
+                    sha = self.commit(branch, body["commit_message"], body["actions"])
+                return 200, self.commits[sha]
+            return 200, self._commit_history(params)
+        if rest.startswith("repository/commits/"):
+            sha = rest[len("repository/commits/") :]
+            return 200, self.commits[sha]
+        if rest.startswith("repository/blobs/"):
+            sha = rest[len("repository/blobs/") :]
+            return 200, {
+                "content": base64.b64encode(self.blobs[sha].encode()).decode(),
+                "encoding": "base64",
+            }
+        if rest == "repository/compare":
+            return 200, self._compare(params)
+        if rest.startswith("repository/files/"):
+            path = rest[len("repository/files/") :]
+            return self._files_api(method, path, params, body)
+        raise _NotFound()
+
+    def _tree(self, params) -> list:
+        files = self._files_for(params["ref"])
+        prefix = params.get("path", "").strip("/")
+        recursive = params.get("recursive") == "true"
+        entries = []
+        seen_dirs = set()
+        for path in sorted(files):
+            if prefix and not (path == prefix or path.startswith(prefix + "/")):
+                continue
+            rel = path[len(prefix) + 1 :] if prefix else path
+            if recursive or "/" not in rel:
+                entries.append(
+                    {
+                        "id": files[path],
+                        "name": rel.rsplit("/", 1)[-1],
+                        "type": "blob",
+                        "path": path,
+                        "mode": "100644",
+                    }
+                )
+            else:
+                top = rel.split("/", 1)[0]
+                if top not in seen_dirs:
+                    seen_dirs.add(top)
+                    entries.append(
+                        {
+                            "id": f"tree-{prefix}-{top}",
+                            "name": top,
+                            "type": "tree",
+                            "path": f"{prefix}/{top}" if prefix else top,
+                            "mode": "040000",
+                        }
+                    )
+        return entries
+
+    def _commit_history(self, params) -> list:
+        head = self._resolve_ref(params["ref_name"])
+        # Walk the branch back through the commit graph; the fake keeps one
+        # linear history per branch through the parents it never records --
+        # the ids are ordered by creation, which is enough for the facade.
+        ordered = [
+            self.commits[sha] for sha in self.commits if sha in self._reachable(head)
+        ]
+        ordered.reverse()
+        path = params.get("path")
+        if path:
+            ordered = [
+                c
+                for c in ordered
+                if any(ch == path or ch.startswith(path + "/") for ch in c["changed"])
+            ]
+        return ordered
+
+    def _reachable(self, head: str) -> set:
+        reached: set = set()
+        sha: Optional[str] = head
+        while sha is not None and sha not in reached:
+            reached.add(sha)
+            sha = self.commits[sha].get("parent")
+        return reached
+
+    def _compare(self, params) -> dict:
+        old, new = self._files_for(params["from"]), self._files_for(params["to"])
+        diffs = []
+        for path in sorted(set(old) | set(new)):
+            if old.get(path) == new.get(path):
+                continue
+            diffs.append(
+                {
+                    "old_path": path,
+                    "new_path": path,
+                    "renamed_file": False,
+                }
+            )
+        return {"diffs": diffs}
+
+    def _files_api(self, method, path, params, body):
+        branch = (body or {}).get("branch") or params.get("ref")
+        if method == "GET":
+            sha = self._files_for(branch).get(path)
+            if sha is None:
+                return 404, {"message": "404 File Not Found"}
+            return 200, {
+                "content": base64.b64encode(self.blobs[sha].encode()).decode(),
+                "blob_id": sha,
+            }
+        if method == "POST":
+            if branch not in self.branch_heads:
+                if self.default_branch is None and not self.commits:
+                    # An empty project: the first file initializes the
+                    # repository and the branch.
+                    self.default_branch = branch
+                    self.project["default_branch"] = branch
+                    sha = self.commit(
+                        branch,
+                        body["commit_message"],
+                        [
+                            {
+                                "action": "create",
+                                "file_path": path,
+                                "content": body["content"],
+                                "encoding": body.get("encoding", "text"),
+                            }
+                        ],
+                    )
+                    return 200, self.commits[sha]
+                raise _Conflict("Invalid branch name")
+            sha = self.commit(
+                branch,
+                body["commit_message"],
+                [
+                    {
+                        "action": "create",
+                        "file_path": path,
+                        "content": body["content"],
+                        "encoding": body.get("encoding", "text"),
+                    }
+                ],
+            )
+            return 200, self.commits[sha]
+        if method == "DELETE":
+            sha = self.branch_files.get(branch, {}).get(path)
+            if sha is None:
+                raise _Conflict("A file with this name does not exist")
+            self.commit(
+                branch,
+                body["commit_message"],
+                [{"action": "delete", "file_path": path}],
+            )
+            return 200, {}
+
+
+class _NotFound(Exception):
+    pass
+
+
+class _Conflict(Exception):
+    pass
+
+
+class DeadlineGitlab(FakeGitlab):
+    """A GitLab whose storage backend cannot do the work: the endpoints
+    selected by ``dead`` keep the request waiting for its whole timeout
+    window and finally answer with Gitaly's gRPC termination text (the
+    fake skips only the waiting)."""
+
+    DEADLINE_BODY = {"message": "4:Stream removed (Deadline Exceeded)."}
+
+    def __init__(self, *args, dead: str = "all", **kwargs):
+        super().__init__(*args, **kwargs)
+        self.dead = dead
+
+    def _route(self, method, url, params, body):
+        rest = unquote(url.split("/api/v4/projects/", 1)[1].partition("/")[2])
+        storage = rest.startswith(
+            (
+                "repository/branches",
+                "repository/commits",
+                "repository/files",
+                "repository/tree",
+            )
+        )
+        writes = method in ("POST", "PUT", "DELETE")
+        if storage and (self.dead == "all" or (self.dead == "writes" and writes)):
+            return 400, dict(self.DEADLINE_BODY)
+        return super()._route(method, url, params, body)
+
+
+@pytest.fixture(autouse=True)
+def stub_timestamp_store():
+    """Keep the date cache out of the store tests, like
+    ``test_github_repo.py`` does: a real store would start background
+    workers and write a cache file into the working directory."""
+    with patch(
+        "vulquantafs.core.repository.impl.metadata.github_repo.DirTimestampStore"
+    ) as store_cls:
+        store = Mock()
+        store.get.return_value = None
+        store_cls.return_value = store
+        yield store
+
+
+def _route_session(monkeypatch, fake: FakeGitlab) -> FakeGitlab:
+    def fake_request(self, method, url, params=None, json=None, timeout=None, **kw):
+        return fake.handle(method, url, params, json)
+
+    monkeypatch.setattr(requests.Session, "request", fake_request)
+    return fake
+
+
+@pytest.fixture
+def gitlab(monkeypatch):
+    return _route_session(monkeypatch, FakeGitlab())
+
+
+@pytest.fixture
+def gitlab_dead_writes(monkeypatch):
+    return _route_session(monkeypatch, DeadlineGitlab(dead="writes"))
+
+
+@pytest.fixture
+def gitlab_dead_storage(monkeypatch):
+    return _route_session(monkeypatch, DeadlineGitlab(dead="all"))
+
+
+class RateLimitGitlab(FakeGitlab):
+    """A GitLab that refuses the next ``limited`` repository endpoints
+    with 429 (prescribing ``retry_after`` as the wait) before serving
+    normally again."""
+
+    def __init__(
+        self, *args, limited: int = 0, retry_after: Optional[str] = "0", **kwargs
+    ):
+        super().__init__(*args, **kwargs)
+        self.limited = limited
+        self.retry_after = retry_after
+        self.attempts = 0
+
+    def handle(self, method, url, params, body):
+        self.attempts += 1
+        if self.limited > 0 and "/repository/" in url:
+            self.limited -= 1
+            return FakeResponse(
+                429,
+                {"message": "Rate limit exceeded"},
+                (
+                    {"Retry-After": self.retry_after}
+                    if self.retry_after is not None
+                    else {}
+                ),
+            )
+        return super().handle(method, url, params, body)
+
+
+@pytest.fixture
+def rate_limited_gitlab(monkeypatch):
+    return _route_session(monkeypatch, RateLimitGitlab())
+
+
+@pytest.fixture
+def stop_breakers():
+    """The breakers a test woke up; stopped in teardown, so a leftover
+    prober never reaches the network that a follow-up test patched."""
+    made: List[StoreCircuitBreaker] = []
+    yield made
+    for breaker in made:
+        breaker.stop()
+
+
+def gitlab_config(**overrides) -> GitlabRepoConfig:
+    data = {
+        "repo": "group/project",
+        "branch": "main",
+        "access_token": "glpat-token",
+        "base_url": "https://gitlab.example.com",
+    }
+    data.update(overrides)
+    return GitlabRepoConfig.from_dict(data)
+
+
+def document(metadata: TGFSMetadata) -> str:
+    return json.dumps(metadata.to_dict())
+
+
+def sample_tree() -> TGFSMetadata:
+    root = TGFSDirectory.root_dir()
+    docs = root.create_dir("docs")
+    docs.create_file_ref("readme", 42)
+    return TGFSMetadata(root)
+
+
+class TestFacade:
+    async def test_the_recursive_tree_lists_every_blob(self, gitlab):
+        gitlab.commit(
+            "main",
+            "seed",
+            [
+                {
+                    "action": "create",
+                    "file_path": "docs/readme.42",
+                    "content": "",
+                    "encoding": "text",
+                },
+                {
+                    "action": "create",
+                    "file_path": "docs/.gitkeep",
+                    "content": "",
+                    "encoding": "text",
+                },
+            ],
+        )
+        facade = GitlabRepository(gitlab_config())
+
+        tree = facade.get_git_tree("main", recursive=True)
+
+        assert tree.truncated is False
+        assert {e.path for e in tree.tree} == {"docs/readme.42", "docs/.gitkeep"}
+
+    async def test_pagination_is_followed(self, gitlab):
+        gitlab.commit(
+            "main",
+            "seed",
+            [
+                {
+                    "action": "create",
+                    "file_path": f"f{i}.123",
+                    "content": "",
+                    "encoding": "text",
+                }
+                for i in range(250)
+            ],
+        )
+        facade = GitlabRepository(gitlab_config())
+
+        tree = facade.get_git_tree("main", recursive=True)
+
+        assert len(tree.tree) == 250
+
+    async def test_the_pages_beyond_the_first_are_fetched_concurrently(self, gitlab):
+        """The boot reads every store: a grown repository's recursive
+        listing paginates into hundreds of GETs, and one page per round
+        trip lined the whole startup up behind a quarter hour of them.
+        GitLab reports the page count, so the remaining pages go out
+        together and the entry order still matches the walk."""
+        gitlab.commit(
+            "main",
+            "seed",
+            [
+                {
+                    "action": "create",
+                    "file_path": f"f{i}.123",
+                    "content": "",
+                    "encoding": "text",
+                }
+                for i in range(250)
+            ],
+        )
+        facade = GitlabRepository(gitlab_config())
+
+        tree = facade.get_git_tree("main", recursive=True)
+
+        pages = [
+            params["page"]
+            for _, url, params, _ in gitlab.requests
+            if url.endswith("repository/tree") and params.get("page")
+        ]
+        assert pages == [1, 2, 3]
+        assert len(tree.tree) == 250
+        assert {e.path for e in tree.tree} == {f"f{i}.123" for i in range(250)}
+
+    async def test_a_429_in_the_concurrent_listing_is_waited_out(self, monkeypatch):
+        """A rate limiter makes the pool crawl instead of fail: every
+        concurrently dispatched page retries its own 429."""
+        gitlab = RateLimitGitlab(limited=3)
+        _route_session(monkeypatch, gitlab)
+        gitlab.commit(
+            "main",
+            "seed",
+            [
+                {
+                    "action": "create",
+                    "file_path": f"f{i}.123",
+                    "content": "",
+                    "encoding": "text",
+                }
+                for i in range(250)
+            ],
+        )
+        before = gitlab.attempts
+        facade = GitlabRepository(gitlab_config())
+
+        tree = facade.get_git_tree("main", recursive=True)
+
+        assert len(tree.tree) == 250
+        assert {e.path for e in tree.tree} == {f"f{i}.123" for i in range(250)}
+        # The three refusals each cost the request that drew them one
+        # retry, wherever in the flight of pages they landed.
+        assert gitlab.attempts - before == 7
+
+    async def test_a_missing_branch_is_a_404(self, gitlab):
+        facade = GitlabRepository(gitlab_config())
+
+        with pytest.raises(GithubException) as ex:
+            facade.get_git_ref("heads/main")
+        assert ex.value.status == 404
+
+    async def test_creating_a_file_that_exists_reads_as_an_earlier_landing(
+        self, gitlab
+    ):
+        gitlab.commit(
+            "main",
+            "seed",
+            [
+                {
+                    "action": "create",
+                    "file_path": "docs/.gitkeep",
+                    "content": "",
+                    "encoding": "text",
+                },
+            ],
+        )
+        facade = GitlabRepository(gitlab_config())
+
+        with pytest.raises(GithubException) as ex:
+            facade.create_file("docs/.gitkeep", "Create directory", "", "main")
+        assert ex.value.status == 422
+        assert ex.value.data == {"message": '"sha" wasn\'t supplied'}
+
+    async def test_a_ref_update_refuses_a_moved_branch(self, gitlab):
+        gitlab.commit("main", "first", [])
+        facade = GitlabRepository(gitlab_config())
+        ref = facade.get_git_ref("heads/main")
+
+        with pytest.raises(GithubException) as ex:
+            ref.edit("not-the-head")
+        assert ex.value.status == 422
+        assert "fast forward" in str(ex.value.data)
+
+    async def test_a_commit_lands_on_the_branch(self, gitlab):
+        gitlab.commit("main", "first", [])
+        facade = GitlabRepository(gitlab_config())
+        pending = facade.create_git_tree([])
+        sha = facade.create_git_commit("empty", pending, []).sha
+
+        assert sha == gitlab.branch_heads["main"]
+
+    async def test_the_head_commit_carries_its_date(self, gitlab):
+        """The replicated layer dates a GitLab mirror by this date."""
+        sha = gitlab.commit("main", "first", [])
+        facade = GitlabRepository(gitlab_config())
+
+        commit = facade.get_git_commit(sha)
+
+        assert commit.committer.date is not None
+        assert commit.committer.date.year == 2024
+
+    async def test_a_commit_creates_a_missing_branch_from_the_default(self, gitlab):
+        gitlab.commit(
+            "master",
+            "seed",
+            [
+                {
+                    "action": "create",
+                    "file_path": "readme.md",
+                    "content": "hi",
+                    "encoding": "text",
+                },
+            ],
+        )
+        facade = GitlabRepository(gitlab_config())
+        with pytest.raises(GithubException):
+            facade.get_git_ref("heads/main")  # marks the branch as missing
+
+        pending = facade.create_git_tree([])
+        facade.create_git_commit("bootstrap", pending, [])
+
+        assert gitlab.file_content("main", "readme.md") == "hi"
+
+    async def test_a_delete_element_removes_the_file(self, gitlab):
+        """A "sha": null element deletes the entry, like GitHub's tree
+        API answers; before, the facade fetched a blob named None."""
+        gitlab.commit(
+            "main",
+            "first",
+            [
+                {
+                    "action": "create",
+                    "file_path": "sub/.vulquantafsstats.json",
+                    "content": "{}",
+                    "encoding": "text",
+                },
+            ],
+        )
+        facade = GitlabRepository(gitlab_config())
+        ref = facade.get_git_ref("heads/main")
+        base_commit = facade.get_git_commit(ref.object.sha)
+        before = len(gitlab.requests)
+        pending = facade.create_git_tree(
+            [
+                InputGitTreeElement(
+                    path="sub/.vulquantafsstats.json",
+                    mode="100644",
+                    type="blob",
+                    sha=None,
+                )
+            ],
+            base_tree=base_commit.tree,
+        )
+        facade.create_git_commit("drop the stats", pending, [base_commit])
+
+        assert gitlab.file_content("main", "sub/.vulquantafsstats.json") is None
+        assert self.tree_gets(gitlab, before) == 0
+
+    async def test_a_delete_element_of_a_missing_file_is_a_noop(self, gitlab):
+        gitlab.commit("main", "first", [])
+        facade = GitlabRepository(gitlab_config())
+        ref = facade.get_git_ref("heads/main")
+        base_commit = facade.get_git_commit(ref.object.sha)
+        pending = facade.create_git_tree(
+            [
+                InputGitTreeElement(
+                    path="gone/.vulquantafsstats.json",
+                    mode="100644",
+                    type="blob",
+                    sha=None,
+                )
+            ],
+            base_tree=base_commit.tree,
+        )
+        facade.create_git_commit("drop the stats", pending, [base_commit])
+
+        assert gitlab.file_content("main", "gone/.vulquantafsstats.json") is None
+
+    async def test_a_commit_bootstraps_an_empty_project(self, monkeypatch):
+        fake = FakeGitlab(empty_project=True)
+
+        def fake_request(self, method, url, params=None, json=None, timeout=None, **kw):
+            return fake.handle(method, url, params, json)
+
+        monkeypatch.setattr(requests.Session, "request", fake_request)
+        facade = GitlabRepository(gitlab_config())
+        pending = facade.create_git_tree(
+            [
+                InputGitTreeElement(
+                    path="hello.txt", mode="100644", type="blob", content="world"
+                )
+            ]
+        )
+        facade.create_git_commit("first ever", pending, [])
+
+        assert fake.default_branch == "main"
+        assert fake.file_content("main", "hello.txt") == "world"
+
+    # -- the branch cache -------------------------------------------------------
+
+    def seed_files(self, gitlab, count: int) -> None:
+        gitlab.commit(
+            "main",
+            "seed",
+            [
+                {
+                    "action": "create",
+                    "file_path": f"f{n}.1",
+                    "content": "",
+                    "encoding": "text",
+                }
+                for n in range(count)
+            ],
+        )
+
+    def tree_gets(self, gitlab, start: int) -> int:
+        return sum(
+            1
+            for method, url, _, _ in gitlab.requests[start:]
+            if method == "GET" and url.endswith("repository/tree")
+        )
+
+    async def test_a_second_diff_serves_the_branch_from_the_cache(self, gitlab):
+        """The diff of a commit reads the branch once; before, every
+        overlay commit -- each file drop, each stats commit -- paid the
+        whole paginated listing again, hundreds of GETs on a grown
+        repository."""
+        self.seed_files(gitlab, 150)
+        facade = GitlabRepository(gitlab_config())
+        base_commit = facade.get_git_commit(facade.get_git_ref("heads/main").object.sha)
+        facade.get_git_tree("main", recursive=True)
+
+        before = len(gitlab.requests)
+        pending = facade.create_git_tree(
+            [InputGitTreeElement(path="new.5", mode="100644", type="blob", content="")],
+            base_tree=base_commit.tree,
+        )
+        facade.create_git_commit("add", pending, [])
+
+        assert [a["action"] for a in pending.actions] == ["create"]
+        assert pending.actions[0]["file_path"] == "new.5"
+        assert self.tree_gets(gitlab, before) == 0
+
+    async def test_the_cache_stays_current_through_the_facades_commits(self, gitlab):
+        self.seed_files(gitlab, 1)
+        facade = GitlabRepository(gitlab_config())
+        base_commit = facade.get_git_commit(facade.get_git_ref("heads/main").object.sha)
+        facade.get_git_tree(base_commit.sha, recursive=True)
+        element = InputGitTreeElement(
+            path="new.5", mode="100644", type="blob", content=""
+        )
+        before = len(gitlab.requests)
+
+        commit = facade.create_git_commit(
+            "add", facade.create_git_tree([element], base_tree=base_commit.tree), []
+        )
+        listing = facade.get_git_tree(commit.sha, recursive=True)
+        assert {entry.path for entry in listing.tree} == {"f0.1", "new.5"}
+        assert self.tree_gets(gitlab, before) == 0
+
+    async def test_a_write_from_outside_invalidates_the_cache(self, gitlab):
+        """A commit that did not land through this repository (the mirrored
+        twin, the user) makes the cached listing stale."""
+        seed_n_files(gitlab, 2)
+        facade = GitlabRepository(gitlab_config())
+        base_commit = facade.get_git_commit(facade.get_git_ref("heads/main").object.sha)
+        facade.get_git_tree(base_commit.sha, recursive=True)
+        element = InputGitTreeElement(
+            path="new.5", mode="100644", type="blob", content=""
+        )
+        facade.create_git_commit(
+            "add", facade.create_git_tree([element], base_tree=base_commit.tree), []
+        )
+        gitlab.commit(
+            "main",
+            "outside",
+            [
+                {
+                    "action": "create",
+                    "file_path": "outside.1",
+                    "content": "",
+                    "encoding": "text",
+                }
+            ],
+        )
+        before = len(gitlab.requests)
+
+        listing = facade.get_git_tree("main", recursive=True)
+        # The head no longer matches the cache, so the facade re-listed the
+        # branch and keeps both the facade's own path and the foreign one.
+        assert {entry.path for entry in listing.tree} == {
+            "f0.1",
+            "f1.1",
+            "new.5",
+            "outside.1",
+        }
+        assert self.tree_gets(gitlab, before) > 0
+
+    async def test_a_files_api_write_folds_into_the_cache(self, gitlab):
+        gitlab.commit("main", "first", [])
+        facade = GitlabRepository(gitlab_config())
+        facade.get_git_tree("main", recursive=True)
+        before = len(gitlab.requests)
+
+        facade.create_file("fresh.9", "write it", "payload", "main")
+        base_commit = facade.get_git_commit(facade.get_git_ref("heads/main").object.sha)
+        pending = facade.create_git_tree(
+            [InputGitTreeElement(path="fresh.9", mode="100644", type="blob", sha=None)],
+            base_tree=base_commit.tree,
+        )
+
+        # The cache knows the file, so the delete diff reads no listing.
+        assert pending.actions == [{"action": "delete", "file_path": "fresh.9"}]
+        assert self.tree_gets(gitlab, before) == 0
+
+        facade.delete_file("fresh.9", "remove it", "", "main")
+        pending = facade.create_git_tree([], base_tree=base_commit.tree)
+
+        # The delete followed too: the file is gone from the cache.
+        assert pending.actions == []
+
+    async def test_a_tree_read_at_the_cached_head_is_served_from_the_cache(
+        self, gitlab
+    ):
+        seed_n_files(gitlab, 2)
+        facade = GitlabRepository(gitlab_config())
+        head = gitlab.branch_heads["main"]
+        facade.get_git_tree("main", recursive=True)
+        before = len(gitlab.requests)
+
+        tree = facade.get_git_tree(head, recursive=True)
+
+        assert len(tree.tree) == 2
+        assert self.tree_gets(gitlab, before) == 0
+
+
+class TestGitlabTreeStore:
+    def repository(self, gitlab, config=None, name_key=None, blob_key=None):
+        return GitlabTreeRepoMetadataRepository(
+            config or gitlab_config(), name_key=name_key, blob_key=blob_key
+        )
+
+    async def test_a_fresh_repository_serves_an_empty_tree(self, gitlab):
+        repo = self.repository(gitlab)
+
+        metadata = await repo.get()
+
+        assert metadata.dir.find_files() == []
+        assert metadata.dir.find_dirs() == []
+
+    async def test_the_mirrored_tree_is_read(self, gitlab):
+        gitlab.commit(
+            "main",
+            "seed",
+            [
+                {
+                    "action": "create",
+                    "file_path": "docs/.gitkeep",
+                    "content": "",
+                    "encoding": "text",
+                },
+                {
+                    "action": "create",
+                    "file_path": "docs/readme.42",
+                    "content": "",
+                    "encoding": "text",
+                },
+            ],
+        )
+        repo = self.repository(gitlab)
+
+        metadata = await repo.get()
+
+        docs = metadata.dir.find_dir("docs")
+        assert docs.find_file("readme").message_id == 42
+
+    async def test_an_empty_tree_pushes_the_mirror(self, gitlab):
+        repo = self.repository(gitlab)
+        await repo.init()
+        repo.metadata.dir.create_dir("docs")
+
+        await repo.push_full()
+
+        assert gitlab.file_content("main", "docs/.gitkeep") == ""
+
+    async def test_the_document_fallback_serves_the_old_layout(self, gitlab):
+        gitlab.commit(
+            "main",
+            "seed",
+            [
+                {
+                    "action": "create",
+                    "file_path": "metadata.json",
+                    "content": document(sample_tree()),
+                    "encoding": "text",
+                },
+            ],
+        )
+        repo = self.repository(gitlab)
+
+        metadata = await repo.get()
+
+        docs = metadata.dir.find_dir("docs")
+        assert docs.find_file("readme").message_id == 42
+
+    async def test_the_document_fallback_decrypts(self, gitlab):
+        key = derive_metadata_blob_key(b"k" * 32)
+        gitlab.commit(
+            "main",
+            "seed",
+            [
+                {
+                    "action": "create",
+                    "file_path": "metadata.json",
+                    "content": encrypt_metadata_blob(
+                        key, document(sample_tree()).encode()
+                    ),
+                    "encoding": "text",
+                },
+            ],
+        )
+        repo = self.repository(gitlab, blob_key=key)
+
+        metadata = await repo.get()
+
+        assert metadata.dir.find_dir("docs").find_file("readme").message_id == 42
+
+    async def test_the_first_push_migrates_and_removes_the_document(self, gitlab):
+        gitlab.commit(
+            "main",
+            "seed",
+            [
+                {
+                    "action": "create",
+                    "file_path": "metadata.json",
+                    "content": document(sample_tree()),
+                    "encoding": "text",
+                },
+            ],
+        )
+        repo = self.repository(gitlab)
+        await repo.get()
+
+        await repo.push_full()
+
+        assert gitlab.file_content("main", "metadata.json") is None
+        # The document's tree is mirrored blob by blob.
+        assert gitlab.file_content("main", "docs/readme.42") == ""
+        # And the tree is served from the mirror from now on, not the
+        # (gone) document.
+        again = await repo.get()
+        assert again.dir.find_dir("docs").find_file("readme").message_id == 42
+
+    async def test_names_are_encrypted_on_the_way_out(self, gitlab):
+        key = b"k" * 32
+        repo = self.repository(gitlab, name_key=key)
+        await repo.init()
+        repo.metadata.dir.create_dir("docs")
+
+        await repo.push_full()
+
+        from vulquantafs.crypto.path_names import encrypt_path_name
+
+        assert (
+            gitlab.file_content("main", f"{encrypt_path_name(key, 'docs')}/.gitkeep")
+            == ""
+        )
+
+    async def test_a_missing_document_does_not_shadow_an_empty_tree(self, gitlab):
+        repo = self.repository(gitlab)
+        await repo.init()
+
+        await repo.push_full()
+
+        assert gitlab.file_content("main", "metadata.json") is None
+
+    async def test_incremental_writes_land_in_the_repository(self, gitlab):
+        repo = self.repository(gitlab)
+        await repo.init()
+
+        docs = repo.metadata.dir.create_dir("docs")
+        await docs.create_file_ref_async("readme", 42)
+
+        assert gitlab.file_content("main", "docs/readme.42") == ""
+
+    async def test_a_wrapped_document_tree_keeps_writing_through(self, gitlab):
+        gitlab.commit(
+            "main",
+            "seed",
+            [
+                {
+                    "action": "create",
+                    "file_path": "metadata.json",
+                    "content": document(sample_tree()),
+                    "encoding": "text",
+                },
+            ],
+        )
+        repo = self.repository(gitlab)
+        await repo.get()
+
+        docs = repo.metadata.dir.find_dir("docs")
+        await docs.create_file_ref_async("other", 7)
+
+        assert gitlab.file_content("main", "docs/other.7") == ""
+
+    async def test_as_a_mirror_it_syncs_a_tree_loaded_elsewhere(self, gitlab):
+        """The redundant-metadata shape: a pinned message primary serves a
+        plain tree; the GitLab tree mirror receives the full sync."""
+        from vulquantafs.core.repository.impl.metadata.replicated import (
+            MetadataStore,
+            ReplicatedMetadataRepository,
+        )
+
+        class PinnedStub(IMetaDataRepository):
+            def __init__(self, tree):
+                super().__init__()
+                self._tree = tree
+
+            async def get(self):
+                return self._tree
+
+            async def push(self):
+                pass
+
+        tree = sample_tree()
+        mirror = self.repository(gitlab)
+        layer = ReplicatedMetadataRepository(
+            [
+                MetadataStore(
+                    key="pinned@tg-main", repo=PinnedStub(tree), primary=True
+                ),
+                MetadataStore(key="gitlab_repo@g/p@main", repo=mirror),
+            ]
+        )
+
+        await layer.init()
+        await settled_initial_push(layer)
+
+        # One shared tree object, store-backed for the mirror.
+        assert layer.metadata is tree
+        assert isinstance(tree.dir, GithubDirectory)
+        assert gitlab.file_content("main", "docs/readme.42") == ""
+
+
+class TestDeadlineAnswers:
+    """Gitaly's deadline text in an answer means the request hung for its
+    whole timeout window and the storage did no work: an outage, not a
+    refused request."""
+
+    async def test_a_deadline_answer_is_an_unreachable_service(
+        self, gitlab_dead_writes
+    ):
+        repo = GitlabRepository(gitlab_config())
+
+        with pytest.raises(StoreUnreachable):
+            repo.create_file("hello.txt", "create", "", "main")
+
+    async def test_a_probe_of_dead_storage_looks_unreachable(self, gitlab_dead_storage):
+        repo = GitlabRepository(gitlab_config())
+
+        with pytest.raises(StoreUnreachable):
+            repo.probe()
+
+    async def test_a_probe_of_a_missing_branch_still_counts_as_answered(self, gitlab):
+        repo = GitlabRepository(gitlab_config())
+
+        with pytest.raises(GithubException) as answered:
+            repo.probe()
+
+        assert answered.value.status == 404
+        assert not is_unreachable_error(answered.value)
+
+
+class TestRateLimitRetries:
+    """A full-tree sync fires many requests in a burst; one 429 used to
+    fail the whole store write, so the facade waits the prescribed wait
+    (or a short backoff) and tries again."""
+
+    @staticmethod
+    def seed(fake: RateLimitGitlab) -> None:
+        fake.commit(
+            "main",
+            "seed",
+            [
+                {
+                    "action": "create",
+                    "file_path": "docs/.gitkeep",
+                    "content": "",
+                    "encoding": "text",
+                }
+            ],
+        )
+        fake.limited = 2
+
+    async def test_a_429_is_retried_until_the_limit_clears(self, rate_limited_gitlab):
+        fake = rate_limited_gitlab
+        self.seed(fake)
+        repo = GitlabRepository(gitlab_config())
+
+        tree = repo.get_git_tree("main", recursive=True)
+
+        assert tree.truncated is False
+        # The head check that validates the branch cache is a request
+        # like the listing, and is rate limited alongside it.
+        assert fake.attempts == 4
+
+    async def test_the_retry_honours_the_prescribed_wait(
+        self, monkeypatch, rate_limited_gitlab
+    ):
+        fake = rate_limited_gitlab
+        self.seed(fake)
+        fake.limited = 1
+        fake.retry_after = "7"
+        sleeps: List[float] = []
+        monkeypatch.setattr(gitlab_tree_mod.time, "sleep", sleeps.append)
+        repo = GitlabRepository(gitlab_config())
+
+        repo.probe()
+
+        assert sleeps == [7.0]
+        assert fake.attempts == 2
+
+    async def test_without_retry_after_it_backs_off_exponentially(
+        self, monkeypatch, rate_limited_gitlab
+    ):
+        fake = rate_limited_gitlab
+        self.seed(fake)
+        fake.retry_after = None
+        sleeps: List[float] = []
+        monkeypatch.setattr(gitlab_tree_mod.time, "sleep", sleeps.append)
+        repo = GitlabRepository(gitlab_config())
+
+        repo.probe()
+
+        assert sleeps == [1.0, 2.0]
+        assert fake.attempts == 3
+
+    async def test_a_persistent_429_raises_after_the_last_attempt(
+        self, monkeypatch, rate_limited_gitlab
+    ):
+        fake = rate_limited_gitlab
+        fake.limited = 100
+        monkeypatch.setattr(gitlab_tree_mod.time, "sleep", lambda _s: None)
+        repo = GitlabRepository(gitlab_config())
+
+        with pytest.raises(GithubException) as ex:
+            repo.probe()
+
+        assert ex.value.status == 429
+        assert fake.attempts == gitlab_tree_mod.RATE_LIMIT_RETRIES
+
+
+async def _wait_closed(store: StoreCircuitBreaker, timeout: float = 10.0) -> None:
+    deadline = time.monotonic() + timeout
+    while store._open and time.monotonic() < deadline:
+        await asyncio.sleep(0.005)
+    assert not store._open
+
+
+class TestFailFastGitlabTreeStore:
+    """While GitLab's storage cannot do the work, the store must refuse
+    its calls instead of cost the request timeout once per push, heal,
+    stats commit and listing -- the wait that made deleting files take a
+    minute each."""
+
+    def repository(self):
+        return GitlabTreeRepoMetadataRepository(gitlab_config())
+
+    async def test_a_deadlining_push_trips_the_breaker(
+        self, gitlab_dead_writes, stop_breakers
+    ):
+        repo = self.repository()
+        stop_breakers.append(repo._gitlab_breaker)
+        repo.metadata = sample_tree()
+
+        with pytest.raises(StoreUnreachable):
+            await repo.push_full()
+        assert repo._gitlab_breaker._open
+
+        # Known dead: the next push is refused without GitLab receiving
+        # another write attempt.
+        posts = [r for r in gitlab_dead_writes.requests if r[0] == "POST"]
+        start = time.monotonic()
+        with pytest.raises(StoreUnreachable):
+            await repo.push_full()
+        assert time.monotonic() - start < 1.0
+        assert [r for r in gitlab_dead_writes.requests if r[0] == "POST"] == posts
+
+    async def test_the_store_writes_again_once_gitlab_answers(
+        self, gitlab_dead_writes, stop_breakers, monkeypatch
+    ):
+        monkeypatch.setattr(breaker_mod, "PROBE_COOLDOWN_SECONDS", 0.05)
+        repo = self.repository()
+        stop_breakers.append(repo._gitlab_breaker)
+        repo.metadata = sample_tree()
+
+        with pytest.raises(StoreUnreachable):
+            await repo.push_full()
+
+        gitlab_dead_writes.dead = "none"
+        await _wait_closed(repo._gitlab_breaker)
+
+        await repo.push_full()
+
+        assert gitlab_dead_writes.file_content("main", "docs/readme.42") == ""
+
+    async def test_a_deadlining_mirror_does_not_stall_replicated_pushes(
+        self, gitlab_dead_writes, stop_breakers
+    ):
+        """The user-visible shape: file operations push the metadata, the
+        GitLab mirror cannot take it, and the operation must not pay the
+        hang more than the first time."""
+        from vulquantafs.core.repository.impl.metadata.replicated import (
+            MetadataStore,
+            ReplicatedMetadataRepository,
+        )
+
+        class PinnedStub(IMetaDataRepository):
+            def __init__(self, tree):
+                super().__init__()
+                self._tree = tree
+
+            async def get(self):
+                return self._tree
+
+            async def push(self):
+                pass
+
+        tree = sample_tree()
+        mirror = self.repository()
+        stop_breakers.append(mirror._gitlab_breaker)
+        layer = ReplicatedMetadataRepository(
+            [
+                MetadataStore(
+                    key="pinned@tg-main", repo=PinnedStub(tree), primary=True
+                ),
+                MetadataStore(key="gitlab_repo@g/p@main", repo=mirror),
+            ]
+        )
+
+        await layer.init()
+        await settled_initial_push(layer)
+        assert layer.stale_stores() == ["gitlab_repo@g/p@main"]
+
+        posts = [r for r in gitlab_dead_writes.requests if r[0] == "POST"]
+        start = time.monotonic()
+        await layer.push()
+        assert time.monotonic() - start < 1.0
+        assert [r for r in gitlab_dead_writes.requests if r[0] == "POST"] == posts
+        assert layer.stale_stores() == ["gitlab_repo@g/p@main"]
+
+
+def _routed(monkeypatch, fake: FakeGitlab) -> GitlabRepository:
+    _route_session(monkeypatch, fake)
+    return GitlabRepository(gitlab_config())
+
+
+def commit_posts(fake: FakeGitlab) -> List[dict]:
+    return [
+        body
+        for method, url, params, body in fake.requests
+        if method == "POST" and url.endswith("repository/commits")
+    ]
+
+
+@pytest.mark.parametrize("warm_cache", [False, True])
+async def test_gitlab_rmdir_limits_reads_and_deletes_to_the_subtree(
+    monkeypatch, warm_cache
+):
+    fake = FakeGitlab()
+    target_paths = ["parent/batch/file.1", "parent/batch/old/.vulquantafsstats.json"]
+    fake.commit(
+        "main",
+        "seed",
+        [
+            {"action": "create", "file_path": path, "content": "", "encoding": "text"}
+            for path in target_paths + ["parent/batch-other/file.2"]
+        ],
+    )
+    facade = _routed(monkeypatch, fake)
+    head = fake.branch_heads["main"]
+    if warm_cache:
+        facade.get_git_tree("main", recursive=True)
+    fake.requests.clear()
+    monkeypatch.setattr(gitlab_tree_mod, "GITLAB_COMMIT_ACTION_LIMIT", 2)
+
+    assert facade.delete_subtree("parent/batch", keep_parent=True) == len(target_paths)
+
+    expected = {"parent/batch-other/file.2", "parent/.gitkeep"}
+    assert fake.branch_files["main"].keys() == expected
+    assert [len(body["actions"]) for body in commit_posts(fake)] == [2, 1]
+    probes = [
+        params
+        for method, url, params, _ in fake.requests
+        if method == "GET" and url.endswith("/repository/tree")
+    ]
+    if warm_cache:
+        assert probes == []
+    else:
+        assert len(probes) == 1
+        assert probes[0]["path"] == "parent/batch"
+        assert probes[0]["ref"] == head
+    assert {
+        entry.path
+        for entry in facade.get_git_tree("main", recursive=True).tree
+        if entry.type == "blob"
+    } == expected
+
+
+class TestParallelBlobFetch:
+    """``create_git_tree`` needs the content of every blob the branch
+    does not hold at its path (a tree rewrite that moved it there); the
+    reads must run concurrently and every action must carry the content
+    a sequential read would have found."""
+
+    def moved_blob_elements(self, facade: GitlabRepository, names: list[str]):
+        tree = facade.get_git_tree("main", recursive=True)
+        shas = {
+            entry.path: entry.sha
+            for entry in tree.tree
+            if entry.type == "blob" and entry.path in names
+        }
+        return [
+            InputGitTreeElement(
+                path=f"moved/{name}", mode="100644", type="blob", sha=shas[name]
+            )
+            for name in names
+        ]
+
+    def watch_blob_reads(self, facade: GitlabRepository) -> dict:
+        real = facade.get_git_blob
+        state = {"active": 0, "max_active": 0}
+
+        def counting(sha):
+            state["active"] += 1
+            state["max_active"] = max(state["max_active"], state["active"])
+            try:
+                time.sleep(0.05)
+                return real(sha)
+            finally:
+                state["active"] -= 1
+
+        facade.get_git_blob = counting  # type: ignore[method-assign]
+        return state
+
+    def test_actions_carry_the_read_blob_content(self, gitlab, monkeypatch):
+        _route_session(monkeypatch, gitlab)
+        facade = GitlabRepository(gitlab_config())
+        facade.create_file("docs/a.txt", "seed", "content of a", branch="main")
+        elements = self.moved_blob_elements(facade, ["docs/a.txt"])
+
+        pending = facade.create_git_tree(elements)
+
+        # Without a base tree the elements are the whole desired state:
+        # the moved blob carries its content, the old path is deleted.
+        assert pending.actions == [
+            {
+                "action": "create",
+                "file_path": "moved/docs/a.txt",
+                "content": base64.b64encode(b"content of a").decode(),
+                "encoding": "base64",
+            },
+            {"action": "delete", "file_path": "docs/a.txt"},
+        ]
+
+    def test_blob_reads_overlap(self, gitlab, monkeypatch):
+        _route_session(monkeypatch, gitlab)
+        facade = GitlabRepository(gitlab_config())
+        facade.create_file("docs/a.txt", "seed", "content of a", branch="main")
+        facade.create_file("docs/b.txt", "seed", "content of b", branch="main")
+        elements = self.moved_blob_elements(facade, ["docs/a.txt", "docs/b.txt"])
+        state = self.watch_blob_reads(facade)
+
+        pending = facade.create_git_tree(elements)
+
+        moved = [
+            action["file_path"]
+            for action in pending.actions
+            if action["action"] == "create"
+        ]
+        assert sorted(moved) == ["moved/docs/a.txt", "moved/docs/b.txt"]
+        assert state["max_active"] == 2
+
+
+class TestChunkedCommits:
+    """One GitLab commit is one storage operation for all of its actions,
+    and GitLab's backend refuses the batches of a full-tree sync early
+    ("4:Stream removed (Deadline Exceeded)"). The facade must therefore
+    land a big tree as several ordinary commits of capped size."""
+
+    async def test_a_big_sync_lands_in_capped_commits(self, monkeypatch):
+        monkeypatch.setattr(gitlab_tree_mod, "GITLAB_COMMIT_ACTION_LIMIT", 3)
+        fake = FakeGitlab(seed={"docs/.gitkeep": ""})
+        facade = _routed(monkeypatch, fake)
+        names = [f"big/file{i:02d}.txt" for i in range(8)]
+        pending = facade.create_git_tree(
+            [
+                InputGitTreeElement(
+                    path=name, mode="100644", type="blob", content=str(i)
+                )
+                for i, name in enumerate(names)
+            ]
+        )
+
+        facade.create_git_commit("initial sync", pending, [])
+
+        posts = commit_posts(fake)
+        action_counts = [len(body["actions"]) for body in posts]
+        assert action_counts == [3, 3, 2]
+        changed = {action["file_path"] for body in posts for action in body["actions"]}
+        assert changed == set(names)
+        for i, name in enumerate(names):
+            assert fake.file_content("main", name) == str(i)
+        assert [body["commit_message"] for body in posts] == [
+            "initial sync (1/3)",
+            "initial sync (2/3)",
+            "initial sync (3/3)",
+        ]
+
+    async def test_a_small_sync_stays_one_unsuffixed_commit(self, monkeypatch):
+        fake = FakeGitlab(seed={"docs/.gitkeep": ""})
+        facade = _routed(monkeypatch, fake)
+        pending = facade.create_git_tree(
+            [
+                InputGitTreeElement(
+                    path="hello.txt", mode="100644", type="blob", content="hi"
+                )
+            ]
+        )
+
+        facade.create_git_commit("a small sync", pending, [])
+
+        posts = commit_posts(fake)
+        assert len(posts) == 1
+        assert posts[0]["commit_message"] == "a small sync"
+        assert fake.file_content("main", "hello.txt") == "hi"
+
+    async def test_a_big_full_push_lands_every_file(self, gitlab, monkeypatch):
+        monkeypatch.setattr(gitlab_tree_mod, "GITLAB_COMMIT_ACTION_LIMIT", 4)
+        repo = GitlabTreeRepoMetadataRepository(gitlab_config())
+        root = TGFSDirectory.root_dir()
+        for i in range(10):
+            root.create_file_ref(f"f{i}", i)
+        repo.metadata = TGFSMetadata(root)
+
+        await repo.push_full()
+
+        posts = commit_posts(gitlab)
+        assert len(posts) >= 3
+        assert all(len(body["actions"]) <= 4 for body in posts)
+        for i in range(10):
+            assert gitlab.file_content("main", f"f{i}.{i}") is not None
+
+
+class TestHistoryCompaction:
+    """GitLab keeps every deleted blob alive for as long as a commit
+    references it, so the branch's history has to be bounded before its
+    storage use is. The commits API cannot create a parentless commit, so
+    the squash is a force commit of the branch's whole current state onto
+    its oldest ancestor."""
+
+    def a_used_branch(self, fake: FakeGitlab) -> None:
+        fake.commit("main", "seed", [])
+        for i in range(5):
+            fake.commit(
+                "main",
+                f"add {i}",
+                [
+                    {
+                        "action": "create",
+                        "file_path": f"docs/f{i}.{i}",
+                        "content": "",
+                        "encoding": "text",
+                    }
+                ],
+            )
+        fake.commit(
+            "main",
+            "remove one",
+            [{"action": "delete", "file_path": "docs/f1.1"}],
+        )
+
+    async def test_a_grown_history_is_force_committed_onto_its_root(self, monkeypatch):
+        fake = FakeGitlab(seed={})
+        self.a_used_branch(fake)
+        facade = _routed(monkeypatch, fake)
+        root = facade.commit_history("main", 100)[-1]
+        assert fake.file_content("main", "docs/f1.1") is None
+        assert len(fake.commits) == 7
+
+        squashed = facade.compact_history("Compact metadata history", 3)
+
+        assert squashed == 7
+        # The branch state survived the rewrite unchanged.
+        assert fake.file_content("main", "docs/f1.1") is None
+        assert fake.file_content("main", "docs/f3.3") == ""
+        assert fake.file_content("main", "docs/.gitkeep") is None
+        # The history carries the anchor's lineage plus one commit.
+        assert len(facade.commit_history("main", 100)) == 2
+        forced = [
+            body
+            for body in commit_posts(fake)
+            if body.get("force") and body.get("start_sha") == root
+        ]
+        assert len(forced) == 1
+        # The replay only carries what changed since the anchor: the files
+        # the pushes added. The removed file predates the anchor, so the
+        # anchor's tree never referenced it and no delete is needed.
+        assert len(forced[0]["actions"]) == 4
+        assert fake.branch_files["main"] == dict(
+            fake.commits[fake._resolve_ref("main")]["files"]
+        )
+
+    async def test_a_history_within_bound_is_left_alone(self, monkeypatch):
+        fake = FakeGitlab(seed={})
+        fake.commit("main", "seed", [])
+        facade = _routed(monkeypatch, fake)
+
+        assert facade.compact_history("Compact metadata history", 100) == 0
+        assert not commit_posts(fake)
+
+
+def seed_n_files(gitlab, count: int) -> None:
+    gitlab.commit(
+        "main",
+        "seed",
+        [
+            {
+                "action": "create",
+                "file_path": f"f{n}.1",
+                "content": "",
+                "encoding": "text",
+            }
+            for n in range(count)
+        ],
+    )
+
+
+def tree_gets(gitlab, start: int) -> int:
+    return sum(
+        1
+        for method, url, _, _ in gitlab.requests[start:]
+        if method == "GET" and url.endswith("repository/tree")
+    )
+
+
+def _commit_file_creation(gitlab, path: str, message: str = "seed") -> None:
+    gitlab.commit(
+        "main",
+        message,
+        [{"action": "create", "file_path": path, "content": "", "encoding": "text"}],
+    )
+
+
+class TestTreeSnapshot:
+    """The boot re-lists the whole tree only when the branch moved: the
+    local snapshot of the last listing serves an unchanged head, which is
+    what kept a rate-limited GitLab holding the boot through its listing."""
+
+    async def test_an_unchanged_head_serves_the_tree_from_the_snapshot(
+        self, gitlab, tmp_path
+    ):
+        seed_n_files(gitlab, 3)
+        first = GitlabTreeRepoMetadataRepository(gitlab_config())
+        first_tree = await first.get()
+        served_revision = first_tree.revision
+        before = len(gitlab.requests)
+
+        second = GitlabTreeRepoMetadataRepository(gitlab_config())
+        metadata = await second.get()
+
+        assert sorted(f.name for f in metadata.dir.find_files()) == [
+            "f0",
+            "f1",
+            "f2",
+        ]
+        assert metadata.revision == served_revision
+        # No listing request crossed the wire for the unchanged head.
+        assert tree_gets(gitlab, before) == 0
+        # The snapshot was re-saved, so the cache stays alive for the
+        # boot after this one.
+        assert snapshot_path(tmp_path).exists()
+
+    async def test_a_moved_head_rebuilds_the_tree(self, gitlab, tmp_path):
+        seed_n_files(gitlab, 2)
+        first = GitlabTreeRepoMetadataRepository(gitlab_config())
+        await first.init()
+        _commit_file_creation(gitlab, "fresh.9", "a later write")
+        before = len(gitlab.requests)
+
+        second = GitlabTreeRepoMetadataRepository(gitlab_config())
+        metadata = await second.get()
+
+        assert metadata.dir.find_file("fresh") is not None
+        assert snapshot_path(tmp_path).exists()
+        assert snapshot_head(tmp_path) == gitlab.branch_heads["main"]
+
+    async def test_a_corrupt_snapshot_is_listed_anew(self, gitlab, tmp_path):
+        seed_n_files(gitlab, 2)
+        first = GitlabTreeRepoMetadataRepository(gitlab_config())
+        await first.init()
+        snapshot_path(tmp_path).write_text("{broken")
+
+        second = GitlabTreeRepoMetadataRepository(gitlab_config())
+        metadata = await second.get()
+
+        assert len(metadata.dir.find_files()) == 2
+
+    async def test_an_empty_repository_saves_no_snapshot(self, gitlab, tmp_path):
+        store = GitlabTreeRepoMetadataRepository(gitlab_config())
+
+        metadata = await store.get()
+
+        assert metadata.dir.find_files() == []
+        assert not snapshot_path(tmp_path).exists()
+
+
+def snapshot_path(tmp_path) -> pathlib.Path:
+    """Where the redirected snapshot store keeps its file for this test."""
+    return tmp_path / "tree-snapshot.json"
+
+
+def snapshot_head(tmp_path) -> Optional[str]:
+    data = json.loads(snapshot_path(tmp_path).read_text())
+    return data["head"]
+
+
+class TestHeadProbe:
+    """The head probe that decides the load's winner costs two requests,
+    none of which may retry a rate limit: one attempt either answers, or
+    the store is skipped instead of the boot waiting out the 429s."""
+
+    async def test_the_probe_answers_the_head_date_in_two_requests(self, gitlab):
+        _commit_file_creation(gitlab, "docs/.gitkeep")
+        store = GitlabTreeRepoMetadataRepository(gitlab_config())
+
+        revision = await store.head_revision()
+
+        assert revision == datetime(2024, 6, 1, tzinfo=timezone.utc).timestamp()
+        assert len(gitlab.requests) == 2
+
+    async def test_a_probe_of_a_missing_branch_reports_an_empty_store(self, gitlab):
+        store = GitlabTreeRepoMetadataRepository(gitlab_config())
+
+        with pytest.raises(NoStoredMetadata):
+            await store.head_revision()
+
+    async def test_the_probe_does_not_retry_a_rate_limited_request(self, monkeypatch):
+        fake = RateLimitGitlab(limited=100, retry_after="30")
+        _routed(monkeypatch, fake)
+        store = GitlabTreeRepoMetadataRepository(gitlab_config())
+
+        with pytest.raises(GithubException) as ex:
+            await store.head_revision()
+
+        assert ex.value.status == 429
+        assert fake.attempts == 1
+
+
+class TestSharedBackoff:
+    """A 429 prescribed wait holds back every request of the project, not
+    just the request that answered it: retries that each burned their own
+    wait budget against the same limiter in parallel kept the limit alive
+    through whole waves of bursts."""
+
+    def test_a_published_pause_holds_back_the_other_sends(self, monkeypatch):
+        repo = GitlabRepository(gitlab_config())
+        sent_at: List[float] = []
+
+        def fake_request(
+            self_session, method, url, params=None, json=None, timeout=None, **kw
+        ):
+            sent_at.append(time.monotonic())
+            return FakeResponse(200, [])
+
+        monkeypatch.setattr(requests.Session, "request", fake_request)
+
+        started = time.monotonic()
+        repo._publish_pause(1.5)
+
+        results: List[requests.Response] = []
+        thread = threading.Thread(
+            target=lambda: results.append(
+                repo._request("GET", "/repository/tree", params={"page": 1})
+            )
+        )
+        thread.start()
+        time.sleep(0.4)
+
+        # Still inside the prescribed wait: not one request was sent.
+        assert sent_at == []
+
+        thread.join(timeout=10)
+        assert results and results[0].status_code == 200
+        assert sent_at[0] - started >= 1.4
+
+    async def test_live_store_aborts_and_resumes_a_rate_limited_tree(self, monkeypatch):
+        class LimitedTree(FakeGitlab):
+            limited = True
+
+            def handle(self, method, url, params, body):
+                if url.endswith("/repository/tree") and params.get("page") == 2:
+                    if self.limited:
+                        return FakeResponse(
+                            429, {"message": "Limited"}, {"Retry-After": "60"}
+                        )
+                return super().handle(method, url, params, body)
+
+        fake = LimitedTree()
+        _route_session(monkeypatch, fake)
+        seed_n_files(fake, 220)
+        store = GitlabTreeRepoMetadataRepository(gitlab_config())
+        raw = store._gitlab._inner
+
+        with pytest.raises(TechnicalError, match="429"):
+            await asyncio.wait_for(store.get(), timeout=2)
+        assert raw._cached_blobs is None
+        sent = len(fake.requests)
+        with pytest.raises(GithubException, match="cooldown"):
+            raw.get_branch("main")
+        assert len(fake.requests) == sent
+
+        fake.limited = False
+        raw._paused_until = 0
+        metadata = await store.get()
+        assert len(metadata.dir.find_files()) == 220
+        pages = [
+            params["page"]
+            for _, url, params, _ in fake.requests
+            if url.endswith("/repository/tree")
+        ]
+        assert pages.count(1) == 1
+        assert set(pages) == {1, 2, 3}

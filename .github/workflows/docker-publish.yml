@@ -28,9 +28,9 @@ jobs:
     strategy:
       matrix:
         include:
-          - name: tgdcfs
+          - name: vulquantafs
             dockerfile: Dockerfile
-          - name: tgdcfs-fe
+          - name: vulquantafs-fe
             dockerfile: Dockerfile.frontend
     steps:
       - name: Checkout code
