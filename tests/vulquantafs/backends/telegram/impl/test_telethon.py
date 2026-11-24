@@ -8,11 +8,20 @@ from telethon import TelegramClient, functions as tlf
 from telethon.sessions import StringSession
 from telethon.helpers import TotalList
 from telethon import types as tlt
-from telethon.errors import FileReferenceExpiredError, SessionPasswordNeededError
+from telethon.errors import (
+    FileReferenceExpiredError,
+    FloodWaitError,
+    RpcCallFailError,
+    ServerError,
+    SessionPasswordNeededError,
+)
 
 from vulquantafs.backends.telegram.impl.telethon import (
+    BOT_LOGIN_ATTEMPTS,
+    FLOOD_WAIT_MAX_SLEEP,
     DOWNLOAD_REQUEST_SIZE,
     TelethonAPI,
+    _is_transient_telegram_login_error,
     Session,
     login_as_account,
     login_as_bots,
@@ -1419,6 +1428,150 @@ class TestLoginAsBots:
 
         invalid.disconnect.assert_awaited_once()
         ready.disconnect.assert_awaited_once()
+
+    @pytest.fixture(autouse=True)
+    def fast_login(self, mocker):
+        mocker.patch(
+            "vulquantafs.backends.telegram.impl.telethon.BOT_LOGIN_STAGGER_SECONDS",
+            0,
+        )
+        mocker.patch(
+            "vulquantafs.backends.telegram.impl.telethon.BOT_LOGIN_RETRY_DELAY", 0
+        )
+
+    def test_telegram_internal_errors_are_transient(self):
+        transient = (
+            ServerError(request=None, message="internal issue"),
+            RpcCallFailError(request=None),
+            FloodWaitError(request=None, capture=17),
+            ValueError("Request was unsuccessful 6 time(s)"),
+        )
+        permanent = (
+            ValueError("invalid session"),
+            ConnectionError("handshake failed"),
+            TimeoutError(),
+        )
+        for error in transient:
+            assert _is_transient_telegram_login_error(error)
+        for other in permanent:
+            assert not _is_transient_telegram_login_error(other)
+
+    async def test_telegram_internal_errors_are_retried(
+        self, mock_config_single_token, mocker, caplog
+    ):
+        session = mocker.patch("vulquantafs.backends.telegram.impl.telethon.Session")
+        session.return_value.get.return_value = None
+        client = mocker.AsyncMock(spec=TelegramClient)
+        client.get_me = mocker.AsyncMock(return_value=mocker.Mock(username="retrybot"))
+        client.session = mocker.Mock()
+        client.session.save.return_value = "session_string"
+        client.start = mocker.AsyncMock(
+            side_effect=[
+                RpcCallFailError(request=None),
+                RpcCallFailError(request=None),
+                None,
+            ]
+        )
+        mocker.patch(
+            "vulquantafs.backends.telegram.impl.telethon._RPCOnlyTelegramClient",
+            return_value=client,
+        )
+
+        assert await login_as_bots(mock_config_single_token) == [client]
+
+        assert client.start.await_count == 3
+        assert (
+            "Telegram bot 789 login failed (RpcCallFailError; attempt 1/" in caplog.text
+        )
+
+    async def test_telethon_giving_up_is_retried_too(
+        self, mock_config_single_token, mocker
+    ):
+        session = mocker.patch("vulquantafs.backends.telegram.impl.telethon.Session")
+        session.return_value.get.return_value = None
+        client = mocker.AsyncMock(spec=TelegramClient)
+        client.get_me = mocker.AsyncMock(return_value=mocker.Mock(username="retrybot"))
+        client.session = mocker.Mock()
+        client.session.save.return_value = "session_string"
+        client.start = mocker.AsyncMock(
+            side_effect=[
+                ValueError("Request was unsuccessful 6 time(s)"),
+                None,
+            ]
+        )
+        mocker.patch(
+            "vulquantafs.backends.telegram.impl.telethon._RPCOnlyTelegramClient",
+            return_value=client,
+        )
+
+        assert await login_as_bots(mock_config_single_token) == [client]
+        assert client.start.await_count == 2
+
+    async def test_a_persistently_failing_bot_fails_over_to_a_healthy_one(
+        self, mock_config, mocker, caplog
+    ):
+        session = mocker.patch("vulquantafs.backends.telegram.impl.telethon.Session")
+        session.return_value.get.return_value = None
+        created = []
+
+        def make_client(*args, **kwargs):
+            client = mocker.AsyncMock(spec=TelegramClient)
+            client.get_me = mocker.AsyncMock(
+                return_value=mocker.Mock(username="retrybot")
+            )
+            client.session = mocker.Mock()
+            client.session.save.return_value = "session_string"
+            client.start = mocker.AsyncMock(side_effect=starred_start)
+            created.append(client)
+            return client
+
+        def starred_start(*, bot_token):
+            if bot_token == "123:token1":
+                raise RpcCallFailError(request=None)
+
+        mocker.patch(
+            "vulquantafs.backends.telegram.impl.telethon._RPCOnlyTelegramClient",
+            side_effect=make_client,
+        )
+
+        result = await login_as_bots(mock_config)
+
+        assert len(result) == 1
+        ready_client = result[0]
+        assert ready_client in created
+        assert any(
+            client.start.await_count == 1 for client in created  # type: ignore[attr-defined]
+        )
+        assert sum(
+            client.start.await_count for client in created  # type: ignore[attr-defined]
+        ) == (BOT_LOGIN_ATTEMPTS + 1)
+        assert "Telegram bot 123 not ready (RpcCallFailError after" in caplog.text
+
+    async def test_a_flood_wait_is_honoured_but_capped(
+        self, mock_config_single_token, mocker
+    ):
+        session = mocker.patch("vulquantafs.backends.telegram.impl.telethon.Session")
+        session.return_value.get.return_value = None
+        client = mocker.AsyncMock(spec=TelegramClient)
+        client.get_me = mocker.AsyncMock(return_value=mocker.Mock(username="retrybot"))
+        client.session = mocker.Mock()
+        client.session.save.return_value = "session_string"
+        client.start = mocker.AsyncMock(
+            side_effect=[FloodWaitError(request=None, capture=45), None]
+        )
+        mocker.patch(
+            "vulquantafs.backends.telegram.impl.telethon._RPCOnlyTelegramClient",
+            return_value=client,
+        )
+        sleep = mocker.patch("asyncio.sleep", new=AsyncMock())
+
+        assert await login_as_bots(mock_config_single_token) == [client]
+
+        assert client.start.await_count == 2
+        awaited = [call.args[0] for call in sleep.await_args_list]
+        assert awaited[0] == 0
+        assert awaited[1] == FLOOD_WAIT_MAX_SLEEP
+        assert awaited[1] < 45
 
 
 class TestConnectionPool:

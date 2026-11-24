@@ -54,6 +54,16 @@ the fact on the commits that shipped them.
 
 ### Fixed
 
+- A Telegram hiccup at startup (the 12 simultaneous fresh bot sign-ins of
+  the fix-build preview all hit `RPC_CALL_FAIL` and the container exited)
+  no longer aborts the whole start. Transient login failures -- Telegram
+  internal errors, flood waits, and the `Request was unsuccessful N
+  time(s)` Telethon raises after exhausting its own retries -- are
+  retried per bot with capped exponential backoff (5 attempts, 5 s base)
+  and flood waits honoured up to 30 s; fresh sign-ins are staggered so
+  the bots do not hammer Telegram's auth endpoint together. A bot that
+  still cannot log in is excluded from startup as before; only a
+  permanent error (broken session, bad credentials) aborts the boot.
 - An SFTP close no longer waits for the reference commit indefinitely. A
   GitHub read timeout plus the write thread's inline retries held the
   shared commit batch for over 27 s during the second bulk retest
