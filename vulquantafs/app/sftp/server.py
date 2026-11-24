@@ -546,6 +546,7 @@ class TGFSSFTPServer(asyncssh.SFTPServer):
     async def close(self, file_obj: object) -> None:
         if not isinstance(file_obj, (ReadHandle, WriteHandle)):
             return
+        closing: asyncio.Task[None] | None = None
         try:
             if isinstance(file_obj, WriteHandle) and self._session_is_ending():
                 # asyncssh closes every handle that is still open when the
@@ -558,11 +559,44 @@ class TGFSSFTPServer(asyncssh.SFTPServer):
                 # client dropped is aborted, never committed.
                 await file_obj.abort()
                 return
-            await file_obj.close()
+            timeout = self._config.vulquantafs.sftp.close_timeout_s
+            if not isinstance(file_obj, WriteHandle) or not timeout:
+                await file_obj.close()
+                return
+
+            # Backend finalization can spend time confirming the bytes,
+            # saving the descriptor and committing metadata in succession.
+            # A bound on any single phase does not bound the SFTP reply.
+            closing = asyncio.create_task(file_obj.close(), name="sftp-write-close")
+            done, _ = await asyncio.wait({closing}, timeout=timeout)
+            if not done:
+                logger.warning(
+                    "SFTP CLOSE for %s timed out after %gs", file_obj.path, timeout
+                )
+                raise asyncssh.SFTPFailure(
+                    f"Timed out after {timeout:g}s finalizing upload of {file_obj.path}"
+                )
+            closing.result()
         finally:
-            self._release_write(file_obj)
+            if closing is not None and not closing.done():
+                # Neither asyncio.wait_for() nor awaiting a cancelled task
+                # bounds cancellation cleanup. Reply now but keep the path
+                # claimed until the old upload can no longer modify it.
+                closing.cancel()
+                closing.add_done_callback(
+                    functools.partial(self._finish_cancelled_close, file_obj)
+                )
+            else:
+                self._release_write(file_obj)
             if file_obj in self._handles:
                 self._handles.remove(file_obj)
+
+    def _finish_cancelled_close(
+        self, handle: Union[ReadHandle, WriteHandle], task: asyncio.Task[None]
+    ) -> None:
+        self._release_write(handle)
+        if not task.cancelled() and (error := task.exception()) is not None:
+            logger.warning("SFTP CLOSE cleanup failed: %s", error)
 
     # ------------------------------------------------------------------
     # mutations

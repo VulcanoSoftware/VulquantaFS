@@ -176,6 +176,7 @@ class TestSFTPConfig:
         assert (
             config.fast_readdir_min_files == SFTPConfig.DEFAULT_FAST_READDIR_MIN_FILES
         )
+        assert config.close_timeout_s == 18
 
     def test_full_block(self):
         config = SFTPConfig.from_dict(
@@ -188,6 +189,7 @@ class TestSFTPConfig:
                 "upload_buffer_size_mb": 8,
                 "upload_buffer_dir": "spool",
                 "fast_readdir_min_files": 0,
+                "close_timeout_s": 0,
             }
         )
 
@@ -201,6 +203,7 @@ class TestSFTPConfig:
         assert config.upload_buffer_size_bytes == 8 * 1024 * 1024
         assert config.upload_buffer_dir is not None
         assert config.fast_readdir_min_files == 0
+        assert config.close_timeout_s == 0
 
     @pytest.mark.parametrize("port", [0, 65536, -1])
     def test_rejects_invalid_port(self, port):
@@ -214,6 +217,11 @@ class TestSFTPConfig:
     def test_rejects_negative_fast_readdir_threshold(self):
         with pytest.raises(ValueError, match="fast_readdir_min_files"):
             SFTPConfig.from_dict({"fast_readdir_min_files": -1})
+
+    @pytest.mark.parametrize("timeout", [-1, float("inf"), float("nan")])
+    def test_rejects_invalid_close_timeout(self, timeout):
+        with pytest.raises(ValueError, match="close_timeout_s"):
+            SFTPConfig.from_dict({"close_timeout_s": timeout})
 
 
 class TestCacheConfig:

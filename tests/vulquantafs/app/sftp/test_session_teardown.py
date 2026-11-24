@@ -21,6 +21,7 @@ from vulquantafs.app.sftp import server as sftp_server
 from vulquantafs.app.sftp.handles import WriteHandle
 from vulquantafs.app.sftp.server import TGFSSFTPServer
 from vulquantafs.auth.user import AdminUser
+from vulquantafs.config import SFTPConfig
 from vulquantafs.core import Ops
 from vulquantafs.errors import FileOrDirectoryDoesNotExist
 
@@ -81,9 +82,7 @@ async def session(mocker):
     mocker.patch.object(sftp_server, "Ops", make_ops_class(recorder))
 
     config = Mock()
-    config.vulquantafs.sftp.upload_buffer_size_bytes = 1024 * 1024
-    config.vulquantafs.sftp.upload_buffer_dir = None
-    config.vulquantafs.sftp.max_ahead_gap_bytes = 1024 * 1024 * 1024
+    config.vulquantafs.sftp = SFTPConfig.from_dict({"upload_buffer_size_mb": 1})
     client = build_client(mocker, "notes")
 
     def sftp_factory(chan):

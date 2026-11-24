@@ -163,6 +163,8 @@ vulquantafs:
   # file. The disk part of the buffer is enforced against the actual free
   # space of `upload_buffer_dir`: an upload that would outgrow it fails
   # with a clear error and is discarded, never committed truncated.
+  # `close_timeout_s` bounds how long CLOSE waits for the upload to finish.
+  # The default is 18 seconds; set to 0 to disable the timeout.
   # ---------------------------------------------------------------------------
   sftp:
     enabled: false
@@ -173,6 +175,7 @@ vulquantafs:
     # upload_buffer_size_mb: 64
     # upload_buffer_dir: ''
     # max_ahead_gap_mb: 1024
+    # close_timeout_s: 18
   # ---------------------------------------------------------------------------
   # Optional transfer tuning.
   #

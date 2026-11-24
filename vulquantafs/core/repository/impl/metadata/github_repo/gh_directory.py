@@ -331,6 +331,12 @@ class GithubConfig:
                 for entry in alive:
                     self._confirm(entry)
                 return False
+            except StoreUnreachable as ex:
+                # All individual writes use the same open circuit. Do not
+                # hold the shared writer trying each path in turn.
+                retry = [entry for entry in alive if self._retry(entry, ex)]
+                self.pending_refs.extend(retry)
+                return bool(retry)
             except Exception as ex:
                 logger.warning(
                     f"Committing {len(alive)} file reference(s) to "
@@ -815,7 +821,17 @@ class GithubDirectory(TGFSDirectory):
         )
         # The shared worker completes the write even if the client goes
         # away during the commit. By this point the content already exists.
-        done, _ = await asyncio.wait({committed}, timeout=AWAITED_COMMIT_MAX_WAIT)
+        try:
+            done, _ = await asyncio.wait({committed}, timeout=AWAITED_COMMIT_MAX_WAIT)
+        except asyncio.CancelledError:
+            # The SFTP deadline or disconnect can end the wait before
+            # this repository's deadline. The shared worker still owns
+            # the write; it must not report an exception to a lost waiter.
+            if committed.done() and not committed.cancelled():
+                committed.exception()
+            else:
+                committed.cancel()
+            raise
         if not done:
             # GitHub is too slow to answer the commit. Answer the client
             # anyway: holding the reply past what it waits for gets the
@@ -899,7 +915,11 @@ class GithubDirectory(TGFSDirectory):
                         f"at {file_path} (an earlier attempt landed)"
                     )
                     return
-                if attempt == PUT_ATTEMPTS - 1 or not _is_transient(ex):
+                if (
+                    isinstance(ex, StoreUnreachable)
+                    or attempt == PUT_ATTEMPTS - 1
+                    or not _is_transient(ex)
+                ):
                     raise
                 logger.warning(
                     f"Creating file reference {name} failed ({ex}); trying again"

@@ -92,6 +92,7 @@ vulquantafs:
     # upload_buffer_dir: ""
     # max_ahead_gap_mb: 1024
     # fast_readdir_min_files: 256
+    # close_timeout_s: 18
 
   encryption:
     enabled: true
@@ -196,6 +197,7 @@ Main application parameters:
   - `upload_buffer_dir` *(optional)*: Spill directory for the upload buffer (the system temp directory when empty).
   - `max_ahead_gap_mb` *(int, default `1024`)*: How far ahead of the streamed position a single write may jump before the upload fails. Within that bound writes may arrive in any order; a gap no write ever fills is zero-filled when the client closes the file.
   - `fast_readdir_min_files` *(int, default `256`)*: In directories with at least this many files, SFTP lists names and types without fetching each file's missing size and timestamps from storage. Known values are still sent; `STAT`/`LSTAT` can fetch the exact values. Set to `0` for clients that require exact attributes in every listing.
+  - `close_timeout_s` *(number, default `18`)*: Maximum wait for an upload's SFTP `CLOSE` response, including storage and metadata confirmation. A timeout returns an SFTP error rather than withholding a response until the client disconnects. Set to `0` to disable the limit; if you raise it, set the client's inactivity timeout higher.
 - **`encryption`**: Client-side AES-256-GCM settings (see [Security & At-Rest Encryption](./encryption.md)).
 - **`cache`** (off unless `enabled: true`): Local disk cache configuration (see [Local Cache & Performance Tuning](./cache-and-performance.md)).
 - **`listing`**: Folder listing behaviour (see [Local Cache & Performance Tuning](./cache-and-performance.md)).

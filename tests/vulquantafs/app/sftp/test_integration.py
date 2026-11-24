@@ -150,7 +150,12 @@ def users(mocker):
 
 
 @pytest.fixture
-async def server(mocker, channel, users):
+def close_timeout_s():
+    return None
+
+
+@pytest.fixture
+async def server(mocker, channel, users, close_timeout_s):
     mocker.patch(
         "vulquantafs.core.ops.create_upload_task", new_callable=mocker.AsyncMock
     )
@@ -161,6 +166,8 @@ async def server(mocker, channel, users):
 
     clients = {"notes": build_client(mocker, "notes", channel)}
     config = build_config(mocker, users)
+    if close_timeout_s is not None:
+        config.vulquantafs.sftp.close_timeout_s = close_timeout_s
 
     acceptor = await asyncssh.listen(
         host="127.0.0.1",
@@ -468,6 +475,70 @@ class TestTransfers:
             await sftp.put(str(source), "/notes/upload.bin")
 
         assert channel.contents["upload.bin"] == payload
+
+    @pytest.mark.parametrize("close_timeout_s", [0.2])
+    async def test_slow_close_returns_failure_without_losing_the_session(
+        self, server, channel
+    ):
+        payload = bytes(range(256)) * 2048 + b"x" * 112
+        path = "/notes/retry.bin"
+        cancelled = asyncio.Event()
+        allow_cleanup = asyncio.Event()
+        cleaned_up = asyncio.Event()
+
+        async def stalled_store(name, data):
+            if name != "retry.bin":
+                return
+            assert (name, data) == ("retry.bin", payload)
+            try:
+                await asyncio.Future()
+            finally:
+                cancelled.set()
+                await allow_cleanup.wait()
+                cleaned_up.set()
+
+        channel.before_commit = stalled_store
+        async with (
+            await connect(server) as conn,
+            conn.start_sftp_client() as sftp,
+            conn.start_sftp_client() as peer,
+        ):
+            try:
+                handle = await sftp.open(path, "xb")
+                await handle.write(payload)
+                with pytest.raises(asyncssh.SFTPFailure, match="finalizing upload"):
+                    await asyncio.wait_for(handle.close(), 2)
+                await asyncio.wait_for(cancelled.wait(), 2)
+
+                # CLOSE has answered even though cancellation cleanup is
+                # blocked. No placeholder is visible, and another session
+                # cannot open the same path until the old upload unwinds.
+                assert "retry.bin" not in await sftp.listdir("/notes")
+                with pytest.raises(asyncssh.SFTPFailure, match="already being written"):
+                    await peer.open(path, "xb")
+                async with await peer.open("/notes/parallel.bin", "xb") as other:
+                    await other.write(payload)
+                assert channel.contents["parallel.bin"] == payload
+
+                channel.before_commit = None
+                allow_cleanup.set()
+                await asyncio.wait_for(cleaned_up.wait(), 2)
+                async with asyncio.timeout(2):
+                    while True:
+                        try:
+                            retry = await sftp.open(path, "xb")
+                            break
+                        except asyncssh.SFTPFailure as ex:
+                            assert "already being written" in str(ex)
+                            await asyncio.sleep(0.01)
+                async with retry:
+                    await retry.write(payload)
+                assert channel.contents["retry.bin"] == payload
+                assert (await sftp.stat(path)).size == 524400
+            finally:
+                allow_cleanup.set()
+                if not cleaned_up.is_set():
+                    conn.abort()
 
     @pytest.mark.parametrize("name", ["retry.bin", "note.txt"])
     async def test_reconnect_after_dropped_close_can_retry(self, server, channel, name):

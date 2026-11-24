@@ -16,6 +16,7 @@ from github import Github
 from github.Repository import Repository
 
 from vulquantafs.core.model import TGFSDirectory
+from vulquantafs.core.repository.impl.metadata.breaker import StoreUnreachable
 from vulquantafs.core.repository.impl.metadata.github_repo.gh_directory import (
     GithubConfig,
     GithubDirectory,
@@ -43,6 +44,26 @@ async def _ticks_while(coro, interval: float = 0.01) -> int:
 
 
 class TestCreateFileRefAsync:
+    @pytest.mark.parametrize("count", [1, 2])
+    async def test_open_circuit_does_not_retry_each_reference(self, ghc, count):
+        broken = StoreUnreachable("outage")
+        ghc.repo.create_file.side_effect = broken
+        ghc.repo.get_git_ref.side_effect = broken
+        directory = GithubDirectory(ghc, "d", None)
+
+        results = await asyncio.gather(
+            *(directory.create_file_ref_async(f"file-{i}", i) for i in range(count)),
+            return_exceptions=True,
+        )
+
+        assert all(result is broken for result in results)
+        assert not directory.files
+        assert ghc.repo.create_file.call_count == (1 if count == 1 else 0)
+        assert ghc.repo.get_git_ref.call_count == (0 if count == 1 else 1)
+
+        ghc.repo.create_file.side_effect = None
+        assert (await directory.create_file_ref_async("file-0", 42)).message_id == 42
+
     async def test_concurrent_creates_wait_for_a_single_commit(self, ghc, monkeypatch):
         from vulquantafs.core.repository.impl.metadata.github_repo import gh_directory
 

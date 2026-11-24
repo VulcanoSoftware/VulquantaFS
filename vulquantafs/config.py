@@ -470,6 +470,9 @@ class SFTPConfig:
     ``fast_readdir_min_files`` lets SFTP list large folders from metadata
     alone. Files without stored stats are listed without size or dates,
     which a client can still request with STAT/LSTAT. Zero disables it.
+
+    ``close_timeout_s`` bounds the entire WRITE handle's CLOSE request,
+    including upload and metadata confirmation. Zero disables the bound.
     """
 
     enabled: bool
@@ -486,8 +489,10 @@ class SFTPConfig:
     DEFAULT_UPLOAD_BUFFER_SIZE_MB = 64
     DEFAULT_MAX_AHEAD_GAP_MB = 1024
     DEFAULT_FAST_READDIR_MIN_FILES = 256
+    DEFAULT_CLOSE_TIMEOUT_S = 18.0
 
     fast_readdir_min_files: int = DEFAULT_FAST_READDIR_MIN_FILES
+    close_timeout_s: float = DEFAULT_CLOSE_TIMEOUT_S
 
     @property
     def upload_buffer_size_bytes(self) -> int:
@@ -530,6 +535,12 @@ class SFTPConfig:
                 f"got {fast_readdir_min_files}"
             )
 
+        close_timeout_s = float(
+            data.get("close_timeout_s", cls.DEFAULT_CLOSE_TIMEOUT_S)
+        )
+        if not math.isfinite(close_timeout_s) or close_timeout_s < 0:
+            raise ValueError("sftp.close_timeout_s must be finite and non-negative")
+
         return cls(
             enabled=bool(data.get("enabled", False)),
             host=str(data.get("host", "0.0.0.0")),  # noqa: S104
@@ -550,6 +561,7 @@ class SFTPConfig:
             ),
             max_ahead_gap_mb=max_ahead_gap_mb,
             fast_readdir_min_files=fast_readdir_min_files,
+            close_timeout_s=close_timeout_s,
         )
 
 

@@ -3,7 +3,6 @@ import base64
 import bisect
 import datetime
 import hashlib
-import json
 import logging
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -41,7 +40,7 @@ from .gh_directory import (
     GithubDirectory,
     commit_tree_overlay,
 )
-from .stats_file import STATS_COMMIT_PREFIX, STATS_FILE_NAME
+from .stats_file import STATS_COMMIT_PREFIX, STATS_FILE_NAME, decode_stats, encode_stats
 from .tree_snapshot import TreeSnapshot, snapshot_file_name
 
 logger = logging.getLogger(__name__)
@@ -590,9 +589,7 @@ class GithubRepoMetadataRepository(IMetaDataRepository):
             return True
         try:
             blob = await asyncio.to_thread(self._ghc.repo.get_git_blob, sha)
-            entries = json.loads(base64.b64decode(blob.content))
-            if not isinstance(entries, dict):
-                raise ValueError("not a JSON object")
+            entries = decode_stats(base64.b64decode(blob.content))
         except Exception as ex:
             logger.warning(
                 f"Could not read {directory.stats_path} from "
@@ -667,7 +664,7 @@ class GithubRepoMetadataRepository(IMetaDataRepository):
         }
         if not entries:
             return None
-        return json.dumps(entries, sort_keys=True, separators=(",", ":"))
+        return encode_stats(entries)
 
     def _commit_stats(self, writes: list[tuple[str, Optional[str]]]) -> None:
         """One commit on top of the branch head; retried when another

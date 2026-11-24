@@ -87,6 +87,7 @@ def build_server(mocker, user=None, clients=None) -> TGFSSFTPServer:
     config = mocker.Mock()
     config.vulquantafs.sftp.upload_buffer_size_bytes = 1024
     config.vulquantafs.sftp.upload_buffer_dir = None
+    config.vulquantafs.sftp.close_timeout_s = SFTPConfig.DEFAULT_CLOSE_TIMEOUT_S
     config.vulquantafs.sftp.fast_readdir_min_files = (
         SFTPConfig.DEFAULT_FAST_READDIR_MIN_FILES
     )

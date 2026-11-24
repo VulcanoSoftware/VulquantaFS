@@ -1483,6 +1483,42 @@ class TestStatsFiles:
         assert sub.stats_sha is not None
 
     @pytest.mark.asyncio
+    async def test_large_stats_write_fits_small_request_and_round_trips(
+        self, repository, repo
+    ):
+        entries = [(f"file-{i}.{i}", f"sha-{i}") for i in range(1, 5406)]
+        root = self.load(repository, repo, entries)
+        for i, fr in enumerate(root.files):
+            fr.stat = FileStat(524400, 1795520000000 + i, 1795520000000 + i)
+        legacy = json.dumps(
+            {str(fr.message_id): fr.stat.to_dict() for fr in root.files}
+        )
+        self.commit_mocks(repo)
+        contents = []
+
+        def create_git_tree(elements, **kwargs):
+            content = elements[0]._identity["content"]
+            # Emulate a write path that transfers compact requests but
+            # times out sending the entire uncompressed stats table.
+            if len(json.dumps(elements[0]._identity)) >= len(legacy) // 3:
+                raise TimeoutError("The write operation timed out")
+            contents.append(content)
+
+        repo.create_git_tree.side_effect = create_git_tree
+        await repository.save_stats([root], keep=True)
+        await repository.save_stats([root], keep=True)
+        assert len(contents) == 1  # same bytes and Git SHA on the next flush
+
+        restored = self.load(
+            repository, repo, entries + [(".vulquantafsstats.json", root.stats_sha)]
+        )
+        repo.get_git_blob.return_value.content = base64.b64encode(
+            contents[0].encode()
+        ).decode()
+        assert await repository.load_stats(restored)
+        assert [fr.stat for fr in restored.files] == [fr.stat for fr in root.files]
+
+    @pytest.mark.asyncio
     async def test_unchanged_stats_are_not_written_again(self, repository, repo):
         root = self.load(repository, repo, [("a.txt.10", "s1")])
         root.files[0].stat = self.stat(5)
