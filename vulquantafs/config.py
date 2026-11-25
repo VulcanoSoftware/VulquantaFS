@@ -371,6 +371,8 @@ class GitlabRepoConfig:
     DEFAULT_BLOB_FETCH_CONCURRENCY = 8
 
     blob_fetch_concurrency: int = DEFAULT_BLOB_FETCH_CONCURRENCY
+    # Proactive pacing shared by all metadata stores on this GitLab host.
+    requests_per_second: float = 4.0
     # Like ``github_repo``: squash the branch's commit history once it
     # grew past this many commits (0 keeps every commit, the default).
     # GitLab's commits API cannot create a parentless commit, so the
@@ -387,6 +389,12 @@ class GitlabRepoConfig:
             raise ValueError(
                 "metadata.gitlab_repo.blob_fetch_concurrency must be "
                 f"positive, got {concurrency}"
+            )
+        rate = float(data.get("requests_per_second", cls.requests_per_second))
+        if not math.isfinite(rate) or rate < 0.01:
+            raise ValueError(
+                "metadata.gitlab_repo.requests_per_second must be finite and "
+                f"at least 0.01, got {rate}"
             )
         squash = int(data.get("squash_history_max_commits", 0))
         if squash < 0:
@@ -417,6 +425,7 @@ class GitlabRepoConfig:
             base_url=base_url,
             file_path=file_path,
             blob_fetch_concurrency=concurrency,
+            requests_per_second=rate,
             squash_history_max_commits=squash,
             layout=_parse_metadata_layout(
                 "metadata.gitlab_repo.layout", data.get("layout")

@@ -124,6 +124,8 @@ filesystems:
     #       # layout: 'tree'
     #       # base_url: 'https://gitlab.example.com'  # self-hosted
     #       # file_path: 'metadata.json'
+    #       # Shared per GitLab host, independent of blob-fetch concurrency.
+    #       # requests_per_second: 4
 
 vulquantafs:
   users:

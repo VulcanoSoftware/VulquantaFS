@@ -507,6 +507,7 @@ class TGFSSFTPServer(asyncssh.SFTPServer):
             max_gap_bytes=sftp_cfg.max_ahead_gap_bytes,
             wait_disconnected=self._channel.wait_closed,
             create_empty_on_close=not exists,
+            journal_file_ref=True,
         )
         self._active_writes.add(resolved)
         self._write_paths[handle] = resolved

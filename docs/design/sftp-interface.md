@@ -121,18 +121,23 @@ SFTP keeps the name of an open upload in memory, not in the file tree.
 Other SFTP sessions cannot open the same path for writing until the handle
 is closed or aborted. A new file can only enter the tree after the storage
 backend accepts its complete stream; an explicit close without writes
-creates an empty file. CLOSE waits for the new reference to be persisted,
-but never longer than 15 s: a GitHub read timeout plus the write thread's
-inline retries can hold the shared commit batch for half a minute, and a
-client gives up after 20 s of silence. A close past that bound is answered
-with an error while the commit keeps retrying in the background, so a
-retransmission appends a version to the same reference instead of finding
-a server that never answers. GitHub reference commits are batched across
-concurrent uploads, and a mirror sync is queued separately when the
-primary already holds the reference. An interrupted upload does not leave
-an empty placeholder that triggers FileZilla's overwrite prompt on
-reconnect. A disconnect after a commit but before the reply can still
-leave a valid destination.
+creates an empty file. With a GitHub tree as the primary metadata store, CLOSE
+confirms a new primary-owned file after the content backend accepts the
+file and its reference is committed to the local SQLite upload journal.
+It does not wait behind a GitHub stats or tree commit. The local file is
+immediately readable. A background worker batches references for GitHub,
+retries with backoff without dropping entries, and queues the usual mirror
+sync. Entries not yet confirmed by GitHub are replayed on restart. Other
+metadata layouts retain their existing persistence rules.
+
+Mount `VULQUANTAFS_DATA_DIR` on writable persistent storage and keep its
+`uploads/` directory when restarting or replacing the server. Until the
+primary receives a reference, the instance's data directory may hold its
+only copy. Journal payloads use the metadata encryption key when encryption
+is enabled. A failed content write or local journal write is still an
+upload failure. An interrupted upload does not leave an empty placeholder,
+but a disconnect after persistence and before the reply can still leave a
+valid destination.
 
 ## Lifecycle
 

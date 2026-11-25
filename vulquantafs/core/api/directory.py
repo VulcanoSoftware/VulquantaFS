@@ -54,6 +54,7 @@ class DirectoryApi:
         is uploaded and, crucially, nothing is deleted from the channel.
         """
         await self.__metadata_api.flush_removals()
+        await self.__metadata_api.flush_uploads(directory=directory)
         directory.move_to(to_parent, name)
         await self.__metadata_api.push()
         return directory
@@ -62,6 +63,7 @@ class DirectoryApi:
         message_ids, mirror_ids = await self.__file_api.collect_deletable_message_ids(
             self.__subtree_file_refs(directory)
         )
+        await self.__metadata_api.flush_uploads(directory=directory)
         directory.delete()
         await self.__metadata_api.push()
         await self.__message_api.delete_messages(message_ids)

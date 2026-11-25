@@ -20,10 +20,21 @@ import hashlib
 import json
 import logging
 import threading
-import time
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime
-from typing import Any, Dict, Iterable, List, NamedTuple, Optional, Sequence, cast
+from datetime import datetime, timezone
+from functools import partial
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    Iterable,
+    List,
+    NamedTuple,
+    Optional,
+    Sequence,
+    Set,
+    cast,
+)
 from urllib.parse import quote
 
 import requests
@@ -49,6 +60,10 @@ from vulquantafs.core.repository.impl.metadata.github_repo.dir_timestamps import
 )
 from vulquantafs.core.repository.impl.metadata.github_repo.gh_directory import (
     GithubDirectory,
+)
+from vulquantafs.core.repository.impl.metadata.gitlab_throttle import (
+    GitlabRateLimited,
+    gate_for,
 )
 from vulquantafs.crypto.metadata_blob import decrypt_metadata_blob
 from vulquantafs.errors import NoStoredMetadata, TechnicalError
@@ -89,13 +104,11 @@ GITLAB_COMMIT_ACTION_LIMIT = 500
 # full recursive scan. Large overlays still benefit from the complete cache.
 POINT_LOOKUP_LIMIT = 8
 
-# GitLab answers 429 when the access token runs into its usage quota. A
-# full-tree sync fires many requests in a burst and one 429 used to fail
-# the whole store write, so the request is retried: for the wait the API
-# prescribes (``Retry-After``), a doubling backoff when it prescribes
-# none, and then the failure stands for the stale/heal machinery.
+# Callers that opt into waiting get a bounded number of attempts.
+# Production store calls fail fast on 429 and leave retries to the
+# replicated heal cycle, without making foreground callers wait.
 RATE_LIMIT_RETRIES = 5
-RATE_LIMIT_MAX_SLEEP_SECONDS = 30.0
+REVISION_TRAILER = "VulquantaFS-Metadata-Revision: "
 
 # How deep a history squash pages for its anchor (the oldest commit it
 # can force the branch onto): 1000 pages of PER_PAGE. Reaching the cap
@@ -142,12 +155,15 @@ class _GitTreeObject:
 
 
 class _Commit:
-    def __init__(self, sha: str, committed_date: Optional[str] = None):
+    def __init__(self, sha: str, data: Optional[dict] = None):
         self.sha = sha
+        data = data or {}
+        self.metadata_revision = _metadata_revision(data)
         # GitLab exposes no tree ids; the tree API accepts the commit sha
         # as its ref, so the commit sha stands in for the tree sha.
         self.tree = _GitTreeObject(sha)
-        self.committer = type("_Committer", (), {"date": _parse_date(committed_date)})()
+        date = self.metadata_revision or _parse_date(data.get("committed_date"))
+        self.committer = type("_Committer", (), {"date": date})()
 
 
 class _CommitMeta:
@@ -219,6 +235,28 @@ def _error_data(response: requests.Response) -> dict:
         return {"message": response.text[:500]}
 
 
+def _metadata_revision(commit: dict) -> Optional[datetime]:
+    # A delayed mirror commit can land minutes after its snapshot was
+    # taken. Its wall-clock commit date must not make that snapshot win
+    # over a newer copy on restart.
+    message = commit.get("message", "").rstrip()
+    trailer = message.rsplit("\n", 1)[-1]
+    if trailer.startswith(REVISION_TRAILER):
+        try:
+            return datetime.fromtimestamp(
+                float(trailer.removeprefix(REVISION_TRAILER)), timezone.utc
+            )
+        except (ValueError, OverflowError, OSError):
+            pass
+    return None
+
+
+def _with_revision(message: str, revision: Optional[float]) -> str:
+    if revision is None:
+        return message
+    return f"{message}\n\n{REVISION_TRAILER}{revision:.6f}"
+
+
 class GitlabRepository:
     """The subset of PyGithub's ``Repository`` the tree-mirror metadata
     store uses, served from the GitLab REST API."""
@@ -231,14 +269,7 @@ class GitlabRepository:
         self._blob_fetch_concurrency = config.blob_fetch_concurrency
         self._wait_on_rate_limit = wait_on_rate_limit
         self._local = threading.local()
-        self._pause_lock = threading.Lock()
-        # The moment (clock monotonic) until no request of this project may
-        # be sent, because a 429 prescribed a wait. Every caller -- the
-        # retries of its own request and any parallel worker of a listing
-        # pool -- holds off until then: at one shared limiter, requests that
-        # kept firing their separate wait budgets simultaneously were what
-        # turned one rate limit into a self-sustaining storm of them.
-        self._paused_until = 0.0
+        self.gate = gate_for(self._base_url, config.requests_per_second)
         # Tree object ids seen in listings, mapped to their path: GitLab's
         # tree API takes a commit-ish ref plus a path, never a tree id,
         # while the store walks trees by the shas a parent listing showed.
@@ -348,29 +379,6 @@ class GitlabRepository:
             self._local.session = session
         return session
 
-    def _rate_limit_wait(self, response: requests.Response, attempt: int) -> float:
-        """Seconds to wait before the next try against a 429: the wait
-        GitLab prescribes (``Retry-After``) when it says one, a doubling
-        backoff otherwise, never beyond ``RATE_LIMIT_MAX_SLEEP_SECONDS``."""
-        value = response.headers.get("Retry-After", "")
-        try:
-            wait = float(value)
-        except (TypeError, ValueError):
-            wait = float(2**attempt)
-        return min(max(wait, 1.0), RATE_LIMIT_MAX_SLEEP_SECONDS)
-
-    def _hold_off(self) -> None:
-        """Sleep until the pause a 429 prescribed has passed, once."""
-        remaining = self._paused_until - time.monotonic()
-        if remaining > 0:
-            time.sleep(remaining)
-
-    def _publish_pause(self, wait: float) -> None:
-        """Make every later request of this project wait out ``wait``
-        seconds before it sends, keeping the longest pause asked for."""
-        with self._pause_lock:
-            self._paused_until = max(self._paused_until, time.monotonic() + wait)
-
     def _request(
         self,
         method: str,
@@ -382,50 +390,26 @@ class GitlabRepository:
     ) -> requests.Response:
         url = f"{self._base_url}/api/v4/projects/{self._project}{path}"
 
-        def send():
-            # Unannotated on purpose: naming ``requests.Response`` here makes
-            # a stub-less mypy read ``Response.status_code`` out of the
-            # untyped requests source, where the branch's own ``_request``
-            # return type already carries the guarantee.
-            return self._session.request(
-                method,
-                url,
-                params=params,
-                json=json_body,
-                timeout=REQUEST_TIMEOUT_SECONDS,
-            )
-
         wait_on_limit = retry_rate_limit and self._wait_on_rate_limit
         attempts = RATE_LIMIT_RETRIES if wait_on_limit else 1
-        if wait_on_limit:
-            self._hold_off()
-        elif self._paused_until > time.monotonic():
-            raise GithubException(429, {"message": "GitLab rate-limit cooldown active"})
-        response = send()
-        for attempt in range(attempts - 1):
-            if response.status_code != 429:
+        for attempt in range(attempts):
+            ticket = self.gate.acquire(wait_on_cooldown=wait_on_limit)
+            try:
+                response = self._session.request(
+                    method,
+                    url,
+                    params=params,
+                    json=json_body,
+                    timeout=REQUEST_TIMEOUT_SECONDS,
+                )
+            except BaseException:
+                self.gate.finish(ticket, None, {})
+                raise
+            limited = self.gate.finish(ticket, response.status_code, response.headers)
+            if limited is None:
                 break
-            wait = self._rate_limit_wait(response, attempt)
-            logger.warning(
-                f"GitLab rate limit exceeded on {method} {path} "
-                f"(attempt {attempt + 1} of {attempts}); "
-                f"retrying in {wait:.0f}s"
-            )
-            # Every other call of this project holds off too: a wave of
-            # requests that each burned its own wait budget against the
-            # same limiter kept the limit from ever clearing.
-            self._publish_pause(wait)
-            time.sleep(wait)
-            response = send()
-        if response.status_code == 429:
-            # Keep the full server-specified cooldown for fail-fast callers:
-            # they don't sleep, but won't restart the same scan every push.
-            if not wait_on_limit:
-                try:
-                    wait = max(1.0, int(response.headers.get("Retry-After", "")))
-                except (TypeError, ValueError):
-                    wait = self._rate_limit_wait(response, 0)
-                self._publish_pause(wait)
+            if attempt + 1 == attempts:
+                raise limited
         if response.status_code >= 400:
             data = _error_data(response)
             if _is_gitaly_deadline(data):
@@ -617,7 +601,7 @@ class GitlabRepository:
         data = self._json(
             self._request("GET", f"/repository/commits/{quote(sha, safe='')}")
         )
-        return _Commit(sha, data.get("committed_date"))
+        return _Commit(sha, data)
 
     def get_git_tree(self, sha: str, recursive: bool = False) -> _Tree:
         if sha == self._branch or (
@@ -1111,7 +1095,9 @@ class GitlabRepository:
             page = int(next_page)
         return shas[:max_items]
 
-    def compact_history(self, message: str, max_commits: int) -> int:
+    def compact_history(
+        self, message: str, max_commits: int, preserve_revision: bool = False
+    ) -> int:
         """Bound the branch's history to ``max_commits`` commits.
 
         GitLab's commits API cannot create a parentless commit, so the
@@ -1187,10 +1173,18 @@ class GitlabRepository:
                 for i in range(0, len(actions), GITLAB_COMMIT_ACTION_LIMIT)
             ]
         total = len(chunks)
+        revision = (
+            self.get_git_commit(history[0]).metadata_revision
+            if preserve_revision
+            else None
+        )
         sha = ""
         for number, chunk in enumerate(chunks, start=1):
             sha = self._post_commit(
-                message if total == 1 else f"{message} ({number}/{total})",
+                _with_revision(
+                    message if total == 1 else f"{message} ({number}/{total})",
+                    revision.timestamp() if revision is not None else None,
+                ),
                 chunk,
                 force=number == 1,
                 start_sha=anchor if number == 1 else None,
@@ -1240,7 +1234,9 @@ class GitlabRepository:
     ) -> str:
         body: Dict[str, Any] = {
             "branch": self._branch,
-            "commit_message": message,
+            "commit_message": _with_revision(
+                message, getattr(self._local, "snapshot_revision", None)
+            ),
             "actions": actions,
         }
         if force:
@@ -1333,6 +1329,9 @@ class GitlabTreeRepoMetadataRepository(GithubRepoMetadataRepository):
     document is then removed, so the migration runs once.
     """
 
+    batch_mirror_writes = True
+    supports_upload_journal = False
+
     def __init__(
         self,
         config: GitlabRepoConfig,
@@ -1341,6 +1340,9 @@ class GitlabTreeRepoMetadataRepository(GithubRepoMetadataRepository):
         legacy_blob_key: Optional[bytes] = None,
     ):
         raw = GitlabRepository(config, wait_on_rate_limit=False)
+        self._raw = raw
+        self._gate = raw.gate
+        self._shared_tree = False
         # Like its GitHub sibling, behind a fail-fast wrapper: GitLab that
         # cannot do the work (a hung storage backend, a dead connection)
         # costs the full request timeout per call, and the replicated layer
@@ -1378,6 +1380,13 @@ class GitlabTreeRepoMetadataRepository(GithubRepoMetadataRepository):
         self._gitlab_breaker.stop()
         await super().close()
 
+    def write_in_cooldown(self) -> bool:
+        return self._gate.in_cooldown()
+
+    def bind_shared_tree(self, metadata: Optional[TGFSMetadata]) -> None:
+        self._shared_tree = True
+        super().bind_shared_tree(metadata)
+
     async def head_revision(self) -> Optional[float]:
         """The branch head's commit date, probed without any retrying.
 
@@ -1408,7 +1417,7 @@ class GitlabTreeRepoMetadataRepository(GithubRepoMetadataRepository):
         )
         commit = head["commit"]
         sha = commit["id"]
-        date = _parse_date(commit.get("committed_date"))
+        date = _metadata_revision(commit) or _parse_date(commit.get("committed_date"))
         if date is None:
             commit = facade._json(
                 facade._request(
@@ -1417,7 +1426,9 @@ class GitlabTreeRepoMetadataRepository(GithubRepoMetadataRepository):
                     retry_rate_limit=False,
                 )
             )
-            date = _parse_date(commit.get("committed_date"))
+            date = _metadata_revision(commit) or _parse_date(
+                commit.get("committed_date")
+            )
         if date is None:
             raise TechnicalError(
                 f"The branch head of {self._ghc.repo_name}@{branch} "
@@ -1472,8 +1483,22 @@ class GitlabTreeRepoMetadataRepository(GithubRepoMetadataRepository):
         await super().push_full()
         await self._remove_document()
 
+    def _full_sync_writer(self) -> Callable[[Set[str]], None]:
+        # Capture the revision on the event loop together with the paths.
+        tree = self.metadata
+        if self._shared_tree and tree is not None and tree.revision is not None:
+            return partial(self._sync_mirror_snapshot, tree.revision)
+        return super()._full_sync_writer()
+
+    def _sync_mirror_snapshot(self, revision: float, paths: Set[str]) -> None:
+        self._raw._local.snapshot_revision = revision
+        try:
+            self._sync_tree_commit(paths)
+        finally:
+            del self._raw._local.snapshot_revision
+
     async def maintain(self) -> None:
-        if self._ghc.squash_history_max_commits > 0:
+        if self._ghc.squash_history_max_commits > 0 and not self.write_in_cooldown():
             async with self._ghc.lock:
                 await self._ghc.write(self._compact_gitlab_history)
 
@@ -1483,7 +1508,7 @@ class GitlabTreeRepoMetadataRepository(GithubRepoMetadataRepository):
         commits API cannot create a parentless commit."""
         limit = self._ghc.squash_history_max_commits
         squashed = cast(Any, self._ghc.repo).compact_history(
-            "Compact metadata history", limit
+            "Compact metadata history", limit, self._shared_tree
         )
         if squashed:
             logger.info(
@@ -1529,11 +1554,16 @@ class GitlabTreeRepoMetadataRepository(GithubRepoMetadataRepository):
             if not exists:
                 self._document_removed = True
                 return
+            message = (
+                "Remove the VulquantaFS single-document metadata (migrated to the "
+                "mirrored tree layout)"
+            )
+            if self._shared_tree:
+                message = _with_revision(message, await self.head_revision())
             await asyncio.to_thread(
                 self._gitlab.delete_file,
                 self._document_path,
-                "Remove the VulquantaFS single-document metadata (migrated to the "
-                "mirrored tree layout)",
+                message,
                 "",
                 self._ghc.commit,
             )
@@ -1542,6 +1572,10 @@ class GitlabTreeRepoMetadataRepository(GithubRepoMetadataRepository):
                 f"Removed the migrated metadata document {self._document_path} "
                 f"from {self._ghc.repo_name}@{self._ghc.commit}"
             )
+        except GitlabRateLimited:
+            # Cleanup is optional and already retried by the next full sync.
+            # The shared limiter has already logged the 429 once.
+            return
         except Exception as ex:
             # The tree is synced; a document that refuses to go away is
             # retried on the next push_full of this process.

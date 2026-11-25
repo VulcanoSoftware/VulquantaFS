@@ -563,6 +563,9 @@ class GithubDirectory(TGFSDirectory):
         self.children.append(res)
         return res
 
+    def restore_dir(self, name: str) -> "GithubDirectory":
+        return self.create_dir_skip_github_ops(name)
+
     def create_dir(self, name: str) -> "GithubDirectory":
         self._require_not_removing()
         child = super().create_dir(name)

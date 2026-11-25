@@ -10,8 +10,10 @@ or Discord, each its own store), a GitHub repo and a GitLab repo.
 
 Behaviour:
 
-* Every ``push`` writes the primary store and then every mirror (all
-  stores at once when ``concurrent_stores`` is set). A mirror that fails
+* Every ``push`` writes the primary store and non-batched mirrors
+  (at once when ``concurrent_stores`` is set). GitLab mirrors batch
+  ordinary pushes on the heal worker, unless needed for durability.
+  A mirror that fails
   is logged, marked *stale* and skipped -- the write still succeeds as
   long as one store holds the tree. Later pushes leave the stale store
   alone (a store that just failed may answer slowly -- a rate limit's
@@ -32,9 +34,8 @@ Behaviour:
 Conflict handling: every push stamps the tree with a revision (see
 ``TGFSMetadata.revision``) and the load serves the store with the
 freshest one -- the primary only by preference when a mirror is not
-meaningfully newer, never by force. The stores only diverge while one
-of them is down, exactly the situation the heal closes; a store whose
-copy was beaten at load is handed the winner's tree like a stale one.
+meaningfully newer, never by force. The heal closes any lag; a store
+whose copy was beaten at load is handed the winner's tree like a stale one.
 """
 
 from __future__ import annotations
@@ -45,7 +46,7 @@ import time
 from dataclasses import dataclass
 from typing import AsyncIterator, Iterable, List, Optional, Sequence, Set
 
-from vulquantafs.core.model import TGFSDirectory, TGFSMetadata
+from vulquantafs.core.model import TGFSDirectory, TGFSFileRef, TGFSMetadata
 from vulquantafs.core.repository.interface import IMetaDataRepository
 from vulquantafs.errors import (
     MetadataBlobTooLarge,
@@ -102,6 +103,10 @@ class ReplicatedMetadataRepository(IMetaDataRepository):
         self._concurrent_stores = concurrent_stores
         # Keys of the stores that missed a write and await a re-sync.
         self._stale: Set[str] = set()
+        # A dirty bit per mirror, not a queue of individual file changes.
+        # Writes registered during a flush set it again for the next cycle.
+        self._pending_batches: Set[str] = set()
+        self._loaded_from_mirror = False
         # Keys of the stores that cannot hold the current document at all
         # (a pinned copy whose messages are too small), with the reason.
         # Re-checked on every heal: a smaller tree fits again.
@@ -135,8 +140,15 @@ class ReplicatedMetadataRepository(IMetaDataRepository):
     def metadata(self, value: Optional[TGFSMetadata]) -> None:
         # One tree, shared by every store: the APIs mutate it in place and
         # each store serializes (or incrementally writes) that same object.
-        for store in self._stores:
-            store.repo.metadata = value
+        primary = self._stores[0].repo
+        if self._loaded_from_mirror:
+            # Never attach write-through hooks to the primary that may have
+            # been unreachable at boot. Fallback mutations must reach push().
+            primary.bind_shared_tree(value)
+        else:
+            primary.metadata = value
+        for store in self._stores[1:]:
+            store.repo.bind_shared_tree(primary.metadata)
 
     # -- loading --------------------------------------------------------------
 
@@ -252,6 +264,7 @@ class ReplicatedMetadataRepository(IMetaDataRepository):
                 # The selected empty store is the bootstrap source, not
                 # a stale copy that needs a full remote reconciliation.
                 self._stale.discard(empty_store.key)
+                self._loaded_from_mirror = not empty_store.primary
                 return TGFSMetadata(dir=TGFSDirectory.root_dir())
             raise TechnicalError(
                 "No metadata store could be read: " + "; ".join(failures)
@@ -265,7 +278,10 @@ class ReplicatedMetadataRepository(IMetaDataRepository):
                     f"Metadata store {winner.key} holds the most recent "
                     f"metadata tree; store {store.key} will be re-synced"
                 )
-        return tree
+        self._loaded_from_mirror = not winner.primary
+        return (
+            winner.repo.export_for_primary(tree) if self._loaded_from_mirror else tree
+        )
 
     async def _read_candidates(
         self,
@@ -342,6 +358,19 @@ class ReplicatedMetadataRepository(IMetaDataRepository):
     async def push(self) -> None:
         await self._push()
 
+    @property
+    def supports_upload_journal(self) -> bool:
+        return self._stores[0].repo.supports_upload_journal
+
+    async def push_upload_refs(
+        self, refs: Sequence[TGFSFileRef], *, full: bool = False
+    ) -> None:
+        # The outbox drains via the primary; mirror copies continue
+        # through the normal (and, for GitLab, batched) replication path.
+        primary = self._stores[0]
+        async with self._store_locks[primary.key]:
+            await primary.repo.push_upload_refs(refs, full=full)
+
     async def push_removals(self) -> None:
         # The journal flusher may not clear an entry until every store,
         # the stale ones included, holds the tree the removal belongs to.
@@ -375,15 +404,18 @@ class ReplicatedMetadataRepository(IMetaDataRepository):
             async with self._store_locks[store.key]:
                 return await self._write(store, full=full_for(store, index))
 
+        batched = []
         if not include_stale:
             # A push that retried a store marked stale inline would pay
             # its slowness on every following operation; the heal worker
             # re-syncs the store once it answers again.
-            stores = [
-                (store, i)
-                for i, store in enumerate(self._stores)
-                if store.key not in self._stale
-            ]
+            stores = []
+            for i, store in enumerate(self._stores):
+                if i > 0 and store.repo.batch_mirror_writes:
+                    self._pending_batches.add(store.key)
+                    batched.append((store, i))
+                elif store.key not in self._stale:
+                    stores.append((store, i))
         else:
             stores = [(store, i) for i, store in enumerate(self._stores)]
 
@@ -398,6 +430,20 @@ class ReplicatedMetadataRepository(IMetaDataRepository):
             any_store_ok = any_store_ok or ok
             if error:
                 errors.append(error)
+        # Deferring a mirror is safe only after another copy took the
+        # write. If not, try even a stale GitLab mirror that isn't cooling
+        # down; its full sync can be the only durable copy.
+        if not any_store_ok:
+            for store, i in batched:
+                if store.repo.write_in_cooldown():
+                    errors.append(f"{store.key}: GitLab rate-limit cooldown active")
+                    continue
+                ok, error = await one(store, i)
+                if ok:
+                    any_store_ok = True
+                    break
+                if error:
+                    errors.append(error)
         if not any_store_ok:
             # Not one store holds the tree; the caller has to know. A push
             # that skipped every stale store lands here as well.
@@ -423,11 +469,20 @@ class ReplicatedMetadataRepository(IMetaDataRepository):
         """Write the whole tree to ``store``; reports success and, on
         failure, a short reason. Failures mark the store stale (or
         skipped, when it cannot hold the document at all) for the heal."""
+        if store.repo.write_in_cooldown():
+            self._stale.add(store.key)
+            return False, "GitLab rate-limit cooldown active"
+        pending = store.key in self._pending_batches
+        self._pending_batches.discard(store.key)
         try:
             if full:
                 await store.repo.push_full()
             else:
                 await store.repo.push()
+        except asyncio.CancelledError:
+            if pending:
+                self._pending_batches.add(store.key)
+            raise
         except MetadataBlobTooLarge as ex:
             reason = str(ex)
             if store.key not in self._skipped:
@@ -441,17 +496,18 @@ class ReplicatedMetadataRepository(IMetaDataRepository):
         except Exception as ex:
             reason = str(ex) or repr(ex)
             self._stale.add(store.key)
-            logger.error(
-                f"Writing the metadata to store {store.key} failed; it will "
-                f"be re-synced once it is available again: {reason}"
-            )
+            if not store.repo.write_in_cooldown():
+                logger.error(
+                    f"Writing the metadata to store {store.key} failed; it will "
+                    f"be re-synced once it is available again: {reason}"
+                )
             return False, reason
         self._stale.discard(store.key)
         self._skipped.pop(store.key, None)
         return True, None
 
     async def heal(self) -> None:
-        """Re-write every store that is stale or skipped.
+        """Re-write every store that has a batch pending or is stale/skipped.
 
         Called periodically by the heal worker and safe to call any time;
         a store that is up to date costs nothing, and one that just came
@@ -467,10 +523,19 @@ class ReplicatedMetadataRepository(IMetaDataRepository):
     async def _heal(self) -> None:
         if not self.metadata:
             return
-        for store in self._stores:
-            if store.key in self._stale or store.key in self._skipped:
-                async with self._store_locks[store.key]:
+
+        async def sync(store: MetadataStore) -> None:
+            if store.repo.write_in_cooldown() or self._store_locks[store.key].locked():
+                return
+            async with self._store_locks[store.key]:
+                if (
+                    store.key in self._pending_batches
+                    or store.key in self._stale
+                    or store.key in self._skipped
+                ):
                     await self._write(store, full=True)
+
+        await asyncio.gather(*(sync(store) for store in self._stores))
 
     async def maintain(self) -> None:
         if not self.metadata or (
@@ -478,7 +543,12 @@ class ReplicatedMetadataRepository(IMetaDataRepository):
         ):
             return
         for store in self._stores:
-            if store.key in self._stale or store.key in self._skipped:
+            if (
+                store.key in self._stale
+                or store.key in self._skipped
+                or store.key in self._pending_batches
+                or store.repo.write_in_cooldown()
+            ):
                 continue
             try:
                 await store.repo.maintain()

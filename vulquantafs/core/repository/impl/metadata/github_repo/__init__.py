@@ -7,7 +7,7 @@ import json
 import logging
 import time
 from concurrent.futures import ThreadPoolExecutor
-from typing import Iterable, NamedTuple, Optional, Sequence, Set, cast
+from typing import Callable, Iterable, NamedTuple, Optional, Sequence, Set, cast
 
 from github import Github, GithubException, InputGitTreeElement
 from github.ContentFile import ContentFile
@@ -39,6 +39,7 @@ from .gh_directory import (
     TREE_OVERLAY_ACTION_LIMIT,
     GithubConfig,
     GithubDirectory,
+    _put_file_refs,
     commit_tree_overlay,
 )
 from .stats_file import STATS_COMMIT_PREFIX, STATS_FILE_NAME
@@ -81,6 +82,8 @@ def _blob_sha(content: str) -> str:
 
 
 class GithubRepoMetadataRepository(IMetaDataRepository):
+    supports_upload_journal = True
+
     def __init__(
         self,
         config: GithubRepoConfig,
@@ -156,6 +159,14 @@ class GithubRepoMetadataRepository(IMetaDataRepository):
     def metadata(self, value: Optional[TGFSMetadata]) -> None:
         self._metadata = None if value is None else self._as_github_tree(value)
 
+    def bind_shared_tree(self, metadata: Optional[TGFSMetadata]) -> None:
+        # Using the normal setter here turns a plain primary's nodes into
+        # write-through nodes bound to the mirror, bypassing replication.
+        self._metadata = metadata
+
+    def export_for_primary(self, metadata: TGFSMetadata) -> TGFSMetadata:
+        return TGFSMetadata.from_dict(metadata.to_dict())
+
     def _as_github_tree(self, metadata: TGFSMetadata) -> TGFSMetadata:
         if isinstance(metadata.dir, GithubDirectory):
             return metadata
@@ -203,6 +214,13 @@ class GithubRepoMetadataRepository(IMetaDataRepository):
             )
 
     async def push(self) -> None:
+        if self.metadata is not None and not isinstance(
+            self.metadata.dir, GithubDirectory
+        ):
+            # Booted on a fallback; the plain tree intentionally has no
+            # write-through hooks to a possibly unreachable primary.
+            await self.push_full()
+            return
         # The incremental writes already landed while the tree was mutated;
         # what is left is the batched file-reference deletions.
         if not self._ghc.pending_drops:
@@ -345,12 +363,66 @@ class GithubRepoMetadataRepository(IMetaDataRepository):
         # GitHub round trips run on the writer thread.
         async with self._ghc.lock:
             desired_blobs = self._desired_blobs()
-            await self._ghc.write(self._sync_tree_commit, desired_blobs)
+            await self._ghc.write(self._full_sync_writer(), desired_blobs)
             # The sync reconciled the whole tree; every pending blob delete
             # it covered is durable now -- and a tree a file reference was
             # dropped from wrote them all out.
             self._ghc.pending_drops.clear()
             self._ghc.pending_drops_since = 0.0
+
+    def _full_sync_writer(self) -> Callable[[Set[str]], None]:
+        return self._sync_tree_commit
+
+    async def push_upload_refs(
+        self, refs: Sequence[TGFSFileRef], *, full: bool = False
+    ) -> None:
+        root = self.root()
+        if full or not isinstance(root, GithubDirectory):
+            # A plain tree loaded from another replica has no write-through
+            # paths. Replay conflicts also need to reconcile obsolete blobs.
+            await self.push_full()
+            return
+        async with self._ghc.lock:
+            # An overlay is safe to replay even if GitHub moved the branch
+            # but its reply was lost. Only a confirmed ref edit clears the
+            # outbox; do not use the legacy single-file 422 heuristic.
+            await self._ghc.write(
+                self._write_upload_refs,
+                [
+                    (
+                        self._ref_blob_path(
+                            ref.location, self._dir_storage_path(ref.location), ref
+                        ),
+                        ref.name,
+                    )
+                    for ref in refs
+                ],
+            )
+
+    def _write_upload_refs(self, refs: Sequence[tuple[str, str]]) -> None:
+        repo, branch = self._ghc.repo, self._ghc.commit
+        try:
+            _put_file_refs(repo, branch, refs)
+        except GithubException as ex:
+            if ex.status not in (404, 409):
+                raise
+            # The branch may not have been created yet (for example the
+            # first root-level uploads to a new metadata repository).
+            try:
+                self._initial_sync_commit({path for path, _name in refs})
+            except GithubException as initial:
+                if initial.status != 409:
+                    raise
+                # GitHub's Git Data API cannot create a tree in a completely
+                # empty repository. Bootstrap it through the Contents API.
+                repo.create_file(
+                    path=refs[0][0],
+                    message="Create initial VulquantaFS file reference",
+                    content="",
+                    branch=branch,
+                )
+                if len(refs) > 1:
+                    _put_file_refs(repo, branch, refs[1:])
 
     def _desired_blobs(self) -> Set[str]:
         """The blob paths the in-memory tree implies."""
@@ -385,7 +457,7 @@ class GithubRepoMetadataRepository(IMetaDataRepository):
         """On-repo path of ``directory``; per-directory encrypted state is
         preserved for a tree of ``GithubDirectory`` nodes, a plain tree
         (loaded from another metadata store) follows the configured key."""
-        if isinstance(directory, GithubDirectory):
+        if isinstance(directory, GithubDirectory) and directory._ghc is self._ghc:
             return directory._github_path
         segments: list[str] = []
         node: Optional[TGFSDirectory] = directory
@@ -401,7 +473,7 @@ class GithubRepoMetadataRepository(IMetaDataRepository):
     def _ref_blob_path(
         self, directory: TGFSDirectory, path: str, fr: TGFSFileRef
     ) -> str:
-        if isinstance(directory, GithubDirectory):
+        if isinstance(directory, GithubDirectory) and directory._ghc is self._ghc:
             segment = directory._file_ref_storage_name(fr.name, fr.message_id)
         else:
             segment = f"{self._encode_segment(fr.name)}.{fr.message_id}"

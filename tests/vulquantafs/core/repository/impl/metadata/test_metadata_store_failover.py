@@ -284,7 +284,12 @@ class TestOutageStaysUsable:
             ]
             # The mirror still served the tree: the file system is fully
             # usable on the healthy store.
-            assert layer.metadata.dir.find_dir("docs").find_file("readme") is not None
+            docs = layer.metadata.dir.find_dir("docs")
+            assert docs.find_file("readme") is not None
+            await docs.create_file_ref_async("fallback-upload", 43)
+            await layer.push()
+            assert fake.file_content("main", "docs/fallback-upload.43") == ""
+            assert timeout.attempts == boot_attempts
         finally:
             # Stop the probe before the request mocks go away.
             gh_breaker.stop()

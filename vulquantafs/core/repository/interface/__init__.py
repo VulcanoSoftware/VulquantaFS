@@ -1,6 +1,6 @@
 from abc import ABCMeta, abstractmethod
 from dataclasses import dataclass, field
-from typing import Dict, Iterable, Iterator, List, Optional
+from typing import Dict, Iterable, Iterator, List, Optional, Sequence
 
 from vulquantafs.core.model import (
     TGFSDirectory,
@@ -103,6 +103,8 @@ class IFDRepository(metaclass=ABCMeta):
 
 
 class IMetaDataRepository(metaclass=ABCMeta):
+    batch_mirror_writes: bool = False
+
     def __init__(self):
         self.metadata: Optional[TGFSMetadata] = None
         # Whether the loaded tree carries stats; worked out on first ask.
@@ -110,6 +112,26 @@ class IMetaDataRepository(metaclass=ABCMeta):
 
     async def init(self):
         self.metadata = await self.get()
+
+    def bind_shared_tree(self, metadata: Optional[TGFSMetadata]) -> None:
+        """Use a shared tree without installing store-specific write hooks."""
+        self.metadata = metadata
+
+    def export_for_primary(self, metadata: TGFSMetadata) -> TGFSMetadata:
+        """Return a tree whose mutations aren't tied to this mirror."""
+        return metadata
+
+    def write_in_cooldown(self) -> bool:
+        return False
+
+    @property
+    def supports_upload_journal(self) -> bool:
+        return False
+
+    async def push_upload_refs(
+        self, refs: Sequence[TGFSFileRef], *, full: bool = False
+    ) -> None:
+        await self.push_full()
 
     @abstractmethod
     async def push(self) -> None:

@@ -270,6 +270,10 @@ class TGFSDirectory:
         self._touch_modified()
         return child
 
+    def restore_dir(self, name: str) -> "TGFSDirectory":
+        """Rebuild a missing parent during local journal replay, without I/O."""
+        return self.create_dir(name)
+
     @classmethod
     def root_dir(cls) -> Self:
         return cls(name="root", parent=None)

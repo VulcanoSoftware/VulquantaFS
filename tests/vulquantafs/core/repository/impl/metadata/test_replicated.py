@@ -132,6 +132,76 @@ def replicated(primary: FakeMetadataRepo, *mirrors: FakeMetadataRepo):
     return ReplicatedMetadataRepository(stores)
 
 
+class TestBatchedMirror:
+    async def test_changes_during_a_running_flush_are_not_dropped(self):
+        started, resume = asyncio.Event(), asyncio.Event()
+
+        class Batched(FakeMetadataRepo):
+            batch_mirror_writes = True
+            saved: list[str]
+
+            async def push_full(self):
+                await super().push_full()
+                snapshot = [d.name for d in self.root().find_dirs()]
+                started.set()
+                await resume.wait()
+                self.saved = snapshot
+
+        mirror = Batched("gitlab")
+        layer = replicated(FakeMetadataRepo("primary"), mirror)
+        layer.metadata = tree("before")
+        await layer.push()
+        heal = asyncio.create_task(layer.heal())
+        try:
+            await asyncio.wait_for(started.wait(), 1)
+            layer.root().create_dir("during")
+            await asyncio.wait_for(layer.push(), 1)
+        finally:
+            resume.set()
+            await heal
+        assert mirror.saved == ["before"]
+        await layer.heal()
+        assert mirror.saved == ["before", "during"]
+        await layer.heal()
+        assert mirror.push_full_calls == 2
+
+    async def test_fallback_writes_even_a_stale_mirror_before_returning(self):
+        class Batched(FakeMetadataRepo):
+            batch_mirror_writes = True
+
+        primary = FakeMetadataRepo("primary", push_error=TechnicalError("offline"))
+        mirror = Batched("gitlab", push_full_error=TechnicalError("offline"))
+        layer = replicated(primary, mirror)
+        layer.metadata = tree("first")
+        with pytest.raises(TechnicalError, match="failed for every store"):
+            await layer.push()
+        mirror.push_full_error = None
+        layer.root().create_dir("fallback")
+        await layer.push()
+        assert mirror.push_full_calls == 2
+        assert mirror.stored is not None
+        assert mirror.stored.dir.find_dir("fallback") is not None
+
+    async def test_removal_requires_mirror_during_cooldown(self):
+        class Batched(FakeMetadataRepo):
+            batch_mirror_writes = True
+            limited = True
+
+            def write_in_cooldown(self):
+                return self.limited
+
+        mirror = Batched("gitlab")
+        layer = replicated(FakeMetadataRepo("primary"), mirror)
+        layer.metadata = tree("keep")
+        await layer.push()
+        with pytest.raises(TechnicalError, match="Waiting for metadata stores: gitlab"):
+            await layer.push_removals()
+        assert mirror.push_full_calls == 0
+        mirror.limited = False
+        await layer.push_removals()
+        assert mirror.push_full_calls == 1
+
+
 class TestConstruction:
     def test_needs_a_store(self):
         with pytest.raises(ValueError, match="needs a store"):

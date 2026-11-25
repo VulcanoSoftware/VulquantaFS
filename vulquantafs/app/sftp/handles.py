@@ -198,6 +198,7 @@ class WriteHandle(Handle):
         max_gap_bytes: int = DEFAULT_MAX_AHEAD_GAP_BYTES,
         wait_disconnected: Optional[Callable[[], Awaitable[None]]] = None,
         create_empty_on_close: bool = False,
+        journal_file_ref: bool = False,
     ):
         self._ops = ops
         self._path = path
@@ -206,6 +207,7 @@ class WriteHandle(Handle):
         self._max_gap_bytes = max_gap_bytes
         self._wait_disconnected = wait_disconnected
         self._create_empty_on_close = create_empty_on_close
+        self._journal_file_ref = journal_file_ref
 
         self._queue: Optional[asyncio.Queue[Optional[bytes]]] = None
         self._task: Optional[asyncio.Task] = None
@@ -547,15 +549,13 @@ class WriteHandle(Handle):
 
     async def _upload_until_disconnect(self, stream: AsyncIterator[bytes]) -> None:
         if self._wait_disconnected is None:
-            await self._ops.upload_from_stream(stream, -1, self._path)
+            await self._store_upload(stream)
             return
 
         # AsyncSSH runs requests serially. If a write is waiting on a full
         # queue (or CLOSE is waiting on the backend), AsyncSSH cannot get
         # to its normal handle cleanup even when the channel is gone.
-        upload = asyncio.create_task(
-            self._ops.upload_from_stream(stream, -1, self._path)
-        )
+        upload = asyncio.create_task(self._store_upload(stream))
         disconnected = asyncio.ensure_future(self._wait_disconnected())
         try:
             done, _ = await asyncio.wait(
@@ -570,6 +570,14 @@ class WriteHandle(Handle):
             for task in (upload, disconnected):
                 task.cancel()
             await asyncio.gather(upload, disconnected, return_exceptions=True)
+
+    async def _store_upload(self, stream: AsyncIterator[bytes]) -> None:
+        if self._journal_file_ref:
+            await self._ops.upload_from_stream(
+                stream, -1, self._path, journal_file_ref=True
+            )
+        else:
+            await self._ops.upload_from_stream(stream, -1, self._path)
 
     def _raise_if_failed(self) -> None:
         if self._error is not None:
