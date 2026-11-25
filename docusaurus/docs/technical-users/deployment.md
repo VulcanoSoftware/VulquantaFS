@@ -22,7 +22,36 @@ VulquantaFS reads configuration and environment settings from standard environme
 
 The encryption passphrase is not read from a fixed environment variable; it is resolved through the `encryption` section of `config.yaml`, in this priority order: `passphrase_env` (the *name* of an environment variable to read, e.g. `VULQUANTAFS_MASTER_PASSPHRASE`), `passphrase_file` (a file containing the passphrase, useful for systemd `LoadCredential`), or inline `passphrase` (development only). The examples below assume `passphrase_env: "VULQUANTAFS_MASTER_PASSPHRASE"` as set in the bundled `demo-config.yaml`.
 
-*(Note: Legacy `TGFS_DATA_DIR` and `TGFS_CONFIG_FILE` environment variables are supported with a deprecation warning).*
+*(Note: the legacy `TGDCFS_DATA_DIR`/`TGDCFS_CONFIG_FILE` variables of the pre-rebrand releases and the older `TGFS_DATA_DIR`/`TGFS_CONFIG_FILE` ones are still read, with a deprecation warning).*
+
+### Upgrading a tgdcfs deployment
+
+VulquantaFS reads what tgdcfs wrote: a `config.yaml` with a top-level `tgdcfs:`
+block loads as `vulquantafs:` (with a deprecation warning), and encrypted
+metadata blobs, Telegram overflow markers and the master salt keep opening.
+Nothing has to be re-encrypted or migrated.
+
+What does change is where the files live. Outside Docker, the default data
+directory is `~/.vulquantafs`; if that directory does not exist yet and
+`~/.tgdcfs` does, the old directory is used in place, so `master.salt`,
+sessions and cache stay where they are. Move it to `~/.vulquantafs` when
+convenient and keep `master.salt` with it -- a new salt means a new master key.
+
+In Docker the image pins the data directory and runs as a different user, so
+remap the volume from the old path to `/home/vulquantafs/.vulquantafs`:
+
+```diff
+ docker run -d \
+   --name vulquantafs \
+-  -v ~/.tgdcfs:/home/tgdcfs/.tgdcfs \
+-  -v "$PWD/config.yaml:/home/tgdcfs/.tgdcfs/config.yaml:ro" \
++  -v ~/.tgdcfs:/home/vulquantafs/.vulquantafs \
++  -v "$PWD/config.yaml:/home/vulquantafs/.vulquantafs/config.yaml:ro" \
+   <namespace>/vulquantafs:latest
+```
+
+The same applies to the compose file: keep the host directory (and with it
+`master.salt`) and change only the container path.
 
 ---
 

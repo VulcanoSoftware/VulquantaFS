@@ -14,13 +14,13 @@
 
 // Docker Hub image without a tag, e.g. "vulcanosoftware/vulquantafs".
 export const DOCKERHUB_IMAGE =
-  process.env.NEXT_PUBLIC_DOCKERHUB_IMAGE || "xyvran/vulquantafs";
+  process.env.NEXT_PUBLIC_DOCKERHUB_IMAGE || "vulcanosoftware/vulquantafs";
 
 // GHCR image without a tag, e.g. "ghcr.io/vulcanosoftware/vulquantafs/vulquantafs".
 // The workflows publish it as ghcr.io/<owner>/<repo>/<image>.
 export const GHCR_IMAGE =
-  process.env.NEXT_PUBLIC_GHCR_IMAGE || "ghcr.io/xyvran/vulquantafs/vulquantafs";
+  process.env.NEXT_PUBLIC_GHCR_IMAGE || "ghcr.io/vulcanosoftware/vulquantafs/vulquantafs";
 
 // Root of this repository's GitHub Pages site, without a trailing slash.
 export const PAGES_URL =
-  process.env.NEXT_PUBLIC_PAGES_URL || "https://xyvran.github.io/vulquantafs";
+  process.env.NEXT_PUBLIC_PAGES_URL || "https://vulcanosoftware.github.io/VulquantaFS";

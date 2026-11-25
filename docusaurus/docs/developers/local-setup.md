@@ -26,7 +26,7 @@ Before starting, ensure your system has the following installed:
 Clone the VulquantaFS repository from GitHub to your local workstation:
 
 ```bash
-git clone https://github.com/Xyvran/vulquantafs.git
+git clone https://github.com/VulcanoSoftware/VulquantaFS.git
 cd vulquantafs
 ```
 

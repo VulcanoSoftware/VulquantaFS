@@ -5,7 +5,7 @@ import type { NextConfig } from "next";
 // <owner>/<repo>, and the Docker Hub namespace is DOCKERHUB_NAMESPACE with a
 // fallback to the owner. An unset or empty variable falls back to the
 // upstream, so a plain local build keeps working.
-const [owner, repo] = (process.env.GITHUB_REPOSITORY || "Xyvran/vulquantafs").split(
+const [owner, repo] = (process.env.GITHUB_REPOSITORY || "VulcanoSoftware/VulquantaFS").split(
   "/",
 );
 // Docker Hub namespaces and GHCR paths are lowercase, whatever case the

@@ -507,6 +507,22 @@ the fact on the commits that shipped them.
   their plaintext messages until the repository history is rewritten or the
   repository is replaced.
 
+### Changed
+
+- The repository is renamed from `VulcanoSoftware/tgdcfs` to
+  `VulcanoSoftware/VulquantaFS`. Nothing on disk changes for an existing
+  setup: the `tgdcfs:` / `tgfs:` config block, the `TGDCFSMETAV1_` metadata
+  blobs and the `TGDCFS_OVERFLOW` caption prefixes written by earlier
+  releases are still read, so a data set created under the old name keeps
+  opening and is upgraded in place. GitHub redirects the old repository and
+  clone URLs, but it does not redirect GitHub Pages project sites, so the
+  documentation and config generator move to
+  `https://vulcanosoftware.github.io/VulquantaFS/` and the old
+  `/tgdcfs/` address returns 404 -- update bookmarks. The GHCR image path
+  follows the repository name and is now
+  `ghcr.io/vulcanosoftware/vulquantafs/vulquantafs`; the Docker Hub image
+  `vulcanosoftware/vulquantafs` is unchanged.
+
 ## [0.6.1] - 2026-10-04
 
 ### Changed

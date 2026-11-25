@@ -19,7 +19,7 @@ GitHub's own context:
 * `github.repository_owner` is the GitHub username or organization that
   owns the repository in which the workflow is running. In a fork that is
   the fork's owner, never the upstream's.
-* `github.repository` is `<owner>/<repo>`, e.g. `VulcanoSoftware/vulquantafs`.
+* `github.repository` is `<owner>/<repo>`, e.g. `VulcanoSoftware/VulquantaFS`.
 
 Workflows use these like this:
 

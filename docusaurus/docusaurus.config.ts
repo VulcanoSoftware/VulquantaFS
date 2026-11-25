@@ -6,7 +6,7 @@ import type * as Preset from '@docusaurus/preset-classic';
 // under the same repository's coordinates: https://<owner>.github.io/<repo>/docs/.
 // Everything below follows GITHUB_REPOSITORY (set by the Pages workflow), so a
 // fork publishes its own docs without editing this file.
-const [owner, repo] = (process.env.GITHUB_REPOSITORY || 'Xyvran/vulquantafs').split('/');
+const [owner, repo] = (process.env.GITHUB_REPOSITORY || 'VulcanoSoftware/VulquantaFS').split('/');
 const ownerLower = owner.toLowerCase();
 // GitHub Pages serves under the repository's exact name, capitals
 // included: /VulquantaFS/ answers and the all-lowercase spelling is a 404.
