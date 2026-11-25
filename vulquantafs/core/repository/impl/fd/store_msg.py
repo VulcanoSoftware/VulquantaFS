@@ -1,7 +1,7 @@
 import asyncio
+import inspect
 import json
 import logging
-from itertools import chain
 from typing import Awaitable, Callable, Dict, List, Optional, Tuple
 
 from vulquantafs.backends.base import IStore
@@ -70,6 +70,83 @@ class StoreFDRepository(IFDRepository):
             and self._local_versions is not None
             and self._local_versions(version.id)
         )
+
+    @staticmethod
+    def _accepts(store, message_id: int) -> bool:
+        """Whether ``store`` can address ``message_id``.
+
+        Stores outside this package (a test double, an embedding app's own
+        implementation) may not carry the capability; they are trusted, the
+        way they were before it existed.
+        """
+        accepts = getattr(store, "accepts_message_id", None)
+        if accepts is None:
+            return True
+        answer = accepts(message_id)
+        if inspect.iscoroutine(answer):
+            # A double that answers every attribute with a mock coroutine.
+            answer.close()
+            return True
+        return bool(answer)
+
+    def _foreign_store_of(self, message_id: int) -> Optional[str]:
+        """The configured store an id can belong to, when this one cannot.
+
+        A descriptor written while another store was the primary records
+        its ids without a store -- "the primary", which tgfs always meant.
+        An id is only meaningful inside the store that issued it, though:
+        a 19-digit Discord snowflake can never name a Telegram message.
+        Asking the primary for one used to fail the whole batched request,
+        which cost every file read in the same window its descriptor and so
+        served it as an empty file, while its recorded size stayed correct.
+        """
+        if not message_id or self._accepts(self._message_api, message_id):
+            return None
+        group = self._mirror_group
+        if group is None:
+            return None
+        for key in group.store_keys:
+            store = group.store_for(key)
+            if store is not None and self._accepts(store, message_id):
+                return key
+        return None
+
+    def _rehome_ref(self, fr: TGFSFileRef) -> None:
+        """Point a ref whose id belongs elsewhere at that store."""
+        if not fr.owned_by(self.key):
+            return
+        key = self._foreign_store_of(fr.message_id)
+        if key is not None:
+            logger.warning(
+                f"File descriptor {fr.message_id} of {fr.name} cannot belong to "
+                f"{self.key}; reading it from {key}"
+            )
+            fr.store = key
+
+    def _rehome_versions(self, fd: TGFSFileDesc) -> None:
+        """Record the store that owns versions whose ids this one cannot hold."""
+        for version in fd.get_versions():
+            if not version.owned_by(self.key) or not version.message_ids:
+                continue
+            if any(
+                self._accepts(self._message_api, mid)
+                for mid in version.message_ids
+                if mid > 0
+            ):
+                continue
+            holders = {
+                key
+                for mid in version.message_ids
+                if mid > 0
+                if (key := self._foreign_store_of(mid)) is not None
+            }
+            if len(holders) != 1:
+                continue
+            version.store = holders.pop()
+            logger.warning(
+                f"Content of {fd.name}@{version.id} cannot live in {self.key}; "
+                f"reading it from {version.store}"
+            )
 
     @property
     def key(self) -> str:
@@ -306,17 +383,19 @@ class StoreFDRepository(IFDRepository):
         # Only ids that belong to this store are looked up here; a version
         # relocated from a former primary is checked against the mirrors.
 
-        all_ids = list(
-            chain(
-                *(
-                    version.message_ids
-                    for version in versions
-                    if version.owned_by(self.key)
-                )
-            )
-        )
+        all_ids = [
+            mid
+            for version in versions
+            if version.owned_by(self.key)
+            for mid in version.message_ids
+            # An id this store cannot hold is not a missing part: it belongs
+            # to another store's namespace and must never be sent here.
+            if self._accepts(self._message_api, mid)
+        ]
         try:
-            file_messages = await self._message_api.get_messages(all_ids)
+            file_messages = (
+                await self._message_api.get_messages(all_ids) if all_ids else []
+            )
         except Exception as ex:
             # An unreachable primary (banned channel, network down) must
             # not make every file look invalid while a mirror has it: treat
@@ -520,6 +599,15 @@ class StoreFDRepository(IFDRepository):
                     f"store {store_key}"
                 )
                 return mirror_message.text
+        if fr.store is not None and fr.store != self.key:
+            # Nothing was even asked: the ref names a store this file system
+            # does not have (a renamed or removed store). Say so instead of
+            # leaving a bare "not found" and an empty file behind it.
+            logger.warning(
+                f"File descriptor {fr.message_id} of {fr.name} is recorded in "
+                f"store {fr.store}, which is not configured here; it cannot be "
+                f"read from {self.key}"
+            )
         return None
 
     def _trust_recorded(self, fd: TGFSFileDesc) -> TGFSFileDesc:
@@ -548,6 +636,7 @@ class StoreFDRepository(IFDRepository):
         # After a promotion the ref may still describe the former primary;
         # re-express it relative to this store before touching anything.
         fr.relocate(self.key)
+        self._rehome_ref(fr)
         text = await self._get_fd_text(fr)
 
         if not text:
@@ -561,6 +650,7 @@ class StoreFDRepository(IFDRepository):
         fd = TGFSFileDesc.from_dict(json.loads(text), name=fr.name)
         for version in fd.get_versions():
             version.relocate(self.key)
+        self._rehome_versions(fd)
         if not validate:
             return self._trust_recorded(fd)
         return await self._validate_fv(fd, include_all_versions)

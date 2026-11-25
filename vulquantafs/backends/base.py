@@ -71,6 +71,11 @@ class StoreCapabilities:
     supports_bulk_delete: bool = True
     # Messages older than this cannot be bulk deleted (Discord: 14 days).
     delete_age_limit_days: Optional[int] = None
+    # Highest message id this backend can address. Telegram ids are signed
+    # 32-bit integers and Discord ids are 19-digit snowflakes, so an id
+    # recorded for one store can never name a message of the other. Used
+    # to spot an id that a descriptor attributes to the wrong store.
+    max_message_id: int = 2**63 - 1
 
 
 class IStore(metaclass=ABCMeta):
@@ -99,6 +104,16 @@ class IStore(metaclass=ABCMeta):
     def backend(self) -> str:
         """Backend name as used in the config (``telegram``, ``discord``)."""
         pass
+
+    def accepts_message_id(self, message_id: int) -> bool:
+        """Whether ``message_id`` can name a message of this store.
+
+        Ids are only meaningful inside the store that issued them; this
+        tells an id of another backend (a 19-digit Discord snowflake in a
+        Telegram channel) apart from a missing message, which is what lets
+        a caller look for the copy that actually holds it.
+        """
+        return 0 < message_id <= self.caps.max_message_id
 
     # -- text messages -----------------------------------------------------
 

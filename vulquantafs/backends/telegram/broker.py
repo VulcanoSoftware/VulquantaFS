@@ -2,7 +2,7 @@ import asyncio
 import logging
 from dataclasses import dataclass
 from functools import reduce
-from typing import List, Optional, Set
+from typing import Dict, List, Optional, Set, Tuple
 
 from vulquantafs.reqres import GetMessagesReq, GetMessagesResp, MessageResp
 from vulquantafs.utils.message_cache import channel_cache
@@ -13,6 +13,12 @@ from .interface import TDLibApi
 # the *first* pending request, so a steady stream of requests cannot keep
 # pushing the flush further out.
 DELAY = 0.5
+
+# Largest message id a Telegram channel can hold. MTProto encodes it as a
+# signed 32-bit integer, so a bigger id -- a 19-digit Discord snowflake that
+# reached a Telegram descriptor, or a corrupt file reference -- makes the
+# client fail while serializing the request, before anything is sent.
+MAX_MESSAGE_ID = 2**31 - 1
 
 
 logger = logging.getLogger(__name__)
@@ -98,27 +104,47 @@ class MessageBroker:
 
         ids: Set[int] = reduce(lambda full, req: full.union(req.ids), requests, set())
 
+        # An id this channel cannot hold is answered as missing without being
+        # sent: one such id in a batch used to make the client raise while
+        # encoding the request, which failed every request that happened to
+        # share the window -- including the reads of unrelated files, whose
+        # clients then received empty files.
+        foreign = {mid for mid in ids if not self.__addressable(mid)}
+        if foreign:
+            logger.warning(
+                f"Ignoring {len(foreign)} message id(s) that cannot belong to "
+                f"this Telegram channel: {sorted(foreign)[:5]}"
+            )
+
+        messages_map, failures = await self.__fetch(ids - foreign)
+
+        for r in requests:
+            if r.future.done():
+                continue
+            result = [
+                None if mid in foreign else messages_map.get(mid) for mid in r.ids
+            ]
+            # A request is only failed when nothing it asked for came back;
+            # one unusable id must not hide the messages next to it.
+            error = next((failures[mid] for mid in r.ids if mid in failures), None)
+            if error is not None and not any(msg is not None for msg in result):
+                r.future.set_exception(error)
+            else:
+                r.future.set_result(result)
+
+    @staticmethod
+    def __addressable(message_id: int) -> bool:
+        return 0 < message_id <= MAX_MESSAGE_ID
+
+    async def __fetch_batch(self, ids: Tuple[int, ...]) -> GetMessagesResp:
+        """Send one batch, moving to the next bot on failure."""
         e: Optional[Exception] = None
         bot = self.tdlib.next_bot
         for _ in range(self.__bots_count):
             try:
-
-                messages = await bot.get_messages(
-                    GetMessagesReq(
-                        chat=self.private_file_channel, message_ids=tuple(ids)
-                    )
+                return await bot.get_messages(
+                    GetMessagesReq(chat=self.private_file_channel, message_ids=ids)
                 )
-
-                messages_map = {
-                    msg.message_id: msg for msg in messages if msg is not None
-                }
-
-                for r in requests:
-                    if not r.future.done():
-                        r.future.set_result(
-                            [messages_map.get(msg_id) for msg_id in r.ids]
-                        )
-                return
             except Exception as ex:
                 e = ex
                 me = await bot.get_me()
@@ -126,12 +152,41 @@ class MessageBroker:
                     f"{me.name} failed to get messages: {ex}, retrying with next bot..."
                 )
                 bot = self.tdlib.next_bot
-        if not e:
-            return
+        if e is None:
+            raise RuntimeError("no bot was available to get messages")
+        logger.error(f"All bots failed to get messages: {e}")
+        raise e
 
-        logger.error(
-            "All bots failed to get messages, propagating exception to all requests."
-        )
-        for request in requests:
-            if e and not request.future.done():
-                request.future.set_exception(e)
+    async def __fetch(
+        self, ids: Set[int]
+    ) -> Tuple[Dict[int, MessageResp], Dict[int, Exception]]:
+        """Fetch ``ids``, isolating the ids that cannot be fetched.
+
+        The batch is retried on another bot as a whole first, so a bot that
+        is down still costs one request per batch. Only when every bot
+        refuses the batch is it split and each half tried on its own: a
+        single id the channel rejects then fails just the requests that
+        asked for it instead of every request in the window.
+        """
+        if not ids:
+            return {}, {}
+        ordered = tuple(sorted(ids))
+        try:
+            messages = await self.__fetch_batch(ordered)
+        except Exception as ex:
+            if len(ordered) == 1:
+                return {}, {ordered[0]: ex}
+            middle = len(ordered) // 2
+            found: Dict[int, MessageResp] = {}
+            failed: Dict[int, Exception] = {}
+            for half in (ordered[:middle], ordered[middle:]):
+                half_found, half_failed = await self.__fetch(set(half))
+                found.update(half_found)
+                failed.update(half_failed)
+            if failed:
+                logger.warning(
+                    f"{len(failed)} of {len(ordered)} message id(s) could not "
+                    f"be fetched; the other {len(found)} were served"
+                )
+            return found, failed
+        return {msg.message_id: msg for msg in messages if msg is not None}, {}

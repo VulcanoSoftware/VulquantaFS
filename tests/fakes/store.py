@@ -59,6 +59,9 @@ class FakeStore(IStore):
     backend_name: str = "fake"
     max_part_bytes: int = 1 << 30
     max_text_chars: int = 4096
+    # Highest id the store can address. Set a small one on a "Telegram"
+    # fake to make a 19-digit Discord snowflake unaddressable there.
+    max_message_id: int = 1 << 62
     server_copy: bool = True
     deleted_on_remove: bool = True
     fail: Set[str] = field(default_factory=set)
@@ -109,6 +112,7 @@ class FakeStore(IStore):
             max_part_bytes=self.max_part_bytes,
             max_text_chars=self.max_text_chars,
             supports_server_copy=self.server_copy,
+            max_message_id=self.max_message_id,
         )
 
     async def send_text(self, message: str) -> int:

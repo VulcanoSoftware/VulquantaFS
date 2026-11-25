@@ -588,6 +588,22 @@ class FileApi:
 
             return empty_file()
         fv = fd.get_latest_version()
+        if not fv.message_ids and not fv.pending:
+            # No readable version: either the descriptor itself could not be
+            # read, or every content message it lists is gone. Serving that
+            # as a zero-byte file made a broken read look like a successful
+            # download of an empty file, while the size in the listing kept
+            # showing the real one. An error lets the client retry.
+            recorded = fr.stat.size if fr.stat is not None else 0
+            if not fd.complete or recorded > 0:
+                raise TechnicalError(
+                    f"{fr.name} has no readable version: "
+                    + (
+                        "its file descriptor could not be read"
+                        if not fd.complete
+                        else f"none of its {recorded} bytes are still stored"
+                    )
+                )
 
         async def chunks():
             try:

@@ -59,7 +59,7 @@ from vulquantafs.utils.message_cache import MessageCache
 from vulquantafs.utils.others import exclude_none
 from vulquantafs.utils.prefetching_chain import prefetching_chain
 
-from .broker import MessageBroker
+from .broker import MAX_MESSAGE_ID, MessageBroker
 from .interface import TDLibApi, bounded_part
 from .uploader import FileUploader
 
@@ -174,6 +174,7 @@ class TelegramStore(MessageBroker, IStore):
             ),
             max_text_chars=MAX_TEXT_CHARS,
             supports_server_copy=True,
+            max_message_id=MAX_MESSAGE_ID,
         )
 
     @staticmethod

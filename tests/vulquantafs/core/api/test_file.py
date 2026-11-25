@@ -11,6 +11,7 @@ from vulquantafs.core.model import (
     TGFSFileDesc,
     TGFSFileRef,
     TGFSFileVersion,
+    FileStat,
 )
 from vulquantafs.errors import (
     FileOrDirectoryAlreadyExists,
@@ -604,6 +605,50 @@ class TestFileApi:
 
         assert chunks == [b""]
         mock_file_desc_api.get_file_desc.assert_called_once_with(sample_file_ref, False)
+
+    @pytest.mark.asyncio
+    async def test_retrieve_refuses_to_serve_an_unreadable_descriptor(
+        self, file_api, mock_file_desc_api, sample_file_ref
+    ):
+        """A descriptor that could not be read is an error, not an empty file.
+
+        Serving the stand-in as zero bytes made a broken read look like a
+        successful download of an empty file, while the listing kept showing
+        the size the descriptor recorded.
+        """
+        unreadable = TGFSFileDesc.empty("broken.txt")
+        unreadable.complete = False
+        mock_file_desc_api.get_file_desc.return_value = unreadable
+
+        with pytest.raises(TechnicalError, match="descriptor could not be read"):
+            await file_api.retrieve(sample_file_ref, 0, -1, "broken.txt")
+
+    @pytest.mark.asyncio
+    async def test_retrieve_refuses_a_file_whose_parts_are_all_gone(
+        self, file_api, mock_file_desc_api, sample_file_ref
+    ):
+        sample_file_ref.stat = FileStat(size=524288, created_at=0, modified_at=0)
+        mock_file_desc_api.get_file_desc.return_value = TGFSFileDesc.empty("gone.txt")
+
+        with pytest.raises(TechnicalError, match="524288 bytes are still stored"):
+            await file_api.retrieve(sample_file_ref, 0, -1, "gone.txt")
+
+    @pytest.mark.asyncio
+    async def test_retrieve_still_serves_a_file_that_is_really_empty(
+        self, file_api, mock_file_desc_api, sample_file_ref
+    ):
+        sample_file_ref.stat = FileStat(size=0, created_at=0, modified_at=0)
+        mock_file_desc_api.get_file_desc.return_value = TGFSFileDesc.empty("empty.txt")
+
+        async def no_chunks():
+            return
+            yield b""  # pragma: no cover
+
+        mock_file_desc_api.download_file_at_version.return_value = no_chunks()
+
+        result = await file_api.retrieve(sample_file_ref, 0, -1, "empty.txt")
+
+        assert [chunk async for chunk in result] == []
 
     @pytest.mark.asyncio
     async def test_retrieve_regular_file(

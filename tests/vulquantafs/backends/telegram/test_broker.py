@@ -28,15 +28,25 @@ class FakeBot:
     short-circuit be exercised.
     """
 
-    def __init__(self, name: str = "bot", fail: Optional[Exception] = None):
+    def __init__(
+        self,
+        name: str = "bot",
+        fail: Optional[Exception] = None,
+        reject: Sequence[int] = (),
+    ):
         self.name = name
         self.fail = fail
+        # Ids this bot refuses, the way Telegram rejects an id it cannot
+        # address; the rest of a batch is fine on its own.
+        self.reject = set(reject)
         self.batches: List[tuple] = []
 
     async def get_messages(self, req) -> GetMessagesResp:
         self.batches.append(tuple(sorted(req.message_ids)))
         if self.fail:
             raise self.fail
+        if self.reject.intersection(req.message_ids):
+            raise RuntimeError("id rejected")
         messages = [_message(mid) for mid in req.message_ids]
         cache = channel_cache(req.chat).id
         for message in messages:
@@ -163,3 +173,49 @@ class TestFailover:
 
         with pytest.raises(RuntimeError, match="boom"):
             await broker.get_messages([1])
+
+
+class TestPoisonedBatch:
+    """One unusable id must not cost the other requests in the window.
+
+    A descriptor can name a 19-digit Discord snowflake while it is fed to
+    the Telegram channel (written when the other store was the primary).
+    MTProto cannot encode that id at all, so the request used to fail
+    before it left, and every file whose descriptor shared the batch was
+    served as an empty file although its parts were in the channel.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_foreign_id_is_answered_missing_and_never_sent(self):
+        bot = FakeBot()
+        broker = _broker(bot)
+
+        result = await broker.get_messages([1, 1574871427142914142])
+
+        assert bot.batches == [(1,)]
+        assert result[0] is not None and result[0].message_id == 1
+        assert result[1] is None
+
+    @pytest.mark.asyncio
+    async def test_a_rejected_id_does_not_fail_the_other_requests(self):
+        bot = FakeBot(reject=[42])
+        broker = _broker(bot)
+
+        good, bad = await asyncio.gather(
+            broker.get_messages([1, 2]),
+            broker.get_messages([42]),
+            return_exceptions=True,
+        )
+
+        assert _ids(good) == [1, 2]
+        assert isinstance(bad, RuntimeError)
+
+    @pytest.mark.asyncio
+    async def test_a_request_sharing_a_rejected_id_keeps_its_other_ids(self):
+        bot = FakeBot(reject=[42])
+        broker = _broker(bot)
+
+        result = await broker.get_messages([7, 42])
+
+        assert result[0] is not None and result[0].message_id == 7
+        assert result[1] is None
