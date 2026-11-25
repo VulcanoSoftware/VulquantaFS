@@ -53,7 +53,31 @@ README = Path(__file__).resolve().parent.parent / "README.md"
 START = "<!-- badges-start -->"
 END = "<!-- badges-end -->"
 
-UPSTREAM_REPOSITORY = "Xyvran/vulquantafs"
+UPSTREAM_REPOSITORY = "VulcanoSoftware/tgdcfs"
+
+# Names this repository carried before it was renamed. A README written under
+# one of them still links to ``<owner>.github.io/<old name>/``; the current
+# name from GITHUB_REPOSITORY no longer matches those links, so they must be
+# recognised by name here.
+LEGACY_REPOSITORY_NAMES = ("VulquantaFS", "vulquantafs")
+
+# Paths only this project's own Pages site serves. A Pages link that points at
+# one of them is ours whatever repository name it carries, so a rename that is
+# not listed above still heals, while an unrelated ``*.github.io`` link
+# (someone's blog, say) is left alone.
+SITE_PATHS = ("docs", "getting-started", "config-generator")
+
+
+def _pages_link_pattern(repo_name: str) -> "re.Pattern[str]":
+    names = {repo_name, UPSTREAM_REPOSITORY.split("/", 1)[1], *LEGACY_REPOSITORY_NAMES}
+    known = "|".join(re.escape(n) for n in sorted(names, key=len, reverse=True))
+    site_paths = "|".join(re.escape(p) for p in SITE_PATHS)
+    return re.compile(
+        r"https://[A-Za-z0-9-]+\.github\.io/"
+        r"(?:(?:" + known + r")(?![\w-])"
+        r"|[A-Za-z0-9._-]+(?=/(?:" + site_paths + r")(?![\w-])))",
+        re.IGNORECASE,
+    )
 
 
 def _canonical_pages_site(repository: str) -> str:
@@ -76,14 +100,11 @@ def sync_text(
 
     pages_site = _canonical_pages_site(repository)
     # Any Pages URL for this repository -- the upstream's, this fork's, or a
-    # stale one left behind by a rename or by an all-lowercase writing --
-    # is normalized to the current coordinates. Case-insensitive, because
-    # GITHUB_REPOSITORY carries the display name (``VulquantaFS``) while
-    # the links may spell the same repository ``vulquantafs``.
-    pages_link = re.compile(
-        r"https://[A-Za-z0-9-]+\.github\.io/" + re.escape(repo_name) + r"(?![\w-])",
-        re.IGNORECASE,
-    )
+    # stale one left behind by an owner change, a repository rename or an
+    # all-lowercase writing -- is normalized to the current coordinates.
+    # Case-insensitive, because GITHUB_REPOSITORY carries the display name
+    # while the links may spell the same repository in lowercase.
+    pages_link = _pages_link_pattern(repo_name)
     # The Docker Hub URL in the README. Like the Pages links it is written
     # by hand, so any namespace it carries -- the upstream's, a fork's own
     # or a stale one -- is normalized to this repository's own.

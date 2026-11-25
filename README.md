@@ -14,9 +14,9 @@
 Telegram and Discord as storage backends behind one WebDAV and SFTP
 server.
 
-[Documentation](https://vecstack-prog.github.io/VulquantaFS/docs/) ·
-[Getting started](https://vecstack-prog.github.io/VulquantaFS/getting-started/) ·
-[Config generator](https://vecstack-prog.github.io/VulquantaFS/config-generator/) ·
+[Documentation](https://vulcanosoftware.github.io/tgdcfs/docs/) ·
+[Getting started](https://vulcanosoftware.github.io/tgdcfs/getting-started/) ·
+[Config generator](https://vulcanosoftware.github.io/tgdcfs/config-generator/) ·
 [Docker Hub](https://hub.docker.com/r/vulcanosoftware/vulquantafs)
 
 </div>
@@ -36,30 +36,30 @@ server.
 
 1. Create the Telegram app, bots and channels (and optionally the Discord
    bot) with the
-   [getting-started guide](https://vecstack-prog.github.io/VulquantaFS/getting-started/).
+   [getting-started guide](https://vulcanosoftware.github.io/tgdcfs/getting-started/).
 2. Write your `config.yaml` in the browser with the
-   [config generator](https://vecstack-prog.github.io/VulquantaFS/config-generator/)
+   [config generator](https://vulcanosoftware.github.io/tgdcfs/config-generator/)
    — nothing you type leaves the page.
 3. Run the server: the
-   [deployment guide](https://vecstack-prog.github.io/VulquantaFS/docs/technical-users/deployment/)
+   [deployment guide](https://vulcanosoftware.github.io/tgdcfs/docs/technical-users/deployment/)
    covers Docker, docker-compose, systemd and Kubernetes, and
-   [connecting clients](https://vecstack-prog.github.io/VulquantaFS/docs/users/connecting-clients/)
+   [connecting clients](https://vulcanosoftware.github.io/tgdcfs/docs/users/connecting-clients/)
    lists the tested WebDAV and SFTP apps.
 
 ## Documentation
 
 | Topic | Guide |
 |---|---|
-| Architecture: backends, stores, file systems | [Technical Architecture Overview](https://vecstack-prog.github.io/VulquantaFS/docs/technical-users/) |
-| Full `config.yaml` reference (stores, file systems, Discord, SFTP, listing) | [Complete Configuration Reference](https://vecstack-prog.github.io/VulquantaFS/docs/technical-users/configuration/) |
-| Connecting WebDAV and SFTP clients | [Connecting Clients](https://vecstack-prog.github.io/VulquantaFS/docs/users/connecting-clients/) |
-| Mirroring, redundancy and the promotion runbook | [Redundancy, Mirroring & Disaster Recovery](https://vecstack-prog.github.io/VulquantaFS/docs/technical-users/redundancy-and-mirroring/) |
-| Local cache, transfer tuning and large folders | [Local Cache & Performance Tuning](https://vecstack-prog.github.io/VulquantaFS/docs/technical-users/cache-and-performance/) |
-| At-rest encryption, master salt and passphrase | [Security & At-Rest Encryption](https://vecstack-prog.github.io/VulquantaFS/docs/technical-users/encryption/) |
-| Manager API and Telegram Mini App | [Management API](https://vecstack-prog.github.io/VulquantaFS/docs/technical-users/management-api/) · [Telegram Mini App](https://vecstack-prog.github.io/VulquantaFS/docs/users/mini-app/) |
-| Deployment with Docker, compose, systemd or Kubernetes | [Deployment](https://vecstack-prog.github.io/VulquantaFS/docs/technical-users/deployment/) |
-| Fork setup: publish under your own name | [Fork Setup & Self-Publishing](https://vecstack-prog.github.io/VulquantaFS/docs/developers/fork-setup/) |
-| Questions and known issues | [FAQ](https://vecstack-prog.github.io/VulquantaFS/docs/users/faq/) |
+| Architecture: backends, stores, file systems | [Technical Architecture Overview](https://vulcanosoftware.github.io/tgdcfs/docs/technical-users/) |
+| Full `config.yaml` reference (stores, file systems, Discord, SFTP, listing) | [Complete Configuration Reference](https://vulcanosoftware.github.io/tgdcfs/docs/technical-users/configuration/) |
+| Connecting WebDAV and SFTP clients | [Connecting Clients](https://vulcanosoftware.github.io/tgdcfs/docs/users/connecting-clients/) |
+| Mirroring, redundancy and the promotion runbook | [Redundancy, Mirroring & Disaster Recovery](https://vulcanosoftware.github.io/tgdcfs/docs/technical-users/redundancy-and-mirroring/) |
+| Local cache, transfer tuning and large folders | [Local Cache & Performance Tuning](https://vulcanosoftware.github.io/tgdcfs/docs/technical-users/cache-and-performance/) |
+| At-rest encryption, master salt and passphrase | [Security & At-Rest Encryption](https://vulcanosoftware.github.io/tgdcfs/docs/technical-users/encryption/) |
+| Manager API and Telegram Mini App | [Management API](https://vulcanosoftware.github.io/tgdcfs/docs/technical-users/management-api/) · [Telegram Mini App](https://vulcanosoftware.github.io/tgdcfs/docs/users/mini-app/) |
+| Deployment with Docker, compose, systemd or Kubernetes | [Deployment](https://vulcanosoftware.github.io/tgdcfs/docs/technical-users/deployment/) |
+| Fork setup: publish under your own name | [Fork Setup & Self-Publishing](https://vulcanosoftware.github.io/tgdcfs/docs/developers/fork-setup/) |
+| Questions and known issues | [FAQ](https://vulcanosoftware.github.io/tgdcfs/docs/users/faq/) |
 
 ## Development
 
@@ -68,7 +68,7 @@ poetry install
 poetry run python main.py
 ```
 
-The [developer guide](https://vecstack-prog.github.io/VulquantaFS/docs/developers/)
+The [developer guide](https://vulcanosoftware.github.io/tgdcfs/docs/developers/)
 covers the local setup, the test suite, the CI workflows, the release
 process and the preview builds. Releases follow
 [SemVer](https://semver.org/) and are recorded in
@@ -83,7 +83,7 @@ Docker images publish under `${{ github.repository_owner }}`, and the
 coordinates on the first push. If your Docker Hub namespace differs from
 your GitHub username, set the repository variable `DOCKERHUB_NAMESPACE` as
 described in the
-[fork setup guide](https://vecstack-prog.github.io/VulquantaFS/docs/developers/fork-setup/).
+[fork setup guide](https://vulcanosoftware.github.io/tgdcfs/docs/developers/fork-setup/).
 
 </details>
 

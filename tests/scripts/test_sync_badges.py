@@ -72,4 +72,44 @@ def test_a_missing_badge_block_is_an_error():
 
 
 def test_the_default_repository_is_the_upstream():
-    assert sync_badges.UPSTREAM_REPOSITORY == "Xyvran/vulquantafs"
+    assert sync_badges.UPSTREAM_REPOSITORY == "VulcanoSoftware/tgdcfs"
+
+
+README_AFTER_RENAME = """\
+{start}
+{end}
+
+[Documentation](https://vecstack-prog.github.io/VulquantaFS/docs/) ·
+[Getting started](https://vecstack-prog.github.io/VulquantaFS/getting-started/) ·
+[Config generator](https://vecstack-prog.github.io/VulquantaFS/config-generator/)
+[Fork setup](https://vecstack-prog.github.io/VulquantaFS/docs/developers/fork-setup/)
+[Blog](https://someone.github.io/portfolio/)
+"""
+
+
+def test_links_written_under_the_old_owner_and_name_follow_a_rename():
+    synced = sync("VulcanoSoftware/tgdcfs", README_AFTER_RENAME)
+    assert "vecstack-prog" not in synced
+    assert "VulquantaFS" not in synced
+    assert "https://vulcanosoftware.github.io/tgdcfs/docs/)" in synced
+    assert "https://vulcanosoftware.github.io/tgdcfs/getting-started/)" in synced
+    assert "https://vulcanosoftware.github.io/tgdcfs/config-generator/)" in synced
+    assert "https://vulcanosoftware.github.io/tgdcfs/docs/developers/fork-setup/" in synced
+
+
+def test_site_links_under_an_unlisted_old_name_are_healed_too():
+    text = README_AFTER_RENAME.replace("VulquantaFS", "SomeOtherOldName")
+    synced = sync("VulcanoSoftware/tgdcfs", text)
+    assert "SomeOtherOldName" not in synced
+    assert "https://vulcanosoftware.github.io/tgdcfs/docs/)" in synced
+
+
+def test_unrelated_github_io_links_are_left_alone():
+    synced = sync("VulcanoSoftware/tgdcfs", README_AFTER_RENAME)
+    assert "https://someone.github.io/portfolio/" in synced
+
+
+def test_the_sync_is_idempotent():
+    once = sync("VulcanoSoftware/tgdcfs", README_AFTER_RENAME)
+    again = sync_badges.sync_text(once, "VulcanoSoftware/tgdcfs", "master")
+    assert again == once
