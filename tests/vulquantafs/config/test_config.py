@@ -17,6 +17,7 @@ from vulquantafs.config import (
     TransferConfig,
     UserConfig,
     WebDAVConfig,
+    _default_data_dir,
     _env_with_legacy_fallback,
 )
 
@@ -530,33 +531,89 @@ class TestConfig:
 class TestLegacyEnvironmentFallback:
     def test_new_name_wins(self, monkeypatch):
         monkeypatch.setenv("VULQUANTAFS_TEST_VAR", "new")
+        monkeypatch.setenv("TGDCFS_TEST_VAR", "older")
         monkeypatch.setenv("TGFS_TEST_VAR", "old")
         assert (
             _env_with_legacy_fallback(
-                "VULQUANTAFS_TEST_VAR", "TGFS_TEST_VAR", "default"
+                "VULQUANTAFS_TEST_VAR",
+                "TGDCFS_TEST_VAR",
+                "TGFS_TEST_VAR",
+                default="default",
             )
             == "new"
         )
 
-    def test_legacy_name_is_used_when_new_name_is_missing(self, monkeypatch):
+    def test_the_tgdcfs_name_is_used_when_the_new_name_is_missing(self, monkeypatch):
+        # A container started before the rebrand sets TGDCFS_DATA_DIR; it has
+        # to keep finding the data directory it has always used.
         monkeypatch.delenv("VULQUANTAFS_TEST_VAR", raising=False)
+        monkeypatch.setenv("TGDCFS_TEST_VAR", "older")
         monkeypatch.setenv("TGFS_TEST_VAR", "old")
         assert (
             _env_with_legacy_fallback(
-                "VULQUANTAFS_TEST_VAR", "TGFS_TEST_VAR", "default"
+                "VULQUANTAFS_TEST_VAR",
+                "TGDCFS_TEST_VAR",
+                "TGFS_TEST_VAR",
+                default="default",
+            )
+            == "older"
+        )
+
+    def test_the_tgfs_name_is_used_when_both_newer_names_are_missing(self, monkeypatch):
+        monkeypatch.delenv("VULQUANTAFS_TEST_VAR", raising=False)
+        monkeypatch.delenv("TGDCFS_TEST_VAR", raising=False)
+        monkeypatch.setenv("TGFS_TEST_VAR", "old")
+        assert (
+            _env_with_legacy_fallback(
+                "VULQUANTAFS_TEST_VAR",
+                "TGDCFS_TEST_VAR",
+                "TGFS_TEST_VAR",
+                default="default",
             )
             == "old"
         )
 
-    def test_default_when_neither_is_set(self, monkeypatch):
-        monkeypatch.delenv("VULQUANTAFS_TEST_VAR", raising=False)
-        monkeypatch.delenv("TGFS_TEST_VAR", raising=False)
+    def test_default_when_none_is_set(self, monkeypatch):
+        for name in ("VULQUANTAFS_TEST_VAR", "TGDCFS_TEST_VAR", "TGFS_TEST_VAR"):
+            monkeypatch.delenv(name, raising=False)
         assert (
             _env_with_legacy_fallback(
-                "VULQUANTAFS_TEST_VAR", "TGFS_TEST_VAR", "default"
+                "VULQUANTAFS_TEST_VAR",
+                "TGDCFS_TEST_VAR",
+                "TGFS_TEST_VAR",
+                default="default",
             )
             == "default"
         )
+
+
+class TestDefaultDataDirectory:
+    """A tgdcfs install keeps its master salt in ~/.tgdcfs.
+
+    Booting into a fresh ~/.vulquantafs would create a new salt, derive a
+    different master key and leave every encrypted file unreadable, so the
+    legacy directory is reused as long as the new one does not exist.
+    """
+
+    @staticmethod
+    def _home(tmp_path, monkeypatch):
+        monkeypatch.setenv("HOME", str(tmp_path))
+        return tmp_path
+
+    def test_the_current_directory_is_used_when_it_exists(self, tmp_path, monkeypatch):
+        home = self._home(tmp_path, monkeypatch)
+        (home / ".vulquantafs").mkdir()
+        (home / ".tgdcfs").mkdir()
+        assert _default_data_dir() == str(home / ".vulquantafs")
+
+    def test_an_existing_tgdcfs_directory_is_used_in_place(self, tmp_path, monkeypatch):
+        home = self._home(tmp_path, monkeypatch)
+        (home / ".tgdcfs").mkdir()
+        assert _default_data_dir() == str(home / ".tgdcfs")
+
+    def test_a_fresh_install_gets_the_current_directory(self, tmp_path, monkeypatch):
+        home = self._home(tmp_path, monkeypatch)
+        assert _default_data_dir() == str(home / ".vulquantafs")
 
 
 class TestConfigFunctions:

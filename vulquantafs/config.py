@@ -12,29 +12,58 @@ from vulquantafs.backends import BACKEND_NAMES, BACKEND_PREFIXES, make_store_key
 logger = logging.getLogger(__name__)
 
 
-def _env_with_legacy_fallback(name: str, legacy_name: str, default: str) -> str:
-    """Read ``name`` from the environment, falling back to the tgfs name.
+def _env_with_legacy_fallback(name: str, *legacy_names: str, default: str) -> str:
+    """Read ``name`` from the environment, falling back to the older names.
 
-    vulquantafs started as a copy of tgfs, whose deployments set ``TGFS_*``
-    variables. Those keep working for now so an existing container can be
-    switched to the vulquantafs image without touching its environment; the
+    The project was called ``tgdcfs`` before VulquantaFS, and before that it
+    was a copy of ``tgfs``, so deployments in the wild set ``TGDCFS_*`` or
+    ``TGFS_*`` variables. Both keep working so an existing container can be
+    switched to the vulquantafs image without touching its environment; a
     fallback logs a deprecation warning and is scheduled for removal.
     """
-    if (value := os.environ.get(name)) is not None:
-        return value
-    if (value := os.environ.get(legacy_name)) is not None:
-        logger.warning(
-            f"Environment variable {legacy_name} is deprecated, use {name} instead"
-        )
-        return value
+    for candidate in (name, *legacy_names):
+        if (value := os.environ.get(candidate)) is not None:
+            if candidate != name:
+                logger.warning(
+                    f"Environment variable {candidate} is deprecated, "
+                    f"use {name} instead"
+                )
+            return value
     return default
 
 
-DATA_DIR = _env_with_legacy_fallback(
-    "VULQUANTAFS_DATA_DIR", "TGFS_DATA_DIR", os.path.expanduser("~/.vulquantafs")
+def _default_data_dir() -> str:
+    """The data directory used when the environment does not name one.
+
+    ``~/.vulquantafs`` is the current default, but a tgdcfs deployment kept
+    its sessions, host keys and -- crucially -- ``master.salt`` in
+    ``~/.tgdcfs``. Starting in a brand-new directory would create a fresh
+    salt, derive a different master key and leave every encrypted file
+    unreadable, so an existing legacy directory is used in place (and left
+    alone) until the operator moves it.
+    """
+    current = os.path.expanduser("~/.vulquantafs")
+    legacy = os.path.expanduser("~/.tgdcfs")
+    if not os.path.exists(current) and os.path.isdir(legacy):
+        logger.warning(
+            f"Using the legacy data directory {legacy}; move it to {current} "
+            f"when convenient and keep master.salt with it"
+        )
+        return legacy
+    return current
+
+
+DATA_DIR = (
+    _env_with_legacy_fallback(
+        "VULQUANTAFS_DATA_DIR", "TGDCFS_DATA_DIR", "TGFS_DATA_DIR", default=""
+    )
+    or _default_data_dir()
 )
 CONFIG_FILE = _env_with_legacy_fallback(
-    "VULQUANTAFS_CONFIG_FILE", "TGFS_CONFIG_FILE", "config.yaml"
+    "VULQUANTAFS_CONFIG_FILE",
+    "TGDCFS_CONFIG_FILE",
+    "TGFS_CONFIG_FILE",
+    default="config.yaml",
 )
 
 

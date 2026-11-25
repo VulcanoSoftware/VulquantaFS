@@ -15,7 +15,7 @@ We welcome contributions from the developer community! Follow this guide to set 
 To contribute code to VulquantaFS, you should create a personal fork of the main repository.
 
 ### 1. Fork the Repository
-1. Navigate to the main repository at [https://github.com/Xyvran/vulquantafs](https://github.com/Xyvran/vulquantafs).
+1. Navigate to the main repository at [https://github.com/VulcanoSoftware/VulquantaFS](https://github.com/VulcanoSoftware/VulquantaFS).
 2. Click the **Fork** button in the top-right corner to create a copy under your GitHub user account (e.g., `github.com/your-username/vulquantafs`).
 
 ### 2. Clone Your Fork Locally
@@ -28,7 +28,7 @@ cd vulquantafs
 ### 3. Add the Upstream Remote
 Configure the original repository as an `upstream` remote so you can sync changes from `master`:
 ```bash
-git remote add upstream https://github.com/Xyvran/vulquantafs.git
+git remote add upstream https://github.com/VulcanoSoftware/VulquantaFS.git
 git remote -v
 ```
 
@@ -122,7 +122,7 @@ git push origin feature/your-feature-name
 ```
 
 ### Step 6: Open a Pull Request
-Go to the [Xyvran/vulquantafs GitHub Repository](https://github.com/Xyvran/vulquantafs) and open a Pull Request targeting `master`.
+Go to the [Xyvran/vulquantafs GitHub Repository](https://github.com/VulcanoSoftware/VulquantaFS) and open a Pull Request targeting `master`.
 
 ---
 

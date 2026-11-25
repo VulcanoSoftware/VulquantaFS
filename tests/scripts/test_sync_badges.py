@@ -72,7 +72,7 @@ def test_a_missing_badge_block_is_an_error():
 
 
 def test_the_default_repository_is_the_upstream():
-    assert sync_badges.UPSTREAM_REPOSITORY == "VulcanoSoftware/tgdcfs"
+    assert sync_badges.UPSTREAM_REPOSITORY == "VulcanoSoftware/VulquantaFS"
 
 
 README_AFTER_RENAME = """\
@@ -88,28 +88,50 @@ README_AFTER_RENAME = """\
 
 
 def test_links_written_under_the_old_owner_and_name_follow_a_rename():
-    synced = sync("VulcanoSoftware/tgdcfs", README_AFTER_RENAME)
+    synced = sync("VulcanoSoftware/VulquantaFS", README_AFTER_RENAME)
     assert "vecstack-prog" not in synced
-    assert "VulquantaFS" not in synced
-    assert "https://vulcanosoftware.github.io/tgdcfs/docs/)" in synced
-    assert "https://vulcanosoftware.github.io/tgdcfs/getting-started/)" in synced
-    assert "https://vulcanosoftware.github.io/tgdcfs/config-generator/)" in synced
-    assert "https://vulcanosoftware.github.io/tgdcfs/docs/developers/fork-setup/" in synced
+    assert "https://vulcanosoftware.github.io/VulquantaFS/docs/)" in synced
+    assert "https://vulcanosoftware.github.io/VulquantaFS/getting-started/)" in synced
+    assert "https://vulcanosoftware.github.io/VulquantaFS/config-generator/)" in synced
+    assert "https://vulcanosoftware.github.io/VulquantaFS/docs/developers/fork-setup/" in synced
+
+
+# A README committed while the repository was still called ``tgdcfs``. GitHub
+# Pages does not redirect the old project-site URL, so every pre-rename link
+# has to be recognised and repointed by name.
+README_BEFORE_RENAME = """\
+{start}
+{end}
+
+[Documentation](https://vulcanosoftware.github.io/tgdcfs/docs/) ·
+[Getting started](https://vulcanosoftware.github.io/tgdcfs/getting-started/) ·
+[Config generator](https://vulcanosoftware.github.io/tgdcfs/config-generator/)
+[Fork setup](https://vulcanosoftware.github.io/tgdcfs/docs/developers/fork-setup/)
+"""
+
+
+def test_a_readme_written_under_the_legacy_name_heals_to_the_new_one():
+    synced = sync("VulcanoSoftware/VulquantaFS", README_BEFORE_RENAME)
+    assert "tgdcfs" not in synced
+    assert "https://vulcanosoftware.github.io/VulquantaFS/docs/)" in synced
+    assert "https://vulcanosoftware.github.io/VulquantaFS/getting-started/)" in synced
+    assert "https://vulcanosoftware.github.io/VulquantaFS/config-generator/)" in synced
+    assert "https://vulcanosoftware.github.io/VulquantaFS/docs/developers/fork-setup/" in synced
 
 
 def test_site_links_under_an_unlisted_old_name_are_healed_too():
     text = README_AFTER_RENAME.replace("VulquantaFS", "SomeOtherOldName")
-    synced = sync("VulcanoSoftware/tgdcfs", text)
+    synced = sync("VulcanoSoftware/VulquantaFS", text)
     assert "SomeOtherOldName" not in synced
-    assert "https://vulcanosoftware.github.io/tgdcfs/docs/)" in synced
+    assert "https://vulcanosoftware.github.io/VulquantaFS/docs/)" in synced
 
 
 def test_unrelated_github_io_links_are_left_alone():
-    synced = sync("VulcanoSoftware/tgdcfs", README_AFTER_RENAME)
+    synced = sync("VulcanoSoftware/VulquantaFS", README_AFTER_RENAME)
     assert "https://someone.github.io/portfolio/" in synced
 
 
 def test_the_sync_is_idempotent():
-    once = sync("VulcanoSoftware/tgdcfs", README_AFTER_RENAME)
-    again = sync_badges.sync_text(once, "VulcanoSoftware/tgdcfs", "master")
+    once = sync("VulcanoSoftware/VulquantaFS", README_AFTER_RENAME)
+    again = sync_badges.sync_text(once, "VulcanoSoftware/VulquantaFS", "master")
     assert again == once

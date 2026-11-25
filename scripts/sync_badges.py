@@ -53,13 +53,15 @@ README = Path(__file__).resolve().parent.parent / "README.md"
 START = "<!-- badges-start -->"
 END = "<!-- badges-end -->"
 
-UPSTREAM_REPOSITORY = "VulcanoSoftware/tgdcfs"
+UPSTREAM_REPOSITORY = "VulcanoSoftware/VulquantaFS"
 
 # Names this repository carried before it was renamed. A README written under
 # one of them still links to ``<owner>.github.io/<old name>/``; the current
 # name from GITHUB_REPOSITORY no longer matches those links, so they must be
-# recognised by name here.
-LEGACY_REPOSITORY_NAMES = ("VulquantaFS", "vulquantafs")
+# recognised by name here. GitHub Pages does not redirect the old project-site
+# URLs, so a README that was not healed would keep sending readers to a 404.
+# Matching is case-insensitive, which covers the lowercase spellings too.
+LEGACY_REPOSITORY_NAMES = ("tgdcfs",)
 
 # Paths only this project's own Pages site serves. A Pages link that points at
 # one of them is ours whatever repository name it carries, so a rename that is
