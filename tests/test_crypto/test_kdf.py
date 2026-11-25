@@ -1,4 +1,4 @@
-"""Unit tests for :mod:`tgdcfs.crypto.kdf`.
+"""Unit tests for :mod:`vulquantafs.crypto.kdf`.
 
 Argon2id is intentionally slow, so we use the minimum-acceptable cost
 parameters for the master-key tests. The cipher and HKDF paths are tested
@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import pytest
 
-from tgdcfs.crypto.kdf import (
+from vulquantafs.crypto.kdf import (
     MASTER_SALT_SIZE,
     derive_file_key,
     derive_master_key,

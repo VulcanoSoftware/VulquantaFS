@@ -2,8 +2,8 @@
 
 Status: implemented. This document explains why the transfer path looks the
 way it does; the code is the authoritative description of what it does
-(`tgdcfs/core/api/message/__init__.py`, `tgdcfs/utils/prefetching_chain.py`,
-`tgdcfs/utils/chunk_cache.py`, and the `transfer` config block).
+(`vulquantafs/core/api/message/__init__.py`, `vulquantafs/utils/prefetching_chain.py`,
+`vulquantafs/utils/chunk_cache.py`, and the `transfer` config block).
 
 ## The starting point
 
@@ -98,7 +98,7 @@ one block and then hits it for the rest of that megabyte.
 
 ## One knob removed
 
-`tgdcfs.download.chunk_size_kb` used to set the size of the chunks a download
+`vulquantafs.download.chunk_size_kb` used to set the size of the chunks a download
 stream hands out. It is gone, because it did not mean anything to either
 library it was passed to. Pyrogram's `get_file` has no such parameter and
 silently ignored it; Telethon caps a file request at 512 KiB, which the

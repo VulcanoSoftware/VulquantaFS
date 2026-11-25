@@ -4,9 +4,9 @@ The Docker image installs its dependencies with ``poetry install --no-root``,
 so the application is not on ``sys.path`` at all -- it is importable only
 because the process starts in the directory it was copied to. A script under
 ``scripts/`` starts out with its own directory on ``sys.path[0]`` instead, so
-without help it cannot import ``tgdcfs``.
+without help it cannot import ``vulquantafs``.
 
-A development checkout hides this: ``poetry install`` drops a ``tgdcfs.pth`` into
+A development checkout hides this: ``poetry install`` drops a ``vulquantafs.pth`` into
 the virtualenv, and the application resolves from site-packages no matter where
 the process starts. That is exactly how a broken check reached CI once. These
 tests run the script with the entries the container does not have stripped from
@@ -59,19 +59,19 @@ def run_like_the_image(env_extra: dict) -> subprocess.CompletedProcess:
 def _clean_env() -> dict:
     import os
 
-    # TGDCFS_DATA_DIR / TGDCFS_CONFIG_FILE are set for the test suite; the script
+    # VULQUANTAFS_DATA_DIR / VULQUANTAFS_CONFIG_FILE are set for the test suite; the script
     # points at its own throwaway config and must not inherit them.
     return {
         k: v
         for k, v in os.environ.items()
-        if k not in ("TGDCFS_DATA_DIR", "TGDCFS_CONFIG_FILE", "PYTHONPATH")
+        if k not in ("VULQUANTAFS_DATA_DIR", "VULQUANTAFS_CONFIG_FILE", "PYTHONPATH")
     }
 
 
 class TestRunsWithTheImagesImportPath:
     @pytest.fixture(scope="class")
     def result(self) -> subprocess.CompletedProcess:
-        return run_like_the_image({"TGDCFS_SMOKE_PORT": str(free_port())})
+        return run_like_the_image({"VULQUANTAFS_SMOKE_PORT": str(free_port())})
 
     def test_exits_successfully(self, result):
         assert result.returncode == 0, (
@@ -81,7 +81,7 @@ class TestRunsWithTheImagesImportPath:
 
     def test_does_not_fail_to_import_the_application(self, result):
         # The specific failure this test exists for.
-        assert "No module named 'tgdcfs'" not in result.stderr
+        assert "No module named 'vulquantafs'" not in result.stderr
 
     def test_reports_that_it_passed(self, result):
         assert "SFTP smoke check passed" in result.stdout + result.stderr
@@ -91,7 +91,7 @@ class TestPortIsConfigurable:
     def test_binds_the_port_it_was_given(self):
         port = free_port()
 
-        result = run_like_the_image({"TGDCFS_SMOKE_PORT": str(port)})
+        result = run_like_the_image({"VULQUANTAFS_SMOKE_PORT": str(port)})
 
         assert result.returncode == 0, result.stderr
         assert f"127.0.0.1:{port}" in result.stdout + result.stderr
@@ -107,8 +107,8 @@ class TestImportingItIsInert:
             f"spec = importlib.util.spec_from_file_location('probe', {str(SCRIPT)!r});"
             "m = importlib.util.module_from_spec(spec);"
             "spec.loader.exec_module(m);"
-            "print(os.environ.get('TGDCFS_DATA_DIR'));"
-            "print(any(k.startswith('tgdcfs') for k in sys.modules))"
+            "print(os.environ.get('VULQUANTAFS_DATA_DIR'));"
+            "print(any(k.startswith('vulquantafs') for k in sys.modules))"
         )
         result = subprocess.run(
             [sys.executable, "-c", probe],

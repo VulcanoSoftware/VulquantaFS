@@ -6,7 +6,7 @@ description: Step-by-step guide to cloning the repo and configuring your local d
 
 # 🛠️ Local Repository & Environment Setup
 
-This step-by-step guide will help you set up the TGDCFS codebase on your local machine for active development.
+This step-by-step guide will help you set up the VulquantaFS codebase on your local machine for active development.
 
 ---
 
@@ -17,24 +17,24 @@ Before starting, ensure your system has the following installed:
 - **Git**: Version 2.30+
 - **Python**: Version **3.13** or higher (`python3 --version`)
 - **Poetry**: Version **2.0** or higher (`poetry --version`)
-- **Node.js**: Version **24+** for the Next.js frontend (`tgdcfs-gh-pages`), **20+** for the Docusaurus site; only needed when working on those
+- **Node.js**: Version **24+** for the Next.js frontend (`vulquantafs-gh-pages`), **20+** for the Docusaurus site; only needed when working on those
 
 ---
 
 ## Step 1: Clone the GitHub Repository
 
-Clone the TGDCFS repository from GitHub to your local workstation:
+Clone the VulquantaFS repository from GitHub to your local workstation:
 
 ```bash
-git clone https://github.com/Xyvran/tgdcfs.git
-cd tgdcfs
+git clone https://github.com/Xyvran/vulquantafs.git
+cd vulquantafs
 ```
 
 ---
 
 ## Step 2: Install Python Dependencies with Poetry
 
-TGDCFS uses **Poetry** for dependency management and virtual environments.
+VulquantaFS uses **Poetry** for dependency management and virtual environments.
 
 1. Tell Poetry to use your Python 3.13 interpreter:
 ```bash
@@ -56,7 +56,7 @@ poetry run python --version
 
 ## Step 3: Install Git Pre-Commit Hooks
 
-TGDCFS uses `pre-commit` to enforce code quality, linting, and formatting checks automatically before every commit.
+VulquantaFS uses `pre-commit` to enforce code quality, linting, and formatting checks automatically before every commit.
 
 Install the pre-commit git hooks:
 ```bash
@@ -67,7 +67,7 @@ Now, every time you execute `git commit`, `pre-commit` will automatically run fo
 
 ---
 
-## Step 4: Run TGDCFS Locally
+## Step 4: Run VulquantaFS Locally
 
 To run the main application server locally in development mode:
 
@@ -87,7 +87,7 @@ The server will initialize and start listening for WebDAV and Manager API reques
 
 ## Step 5: Building & Testing Docker Containers Locally
 
-TGDCFS provides multi-stage `Dockerfile` (for the Python backend service) and `Dockerfile.frontend` (for the Nginx + Next.js web frontend).
+VulquantaFS provides multi-stage `Dockerfile` (for the Python backend service) and `Dockerfile.frontend` (for the Nginx + Next.js web frontend).
 
 ### Prerequisites for Docker Development
 - **Docker Engine** (20.10+) or **Docker Desktop** / **Podman**
@@ -100,52 +100,52 @@ TGDCFS provides multi-stage `Dockerfile` (for the Python backend service) and `D
 Build the backend Docker image using the main `Dockerfile`:
 
 ```bash
-docker build -t tgdcfs:local -f Dockerfile .
+docker build -t vulquantafs:local -f Dockerfile .
 ```
 
 #### Key Architecture Notes:
 - **Multi-Stage Build**: Stage 1 (`builder`) installs Poetry and builds Python packages into `/usr/local`. Stage 2 installs runtime system dependencies and copies wheels over, resulting in a minimal footprint.
-- **Non-Root User**: The image runs as non-root user `tgdcfs` (UID/GID created in container).
-- **Data Directory Pinning (`TGDCFS_DATA_DIR`)**: Explicitly pinned to `ENV TGDCFS_DATA_DIR=/home/tgdcfs/.tgdcfs`. This guarantees that even if run with custom user IDs (`docker run --user 12345`), path expansion resolves consistently to `/home/tgdcfs/.tgdcfs`.
+- **Non-Root User**: The image runs as non-root user `vulquantafs` (UID/GID created in container).
+- **Data Directory Pinning (`VULQUANTAFS_DATA_DIR`)**: Explicitly pinned to `ENV VULQUANTAFS_DATA_DIR=/home/vulquantafs/.vulquantafs`. This guarantees that even if run with custom user IDs (`docker run --user 12345`), path expansion resolves consistently to `/home/vulquantafs/.vulquantafs`.
 
 ---
 
 ### Running the Backend Container
 
-To run your locally built TGDCFS container with your local configuration and persistent data directory:
+To run your locally built VulquantaFS container with your local configuration and persistent data directory:
 
 ```bash
 docker run -d \
-  --name tgdcfs-local \
+  --name vulquantafs-local \
   -p 1900:1900 \
   -p 2222:2222 \
-  -v "$PWD/config.yaml:/home/tgdcfs/.tgdcfs/config.yaml:ro" \
-  -v "$PWD/data:/home/tgdcfs/.tgdcfs" \
-  tgdcfs:local
+  -v "$PWD/config.yaml:/home/vulquantafs/.vulquantafs/config.yaml:ro" \
+  -v "$PWD/data:/home/vulquantafs/.vulquantafs" \
+  vulquantafs:local
 ```
 
 #### Container Ports Summary:
 - **`1900`**: WebDAV server & Manager REST API endpoint.
-- **`2222`**: AsyncSSH SFTP server (active when `tgdcfs.sftp.enabled: true` in config).
+- **`2222`**: AsyncSSH SFTP server (active when `vulquantafs.sftp.enabled: true` in config).
 
 ---
 
 ### Running Automated Docker Container Smoke Checks
 
-TGDCFS includes an automated smoke test script (`scripts/docker_smoke_check.py`) that tests container boot, runtime dependencies, host key generation, and SFTP authentication without requiring live Telegram API credentials.
+VulquantaFS includes an automated smoke test script (`scripts/docker_smoke_check.py`) that tests container boot, runtime dependencies, host key generation, and SFTP authentication without requiring live Telegram API credentials.
 
 Run the smoke test against your built image:
 
 ```bash
 docker run --rm \
   -v "$PWD/scripts:/app/scripts:ro" \
-  tgdcfs:local \
+  vulquantafs:local \
   python scripts/docker_smoke_check.py
 ```
 
 #### What the Smoke Test Verifies:
 1. **Runtime Imports**: Imports the application inside the image — the image installs its packages with `--no-root`, so this is what catches dependencies missing from the runtime layer.
-2. **SFTP Server Initialization**: Starts AsyncSSH with a throwaway in-memory configuration (no Telegram login involved) and verifies the ed25519 host key is generated in `TGDCFS_DATA_DIR`.
+2. **SFTP Server Initialization**: Starts AsyncSSH with a throwaway in-memory configuration (no Telegram login involved) and verifies the ed25519 host key is generated in `VULQUANTAFS_DATA_DIR`.
 3. **Authentication Verification**: Connects via AsyncSSH with valid credentials and lists the empty virtual root, then asserts a wrong password is rejected.
 
 The custom-UID check (`docker run --user 12345`) is not part of the script itself; the `docker-preview.yml` workflow runs it separately after the smoke check.
@@ -154,25 +154,25 @@ The custom-UID check (`docker run --user 12345`) is not part of the script itsel
 
 ### Building & Testing the Web Frontend Container (`Dockerfile.frontend`)
 
-The web frontend (`tgdcfs-gh-pages/`) is built using Next.js static exports and served by Nginx.
+The web frontend (`vulquantafs-gh-pages/`) is built using Next.js static exports and served by Nginx.
 
 #### Build the Frontend Image:
 ```bash
-docker build -t tgdcfs-fe:local -f Dockerfile.frontend .
+docker build -t vulquantafs-fe:local -f Dockerfile.frontend .
 ```
 
 #### Run the Frontend Container:
 ```bash
 docker run -d \
-  --name tgdcfs-fe-local \
+  --name vulquantafs-fe-local \
   -p 8080:80 \
-  tgdcfs-fe:local
+  vulquantafs-fe:local
 ```
 
-Access the frontend mini-app at `http://localhost:8080/tgdcfs/`.
+Access the frontend mini-app at `http://localhost:8080/vulquantafs/`.
 
 #### Smoke-Testing Frontend Image via CLI:
 ```bash
-curl -f -I http://localhost:8080/tgdcfs/
+curl -f -I http://localhost:8080/vulquantafs/
 ```
-*(A HTTP `200 OK` confirms Nginx is correctly serving the exported Next.js app on path `/tgdcfs/`).*
+*(A HTTP `200 OK` confirms Nginx is correctly serving the exported Next.js app on path `/vulquantafs/`).*

@@ -1,0 +1,2271 @@
+"use client";
+
+import { Add, BugReport, ContentCopy, Download, Refresh } from "@mui/icons-material";
+import {
+  Alert,
+  AlertTitle,
+  Box,
+  Button,
+  Card,
+  CardContent,
+  Checkbox,
+  Container,
+  Divider,
+  FormControl,
+  FormControlLabel,
+  InputLabel,
+  MenuItem,
+  Paper,
+  Select,
+  Typography,
+} from "@mui/material";
+import yaml from "js-yaml";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { Prism as SyntaxHighlighter } from "react-syntax-highlighter";
+import { vscDarkPlus } from "react-syntax-highlighter/dist/esm/styles/prism";
+import { DOCKERHUB_IMAGE, GHCR_IMAGE, PAGES_URL } from "../lib/coordinates";
+import { ColumnResizeHandle } from "../appearance/ColumnResizeHandle";
+import { CustomizePanel } from "../appearance/CustomizePanel";
+import { DEFAULT_SETTINGS, useAppearance } from "../appearance/AppearanceProvider";
+import { BotTokenField } from "./components/BotTokenField";
+import { ConfigTextField } from "./components/ConfigTextField";
+import { DockerRunPanel } from "./components/DockerRunPanel";
+import {
+  EncryptionConfig,
+  EncryptionField,
+} from "./components/EncryptionField";
+import { FieldRow } from "./components/FieldRow";
+import { FilesystemField } from "./components/FilesystemField";
+import { FormSection } from "./components/FormSection";
+import { LoadConfigButton } from "./components/LoadConfigButton";
+import { StoreField } from "./components/StoreField";
+import { UserField } from "./components/UserField";
+import { importConfig } from "./config-import";
+import { redactSecrets } from "./redact";
+import {
+  CACHE_DEFAULTS,
+  CacheConfig,
+  ConfigData,
+  DiscordConfig,
+  FilesystemConfig,
+  LISTING_DEFAULTS,
+  ListingConfig,
+  SftpConfig,
+  StoreConfig,
+  SyncMode,
+  TransferConfig,
+  UserConfig,
+  defaultConfig,
+  isValidDirectoryName,
+  isValidStoreName,
+  needsReupload,
+  newFilesystem,
+  newMetadataEntry,
+  GITLAB_DEFAULTS,
+  METADATA_PUSH_DEFAULTS,
+  MetadataEntry,
+  MetadataPushConfig,
+} from "./types";
+
+// Type-safe path mapping for updateConfig
+type ConfigUpdatePaths = {
+  "telegram.enabled": boolean;
+  "telegram.api_id": string;
+  "telegram.api_hash": string;
+  "telegram.lib": "pyrogram" | "telethon";
+  "telegram.bot.tokens": string[];
+  discord: DiscordConfig;
+  stores: StoreConfig[];
+  filesystems: FilesystemConfig[];
+  "vulquantafs.users": UserConfig[];
+  "vulquantafs.jwt.secret": string;
+  "vulquantafs.jwt.algorithm": string;
+  "vulquantafs.jwt.life": number;
+  "vulquantafs.server.host": string;
+  "vulquantafs.server.port": number;
+  "vulquantafs.sftp": SftpConfig;
+  "vulquantafs.transfer": TransferConfig;
+  "vulquantafs.encryption": EncryptionConfig;
+  "vulquantafs.cache": CacheConfig;
+  "vulquantafs.listing": ListingConfig;
+};
+
+// One metadata store as it reaches the YAML: only the fields of the
+// chosen type, and the GitLab base_url/file_path only when they differ
+// from the loader's defaults.
+type MetadataEntryYaml = {
+  type: string;
+  store?: string;
+  github_repo?: {
+    repo: string;
+    commit: string;
+    access_token: string;
+    layout?: string;
+    file_path?: string;
+    squash_history_max_commits?: number;
+  };
+  gitlab_repo?: {
+    repo: string;
+    branch: string;
+    access_token: string;
+    base_url?: string;
+    file_path?: string;
+    layout?: string;
+    blob_fetch_concurrency?: number;
+    squash_history_max_commits?: number;
+  };
+};
+
+// One metadata_push block as it reaches the YAML, or nothing when every
+// value equals the loader's default.
+type MetadataPushYaml = {
+  mode?: string;
+  window_ms?: number;
+  parallel_stores?: boolean;
+};
+
+const metadataPushYaml = (push: MetadataPushConfig): MetadataPushYaml | undefined => {
+  const yaml: MetadataPushYaml = {};
+  if (push.mode !== METADATA_PUSH_DEFAULTS.mode) yaml.mode = push.mode;
+  if (push.window_ms !== METADATA_PUSH_DEFAULTS.window_ms)
+    yaml.window_ms = push.window_ms;
+  if (push.parallel_stores !== METADATA_PUSH_DEFAULTS.parallel_stores)
+    yaml.parallel_stores = push.parallel_stores;
+  return Object.keys(yaml).length > 0 ? yaml : undefined;
+};
+
+const metadataEntryYaml = (entry: MetadataEntry): MetadataEntryYaml => {
+  const yaml: MetadataEntryYaml = { type: entry.type };
+  if (entry.type === "pinned_message" && entry.store.trim() !== "") {
+    yaml.store = entry.store.trim();
+  }
+  if (entry.type === "github_repo") {
+    const filePath = entry.github_repo.file_path.trim();
+    yaml.github_repo = {
+      repo: entry.github_repo.repo,
+      commit: entry.github_repo.commit,
+      access_token: entry.github_repo.access_token,
+      // The tree layout is the loader's default; only the document
+      // layout has to be spelled out.
+      ...(entry.github_repo.layout === "document"
+        ? { layout: entry.github_repo.layout }
+        : {}),
+      ...(filePath !== "" && filePath !== GITLAB_DEFAULTS.file_path
+        ? { file_path: filePath }
+        : {}),
+      ...(entry.github_repo.layout === "tree" &&
+      entry.github_repo.squash_history_max_commits !== 0
+        ? {
+            squash_history_max_commits:
+              entry.github_repo.squash_history_max_commits,
+          }
+        : {}),
+    };
+  }
+  if (entry.type === "gitlab_repo") {
+    const baseUrl = entry.gitlab_repo.base_url.trim();
+    const filePath = entry.gitlab_repo.file_path.trim();
+    yaml.gitlab_repo = {
+      repo: entry.gitlab_repo.repo,
+      branch: entry.gitlab_repo.branch,
+      access_token: entry.gitlab_repo.access_token,
+      ...(baseUrl !== "" && baseUrl !== GITLAB_DEFAULTS.base_url
+        ? { base_url: baseUrl }
+        : {}),
+      ...(filePath !== "" && filePath !== GITLAB_DEFAULTS.file_path
+        ? { file_path: filePath }
+        : {}),
+      ...(entry.gitlab_repo.layout === "document"
+        ? { layout: entry.gitlab_repo.layout }
+        : {}),
+      ...(entry.gitlab_repo.layout === "tree" &&
+      entry.gitlab_repo.blob_fetch_concurrency !==
+        GITLAB_DEFAULTS.blob_fetch_concurrency
+        ? { blob_fetch_concurrency: entry.gitlab_repo.blob_fetch_concurrency }
+        : {}),
+      ...(entry.gitlab_repo.layout === "tree" &&
+      entry.gitlab_repo.squash_history_max_commits !== 0
+        ? {
+            squash_history_max_commits:
+              entry.gitlab_repo.squash_history_max_commits,
+          }
+        : {}),
+    };
+  }
+  return yaml;
+};
+
+const generateRandomSecret = (): string => {
+  const chars =
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789!@#$%^&*()_+-=[]{}|;:,.<>?";
+  let result = "";
+  for (let i = 0; i < 64; i++) {
+    result += chars.charAt(Math.floor(Math.random() * chars.length));
+  }
+  return result;
+};
+
+export default function ConfigGenerator() {
+  const { settings, mounted, setSidebarWidth } = useAppearance();
+  const columnsRef = useRef<HTMLDivElement>(null);
+  const [dragWidth, setDragWidth] = useState<number | null>(null);
+  const sidebarWidth = mounted ? dragWidth ?? settings.sidebarWidth : 400;
+
+  const [withUserAccountUpload, setWithUserAccountUpload] = useState(false);
+  const [withUserAccountDownload, setWithUserAccountDownload] = useState(false);
+
+  const [config, setConfig] = useState<ConfigData>(defaultConfig);
+  // Outcome of the last "Load Existing config.yaml", shown above the form.
+  const [importResult, setImportResult] = useState<{
+    severity: "success" | "error";
+    message: string;
+    notes: string[];
+  } | null>(null);
+
+  const updateConfig = useCallback(
+    <K extends keyof ConfigUpdatePaths>(
+      path: K,
+      value: ConfigUpdatePaths[K]
+    ): void => {
+      const newConfig = { ...config };
+
+      if (path === "telegram.enabled") {
+        newConfig.telegram.enabled = value as boolean;
+      } else if (path === "telegram.api_id") {
+        newConfig.telegram.api_id = value as string;
+      } else if (path === "telegram.api_hash") {
+        newConfig.telegram.api_hash = value as string;
+      } else if (path === "telegram.lib") {
+        newConfig.telegram.lib = value as "pyrogram" | "telethon";
+      } else if (path === "telegram.bot.tokens") {
+        newConfig.telegram.bot.tokens = value as string[];
+      } else if (path === "discord") {
+        newConfig.discord = value as DiscordConfig;
+      } else if (path === "stores") {
+        newConfig.stores = value as StoreConfig[];
+      } else if (path === "filesystems") {
+        newConfig.filesystems = value as FilesystemConfig[];
+      } else if (path === "vulquantafs.users") {
+        newConfig.vulquantafs.users = value as UserConfig[];
+      } else if (path === "vulquantafs.jwt.secret") {
+        newConfig.vulquantafs.jwt.secret = value as string;
+      } else if (path === "vulquantafs.jwt.algorithm") {
+        newConfig.vulquantafs.jwt.algorithm = value as string;
+      } else if (path === "vulquantafs.jwt.life") {
+        newConfig.vulquantafs.jwt.life = value as number;
+      } else if (path === "vulquantafs.server.host") {
+        newConfig.vulquantafs.server.host = value as string;
+      } else if (path === "vulquantafs.server.port") {
+        newConfig.vulquantafs.server.port = value as number;
+      } else if (path === "vulquantafs.sftp") {
+        newConfig.vulquantafs.sftp = value as SftpConfig;
+      } else if (path === "vulquantafs.transfer") {
+        newConfig.vulquantafs.transfer = value as TransferConfig;
+      } else if (path === "vulquantafs.encryption") {
+        newConfig.vulquantafs.encryption = value as EncryptionConfig;
+      } else if (path === "vulquantafs.cache") {
+        newConfig.vulquantafs.cache = value as CacheConfig;
+      } else if (path === "vulquantafs.listing") {
+        newConfig.vulquantafs.listing = value as ListingConfig;
+      }
+
+      setConfig(newConfig);
+    },
+    [config]
+  );
+
+  // Generate JWT secret on client side only to avoid hydration mismatch
+  useEffect(() => {
+    if (config.vulquantafs.jwt.secret === "") {
+      updateConfig("vulquantafs.jwt.secret", generateRandomSecret());
+    }
+  }, [config.vulquantafs.jwt.secret, updateConfig]);
+
+  const loadConfig = (text: string) => {
+    try {
+      const imported = importConfig(text);
+      setConfig(imported.config);
+      setWithUserAccountUpload(imported.withUserAccountUpload);
+      setWithUserAccountDownload(imported.withUserAccountDownload);
+      setImportResult({
+        severity: "success",
+        message:
+          imported.notes.length === 0
+            ? "The config was loaded into the form."
+            : "The config was loaded into the form; a few things did not carry over:",
+        notes: imported.notes,
+      });
+    } catch (err) {
+      setImportResult({
+        severity: "error",
+        message: `The file could not be read as a config.yaml: ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+        notes: [],
+      });
+    }
+    window.scrollTo({ top: 0, behavior: "smooth" });
+  };
+
+  const telegramUsed = config.stores.some((s) => s.backend === "telegram");
+
+  const addBotToken = () => {
+    const newTokens = [...config.telegram.bot.tokens, ""];
+    updateConfig("telegram.bot.tokens", newTokens);
+  };
+
+  const removeBotToken = (index: number) => {
+    const newTokens = config.telegram.bot.tokens.filter((_, i) => i !== index);
+    updateConfig("telegram.bot.tokens", newTokens);
+  };
+
+  const updateBotToken = (index: number, value: string) => {
+    const newTokens = [...config.telegram.bot.tokens];
+    newTokens[index] = value;
+    updateConfig("telegram.bot.tokens", newTokens);
+  };
+
+  const updateDiscord = <K extends keyof DiscordConfig>(
+    field: K,
+    value: DiscordConfig[K]
+  ) => {
+    updateConfig("discord", { ...config.discord, [field]: value });
+  };
+
+  const updateDiscordToken = (index: number, value: string) => {
+    const tokens = [...config.discord.bot_tokens];
+    tokens[index] = value;
+    updateDiscord("bot_tokens", tokens);
+  };
+
+  // -- stores ---------------------------------------------------------------
+
+  const addStore = () => {
+    updateConfig("stores", [
+      ...config.stores,
+      {
+        name: `store-${config.stores.length + 1}`,
+        backend:
+          config.telegram.enabled || !config.discord.enabled
+            ? "telegram"
+            : "discord",
+        channel: "",
+      },
+    ]);
+  };
+
+  const removeStore = (index: number) => {
+    const removed = config.stores[index].name;
+    const stores = config.stores.filter((_, i) => i !== index);
+    // Drop references to the removed store.
+    const filesystems = config.filesystems.map((fs) => ({
+      ...fs,
+      primary: fs.primary === removed ? "" : fs.primary,
+      mirrors: fs.mirrors.filter((m) => m !== removed),
+      read_sources: fs.read_sources.filter((m) => m !== removed),
+    }));
+    setConfig({ ...config, stores, filesystems });
+  };
+
+  const updateStore = (
+    index: number,
+    field: keyof StoreConfig,
+    value: string
+  ) => {
+    const stores = [...config.stores];
+    const oldName = stores[index].name;
+    stores[index] = { ...stores[index], [field]: value };
+    let filesystems = config.filesystems;
+    if (field === "name" && oldName !== value) {
+      // Keep file systems pointing at the renamed store, including the
+      // pinned-message metadata stores that name one.
+      filesystems = config.filesystems.map((fs) => ({
+        ...fs,
+        primary: fs.primary === oldName ? value : fs.primary,
+        mirrors: fs.mirrors.map((m) => (m === oldName ? value : m)),
+        read_sources: fs.read_sources.map((m) => (m === oldName ? value : m)),
+        metadata:
+          fs.metadata.store === oldName
+            ? { ...fs.metadata, store: value }
+            : fs.metadata,
+        metadata_mirrors: fs.metadata_mirrors.map((m) =>
+          m.store === oldName ? { ...m, store: value } : m
+        ),
+      }));
+    }
+    setConfig({ ...config, stores, filesystems });
+  };
+
+  const getStoreNameErrors = (index: number): string[] => {
+    const errors: string[] = [];
+    const name = config.stores[index].name.trim();
+    if (!name) {
+      errors.push("Store name is required");
+      return errors;
+    }
+    if (!isValidStoreName(name)) {
+      errors.push("Letters, digits, '-', '_' and '.' only");
+    }
+    if (
+      config.stores.findIndex((s, i) => i !== index && s.name.trim() === name) !==
+      -1
+    ) {
+      errors.push("Store names must be unique");
+    }
+    return errors;
+  };
+
+  const getStoreChannelErrors = (index: number): string[] => {
+    const errors: string[] = [];
+    const store = config.stores[index];
+    const channel = store.channel.trim();
+    if (!channel) {
+      errors.push("Channel ID is required");
+      return errors;
+    }
+    if (store.backend === "discord" && !/^\d+$/.test(channel)) {
+      errors.push("Discord channel ids are numeric");
+    }
+    if (store.backend === "telegram" && !config.telegram.enabled) {
+      errors.push("Enable the Telegram backend below");
+    }
+    if (store.backend === "discord" && !config.discord.enabled) {
+      errors.push("Enable the Discord backend below");
+    }
+    if (
+      config.stores.findIndex(
+        (s, i) =>
+          i !== index && s.backend === store.backend && s.channel.trim() === channel
+      ) !== -1
+    ) {
+      errors.push("Another store uses this channel");
+    }
+    return errors;
+  };
+
+  // -- file systems ----------------------------------------------------------
+
+  const addFilesystem = () => {
+    updateConfig("filesystems", [
+      ...config.filesystems,
+      newFilesystem(`filesystem-${config.filesystems.length + 1}`, ""),
+    ]);
+  };
+
+  const removeFilesystem = (index: number) => {
+    updateConfig(
+      "filesystems",
+      config.filesystems.filter((_, i) => i !== index)
+    );
+  };
+
+  const updateFilesystem = <K extends keyof FilesystemConfig>(
+    index: number,
+    field: K,
+    value: FilesystemConfig[K]
+  ) => {
+    const filesystems = [...config.filesystems];
+    const fs = { ...filesystems[index], [field]: value };
+    if (field === "primary") {
+      fs.mirrors = fs.mirrors.filter((m) => m !== value);
+    }
+    if (field === "primary" || field === "mirrors") {
+      const held = [fs.primary, ...fs.mirrors];
+      fs.read_sources = fs.read_sources.filter((m) => held.includes(m));
+    }
+    if (field === "sync" && value !== "inline") {
+      fs.strict = false;
+    }
+    if (field === "sync" && value === "tee") {
+      // Tee feeds the mirrors from the upload stream; write-back answers
+      // before any store has the bytes, so the two exclude each other.
+      fs.write_ack = "primary";
+    }
+    if (field === "write_ack" && value === "cache" && fs.sync === "tee") {
+      fs.sync = "background";
+    }
+    if (field === "strict" && value === true) {
+      // Strict promises the mirror copy when the write is answered;
+      // write-back answers before any store has the bytes.
+      fs.write_ack = "primary";
+    }
+    // Same default as the loader: a mirror that re-uploads must not hold
+    // up the write. Only ever nudges towards background, never back.
+    if (
+      (field === "mirrors" || field === "primary" || field === "mode") &&
+      fs.sync === "inline" &&
+      !fs.strict &&
+      needsReupload(fs, config.stores)
+    ) {
+      fs.sync = "background";
+    }
+    filesystems[index] = fs;
+    updateConfig("filesystems", filesystems);
+  };
+
+  const updateFilesystemMetadata = (index: number, entry: MetadataEntry) => {
+    const filesystems = [...config.filesystems];
+    filesystems[index] = { ...filesystems[index], metadata: entry };
+    updateConfig("filesystems", filesystems);
+  };
+
+  const updateFilesystemMetadataMirror = (
+    index: number,
+    mirrorIndex: number,
+    entry: MetadataEntry
+  ) => {
+    const filesystems = [...config.filesystems];
+    const mirrors = [...filesystems[index].metadata_mirrors];
+    mirrors[mirrorIndex] = entry;
+    filesystems[index] = { ...filesystems[index], metadata_mirrors: mirrors };
+    updateConfig("filesystems", filesystems);
+  };
+
+  const addFilesystemMetadataMirror = (index: number) => {
+    const filesystems = [...config.filesystems];
+    filesystems[index] = {
+      ...filesystems[index],
+      metadata_mirrors: [
+        ...filesystems[index].metadata_mirrors,
+        newMetadataEntry(),
+      ],
+    };
+    updateConfig("filesystems", filesystems);
+  };
+
+  const removeFilesystemMetadataMirror = (
+    index: number,
+    mirrorIndex: number
+  ) => {
+    const filesystems = [...config.filesystems];
+    filesystems[index] = {
+      ...filesystems[index],
+      metadata_mirrors: filesystems[index].metadata_mirrors.filter(
+        (_, i) => i !== mirrorIndex
+      ),
+    };
+    updateConfig("filesystems", filesystems);
+  };
+
+  const getFilesystemNameErrors = (index: number): string[] => {
+    const errors: string[] = [];
+    const name = config.filesystems[index].name;
+    if (!name.trim()) {
+      errors.push("Name is required");
+      return errors;
+    }
+    if (!isValidDirectoryName(name)) {
+      errors.push('Invalid characters. Cannot contain: / \\ : * ? " < > |');
+    }
+    if (
+      config.filesystems.findIndex(
+        (fs, i) =>
+          i !== index && fs.name.trim().toLowerCase() === name.trim().toLowerCase()
+      ) !== -1
+    ) {
+      errors.push("File system names must be unique");
+    }
+    return errors;
+  };
+
+  const primaryOwner = (storeName: string, exceptIndex: number) =>
+    config.filesystems.findIndex(
+      (fs, i) => i !== exceptIndex && fs.primary === storeName
+    );
+
+  const getFilesystemPrimaryErrors = (index: number): string[] => {
+    const fs = config.filesystems[index];
+    if (!fs.primary || !config.stores.some((s) => s.name === fs.primary)) {
+      return ["Pick a primary store"];
+    }
+    if (primaryOwner(fs.primary, index) !== -1) {
+      return ["This store is already the primary of another file system"];
+    }
+    return [];
+  };
+
+  const filesystemNeedsSharedStore = (index: number): boolean =>
+    config.filesystems[index].mirrors.some(
+      (m) => primaryOwner(m, index) !== -1
+    );
+
+  const getFilesystemMirrorErrors = (index: number): string[] => {
+    const fs = config.filesystems[index];
+    const errors: string[] = [];
+    if (filesystemNeedsSharedStore(index) && !fs.allow_shared_store) {
+      errors.push(
+        "A mirror is the primary of another file system; allow the shared store below or pick another mirror"
+      );
+    }
+    return errors;
+  };
+
+  // The key the loader builds for one metadata store; two entries with the
+  // same key would overwrite each other's writes.
+  const metadataStoreKey = (entry: MetadataEntry, primaryName: string): string => {
+    if (entry.type === "pinned_message") {
+      return `pinned_message@${entry.store.trim() || primaryName}`;
+    }
+    if (entry.type === "github_repo") {
+      return `github_repo@${entry.github_repo.repo.trim()}@${entry.github_repo.commit.trim()}`;
+    }
+    return `gitlab_repo@${entry.gitlab_repo.repo.trim()}@${entry.gitlab_repo.branch.trim()}`;
+  };
+
+  // The rules the loader enforces on the metadata stores of one file
+  // system, checked live so an impossible combination is visible before
+  // the config is generated.
+  const getFilesystemMetadataErrors = (index: number): string[] => {
+    const fs = config.filesystems[index];
+    const errors: string[] = [];
+    const primaryName = fs.primary.trim();
+    const fsStores = [fs.primary, ...fs.mirrors];
+    const seenPinned = new Set<string>();
+    const seenKeys = new Set<string>();
+    [fs.metadata, ...fs.metadata_mirrors].forEach((entry, i) => {
+      const label = i === 0 ? "Primary metadata store" : `Metadata mirror ${i}`;
+      if (entry.type === "pinned_message") {
+        const target = entry.store.trim() || primaryName;
+        if (primaryName !== "") {
+          if (seenPinned.has(target)) {
+            errors.push(
+              `${label}: two pinned-message stores point at store '${target}'; a channel holds only one pinned message`
+            );
+          } else {
+            seenPinned.add(target);
+          }
+          if (!fsStores.includes(target)) {
+            errors.push(
+              `${label}: store '${target}' is neither the primary nor a mirror of this file system`
+            );
+          }
+        }
+      }
+      if (
+        entry.type === "github_repo" &&
+        (!entry.github_repo.repo.trim() || !entry.github_repo.access_token.trim())
+      ) {
+        errors.push(
+          `${label}: the GitHub repository needs a repository and an access token`
+        );
+      }
+      if (
+        entry.type === "gitlab_repo" &&
+        (!entry.gitlab_repo.repo.trim() || !entry.gitlab_repo.access_token.trim())
+      ) {
+        errors.push(
+          `${label}: the GitLab repository needs a repository and an access token`
+        );
+      }
+      const key = metadataStoreKey(entry, primaryName);
+      if (seenKeys.has(key)) {
+        errors.push(`${label}: metadata store '${key}' is listed twice`);
+      } else {
+        seenKeys.add(key);
+      }
+    });
+    return errors;
+  };
+
+  const buildConfigForYaml = () => {
+    const stores: {
+      [name: string]: { backend: string; channel: string };
+    } = {};
+    config.stores
+      .filter((s) => s.name.trim() !== "" && s.channel.trim() !== "")
+      .forEach((s) => {
+        stores[s.name.trim()] = { backend: s.backend, channel: s.channel.trim() };
+      });
+
+    const filesystems: {
+      [name: string]: {
+        primary: string;
+        mirrors?: string[];
+        mode?: string;
+        sync?: string;
+        strict?: boolean;
+        write_ack?: string;
+        read_parallel?: boolean;
+        read_sources?: string[];
+        allow_shared_store?: boolean;
+        metadata: MetadataEntryYaml;
+        metadata_mirrors?: MetadataEntryYaml[];
+        metadata_push?: MetadataPushYaml;
+      };
+    } = {};
+    config.filesystems
+      .filter((fs) => fs.name.trim() !== "" && fs.primary in stores)
+      .forEach((fs) => {
+        const mirrors = fs.mirrors.filter((m) => m in stores && m !== fs.primary);
+        // The loader derives sync from the stores when it is left out:
+        // background as soon as a mirror re-uploads, inline otherwise.
+        // Writing the same value would pin it, so a config generated today
+        // would keep blocking uploads after the default changes; only a
+        // choice that differs from the derived default is written.
+        const derivedSync: SyncMode =
+          needsReupload(fs, config.stores) && !fs.strict ? "background" : "inline";
+        const writeBack =
+          config.vulquantafs.cache.enabled && !fs.strict && fs.write_ack === "cache";
+        const metadataMirrors = fs.metadata_mirrors.filter(
+          (entry) =>
+            entry.type !== "pinned_message" ||
+            entry.store.trim() === "" ||
+            entry.store.trim() in stores
+        );
+        filesystems[fs.name.trim()] = {
+          primary: fs.primary,
+          ...(mirrors.length > 0
+            ? {
+                mirrors,
+                mode: fs.mode,
+                ...(fs.sync !== derivedSync ? { sync: fs.sync } : {}),
+                ...(fs.strict ? { strict: true } : {}),
+                ...(fs.allow_shared_store ? { allow_shared_store: true } : {}),
+                ...(fs.read_parallel ? { read_parallel: true } : {}),
+                ...(fs.read_parallel && fs.read_sources.length > 0
+                  ? {
+                      read_sources: fs.read_sources.filter((s) =>
+                        [fs.primary, ...mirrors].includes(s)
+                      ),
+                    }
+                  : {}),
+              }
+            : {}),
+          ...(writeBack ? { write_ack: "cache" } : {}),
+          ...(metadataPushYaml(fs.metadata_push) !== undefined
+            ? { metadata_push: metadataPushYaml(fs.metadata_push) }
+            : {}),
+          metadata: metadataEntryYaml(fs.metadata),
+          // A pinned mirror naming a store that is gone from the config
+          // would fail to load; dropped like a file mirror would be.
+          ...(metadataMirrors.length > 0
+            ? {
+                metadata_mirrors: metadataMirrors.map(metadataEntryYaml),
+              }
+            : {}),
+        };
+      });
+
+    // The user account is needed for pinning, so also when a metadata
+    // mirror pins the tree in a Telegram store.
+    const pinnedOnTelegram = config.filesystems.some((fs) =>
+      [fs.metadata, ...fs.metadata_mirrors].some((entry) => {
+        if (entry.type !== "pinned_message") return false;
+        const storeName =
+          entry.store.trim() !== "" ? entry.store.trim() : fs.primary;
+        return (
+          config.stores.find((s) => s.name === storeName)?.backend ===
+          "telegram"
+        );
+      })
+    );
+
+    const configForYaml = {
+      backends: {
+        ...(config.telegram.enabled && telegramUsed
+          ? {
+              telegram: {
+                api_id: config.telegram.api_id,
+                api_hash: config.telegram.api_hash,
+                lib: config.telegram.lib,
+                ...(withUserAccountUpload ||
+                withUserAccountDownload ||
+                pinnedOnTelegram
+                  ? {
+                      account: {
+                        session_file: "account.session",
+                        used_to_upload: withUserAccountUpload,
+                        used_to_download: withUserAccountDownload,
+                      },
+                    }
+                  : {}),
+                bot: {
+                  session_file: config.telegram.bot.session_file,
+                  tokens: config.telegram.bot.tokens.filter(
+                    (token) => token.trim() !== ""
+                  ),
+                },
+              },
+            }
+          : {}),
+        ...(config.discord.enabled
+          ? {
+              discord: {
+                bot_tokens: config.discord.bot_tokens.filter(
+                  (token) => token.trim() !== ""
+                ),
+                max_file_size_bytes: config.discord.max_file_size_bytes,
+                delete_messages_on_remove:
+                  config.discord.delete_messages_on_remove,
+              },
+            }
+          : {}),
+      },
+      stores,
+      filesystems,
+      vulquantafs: {
+        users: config.vulquantafs.users.reduce((acc, user) => {
+          if (user.username.trim() !== "") {
+            acc[user.username] = {
+              password: user.password,
+              ...(user.readonly ? { readonly: true } : {}),
+            };
+          }
+          return acc;
+        }, {} as { [key: string]: { password: string; readonly?: boolean } }),
+        jwt: config.vulquantafs.jwt,
+        server: config.vulquantafs.server,
+        ...(() => {
+          const sftp = config.vulquantafs.sftp;
+          if (!sftp.enabled) return {};
+          const block: {
+            enabled: boolean;
+            host: string;
+            port: number;
+            host_key_file: string;
+            authorized_keys_dir?: string;
+            upload_buffer_size_mb: number;
+          } = {
+            enabled: true,
+            host: sftp.host,
+            port: sftp.port,
+            host_key_file: sftp.host_key_file,
+            upload_buffer_size_mb: sftp.upload_buffer_size_mb,
+          };
+          if (sftp.authorized_keys_dir.trim() !== "") {
+            block.authorized_keys_dir = sftp.authorized_keys_dir.trim();
+          }
+          return { sftp: block };
+        })(),
+        ...(() => {
+          const transfer = config.vulquantafs.transfer;
+          if (!transfer.enabled) return {};
+          // "enabled" only drives this form; it is not a config key.
+          const settings = { ...transfer } as Partial<TransferConfig>;
+          delete settings.enabled;
+          return { transfer: settings };
+        })(),
+        ...(() => {
+          const cache = config.vulquantafs.cache;
+          if (!cache.enabled) return {};
+          // Only what differs from the loader's defaults, plus the switch.
+          const block: Partial<CacheConfig> = { enabled: true };
+          (Object.keys(CACHE_DEFAULTS) as (keyof CacheConfig)[]).forEach((key) => {
+            if (key !== "enabled" && cache[key] !== CACHE_DEFAULTS[key]) {
+              (block as Record<string, unknown>)[key] = cache[key];
+            }
+          });
+          return { cache: block };
+        })(),
+        ...(() => {
+          // Only what differs from the loader's defaults; no block at all
+          // when nothing does.
+          const listing = config.vulquantafs.listing;
+          const block: Partial<ListingConfig> = {};
+          (Object.keys(LISTING_DEFAULTS) as (keyof ListingConfig)[]).forEach(
+            (key) => {
+              if (listing[key] !== LISTING_DEFAULTS[key]) {
+                (block as Record<string, unknown>)[key] = listing[key];
+              }
+            }
+          );
+          return Object.keys(block).length ? { listing: block } : {};
+        })(),
+        encryption: (() => {
+          const enc = config.vulquantafs.encryption;
+          const block: {
+            enabled: boolean;
+            encrypt_names: boolean;
+            passphrase?: string;
+            passphrase_env?: string;
+            passphrase_file?: string;
+            master_salt_file: string;
+            chunk_size: number;
+          } = {
+            enabled: enc.enabled,
+            encrypt_names: enc.encrypt_names,
+            master_salt_file: enc.master_salt_file,
+            chunk_size: enc.chunk_size,
+          };
+          if (enc.enabled) {
+            if (enc.passphrase_source === "passphrase") {
+              block.passphrase = enc.passphrase;
+            } else if (enc.passphrase_source === "passphrase_env") {
+              block.passphrase_env = enc.passphrase_env;
+            } else if (enc.passphrase_source === "passphrase_file") {
+              block.passphrase_file = enc.passphrase_file;
+            }
+          }
+          return block;
+        })(),
+      },
+    };
+
+    return configForYaml;
+  };
+
+  const generateYaml = () => yaml.dump(buildConfigForYaml(), { indent: 2 });
+
+  const generateRedactedYaml = () =>
+    yaml.dump(redactSecrets(buildConfigForYaml()), { indent: 2 });
+
+  const downloadFile = (name: string, yamlContent: string) => {
+    const blob = new Blob([yamlContent], { type: "text/yaml" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = name;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  };
+
+  const downloadConfig = () => {
+    downloadFile("config.yaml", generateYaml());
+  };
+
+  const downloadRedactedConfig = () => {
+    downloadFile("config.redacted.yaml", generateRedactedYaml());
+  };
+
+  const copyToClipboard = () => {
+    const yamlContent = generateYaml();
+    navigator.clipboard.writeText(yamlContent);
+  };
+
+  const regenerateJwtSecret = () => {
+    updateConfig("vulquantafs.jwt.secret", generateRandomSecret());
+  };
+
+  const addUser = () => {
+    const newUsers = [
+      ...config.vulquantafs.users,
+      { username: "", password: "", readonly: false },
+    ];
+    updateConfig("vulquantafs.users", newUsers);
+  };
+
+  const removeUser = (index: number) => {
+    const newUsers = config.vulquantafs.users.filter((_, i) => i !== index);
+    updateConfig("vulquantafs.users", newUsers);
+  };
+
+  const updateUser = <K extends keyof UserConfig>(
+    index: number,
+    field: K,
+    value: UserConfig[K]
+  ) => {
+    const newUsers = [...config.vulquantafs.users];
+    newUsers[index] = { ...newUsers[index], [field]: value };
+    updateConfig("vulquantafs.users", newUsers);
+  };
+
+  return (
+    <div className="dcfs-page">
+      <Container
+        maxWidth={mounted && settings.fullWidth ? false : "lg"}
+        sx={{ py: { xs: 3, md: 6 } }}
+      >
+        <Typography
+          variant="h3"
+          component="h1"
+          gutterBottom
+          align="center"
+          sx={{ fontSize: { xs: "1.8rem", sm: "3rem" } }}
+          className="dcfs-gradient-text"
+        >
+          VulquantaFS Config Generator
+        </Typography>
+
+      <Typography
+        variant="h6"
+        color="text.secondary"
+        align="center"
+        sx={{ mb: 4 }}
+      >
+        Generate your VulquantaFS configuration file with this interactive form
+      </Typography>
+
+      <Alert severity="warning" sx={{ mb: 3 }}>
+        <AlertTitle>Important</AlertTitle>
+        Keep your API credentials and bot tokens secure. Never share them
+        publicly.
+      </Alert>
+
+      {importResult && (
+        <Alert
+          severity={importResult.severity}
+          onClose={() => setImportResult(null)}
+          sx={{ mb: 3 }}
+        >
+          {importResult.message}
+          {importResult.notes.length > 0 && (
+            <Box component="ul" sx={{ m: 0, mt: 1, pl: 2.5 }}>
+              {importResult.notes.map((note) => (
+                <li key={note}>{note}</li>
+              ))}
+            </Box>
+          )}
+        </Alert>
+      )}
+
+      <Box
+        ref={columnsRef}
+        sx={{
+          display: "flex",
+          gap: 2,
+          alignItems: "stretch",
+          flexDirection: { xs: "column", lg: "row" },
+        }}
+      >
+        <Box sx={{ flex: 1, minWidth: 0 }}>
+          <Paper className="dcfs-glass dcfs-fade-in" sx={{ p: { xs: 2, md: 4 } }}>
+            <FormSection title="Stores" showDivider={false}>
+              <Typography variant="body2" color="text.secondary">
+                A store is one channel of one backend: a private Telegram
+                channel or a Discord channel. Give each a short name; file
+                systems below refer to stores by that name, and the name never
+                reaches the stored metadata, so it can be changed later.
+              </Typography>
+              {config.stores.map((store, index) => (
+                <StoreField
+                  key={index}
+                  store={store}
+                  telegramEnabled={config.telegram.enabled}
+                  discordEnabled={config.discord.enabled}
+                  onUpdate={(field, value) => updateStore(index, field, value)}
+                  onDelete={
+                    config.stores.length > 1
+                      ? () => removeStore(index)
+                      : undefined
+                  }
+                  nameErrors={getStoreNameErrors(index)}
+                  channelErrors={getStoreChannelErrors(index)}
+                />
+              ))}
+              <Button
+                startIcon={<Add />}
+                onClick={addStore}
+                variant="outlined"
+                size="small"
+                sx={{ width: "fit-content" }}
+              >
+                Add Another Store
+              </Button>
+            </FormSection>
+
+            <FormSection title="File Systems">
+              <Typography variant="body2" color="text.secondary">
+                Each file system is a top-level directory over WebDAV and SFTP.
+                It has one primary store and any number of mirror stores;
+                primary and mirror can be swapped later with a config change.
+                Files that existed before a mirror was added are copied by the
+                backfill task (Manager API:{" "}
+                <code>POST /api/redundancy/backfill/&lt;file system&gt;</code>
+                ).
+              </Typography>
+              {config.filesystems.map((filesystem, index) => (
+                <FilesystemField
+                  key={index}
+                  filesystem={filesystem}
+                  stores={config.stores}
+                  onUpdate={(field, value) =>
+                    updateFilesystem(index, field, value)
+                  }
+                  onUpdateMetadata={(entry) =>
+                    updateFilesystemMetadata(index, entry)
+                  }
+                  onUpdateMetadataMirror={(mirrorIndex, entry) =>
+                    updateFilesystemMetadataMirror(index, mirrorIndex, entry)
+                  }
+                  onAddMetadataMirror={() => addFilesystemMetadataMirror(index)}
+                  onRemoveMetadataMirror={(mirrorIndex) =>
+                    removeFilesystemMetadataMirror(index, mirrorIndex)
+                  }
+                  onDelete={
+                    config.filesystems.length > 1
+                      ? () => removeFilesystem(index)
+                      : undefined
+                  }
+                  nameErrors={getFilesystemNameErrors(index)}
+                  primaryErrors={getFilesystemPrimaryErrors(index)}
+                  mirrorErrors={getFilesystemMirrorErrors(index)}
+                  metadataErrors={getFilesystemMetadataErrors(index)}
+                  needsSharedStore={filesystemNeedsSharedStore(index)}
+                  cacheEnabled={config.vulquantafs.cache.enabled}
+                />
+              ))}
+              <Button
+                startIcon={<Add />}
+                onClick={addFilesystem}
+                variant="outlined"
+                size="small"
+                sx={{ width: "fit-content" }}
+              >
+                Add Another File System
+              </Button>
+            </FormSection>
+
+            <FormSection title="Telegram (Optional)">
+              <FormControlLabel
+                label="Enable the Telegram backend"
+                control={
+                  <Checkbox
+                    checked={config.telegram.enabled}
+                    onChange={(e) =>
+                      updateConfig("telegram.enabled", e.target.checked)
+                    }
+                  />
+                }
+              />
+              {!config.telegram.enabled && (
+                <Alert severity="info">
+                  Telegram is off: no Telegram store can be used and the
+                  block is left out of the config. A Discord-only deployment
+                  needs the Discord backend below.
+                </Alert>
+              )}
+              {config.telegram.enabled && !telegramUsed && (
+                <Alert severity="info">
+                  No store uses Telegram; this block is left out of the
+                  config.
+                </Alert>
+              )}
+              {config.telegram.enabled && (
+                <>
+                  <Box
+                    sx={{
+                      display: "flex",
+                      flexWrap: "wrap",
+                      alignItems: "center",
+                      gap: 2,
+                      mb: 2,
+                    }}
+                  >
+                    <Typography variant="h6">API Credentials</Typography>
+                    <Button
+                      variant="outlined"
+                      size="small"
+                      component="a"
+                      href="https://my.telegram.org/apps"
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      sx={{ textTransform: "none" }}
+                    >
+                      Get API Keys
+                    </Button>
+                  </Box>
+                  <FieldRow justifyContent="space-between">
+                    <ConfigTextField
+                      label="API ID"
+                      value={config.telegram.api_id}
+                      onChange={(e) =>
+                        updateConfig("telegram.api_id", e.target.value)
+                      }
+                      style={{ flex: 1 }}
+                      required={telegramUsed}
+                    />
+                    <ConfigTextField
+                      label="API Hash"
+                      value={config.telegram.api_hash}
+                      onChange={(e) =>
+                        updateConfig("telegram.api_hash", e.target.value)
+                      }
+                      style={{ flex: 1 }}
+                      required={telegramUsed}
+                    />
+                    <FormControl size="small" sx={{ minWidth: 200 }}>
+                      <InputLabel>Telegram Library</InputLabel>
+                      <Select
+                        value={config.telegram.lib}
+                        label="Telegram Library"
+                        onChange={(e) =>
+                          updateConfig(
+                            "telegram.lib",
+                            e.target.value as "pyrogram" | "telethon"
+                          )
+                        }
+                      >
+                        <MenuItem value="pyrogram">Pyrogram</MenuItem>
+                        <MenuItem value="telethon">Telethon</MenuItem>
+                      </Select>
+                    </FormControl>
+                  </FieldRow>
+
+                  <FormControlLabel
+                    label="Use user account to upload files (No benefit unless you are a premium user)"
+                    control={
+                      <Checkbox
+                        checked={withUserAccountUpload}
+                        onChange={(e) => {
+                          setWithUserAccountUpload(e.target.checked);
+                        }}
+                      />
+                    }
+                  />
+                  <FormControlLabel
+                    label="Use user account to download files (No known benefit)"
+                    control={
+                      <Checkbox
+                        checked={withUserAccountDownload}
+                        onChange={(e) => {
+                          setWithUserAccountDownload(e.target.checked);
+                        }}
+                      />
+                    }
+                  />
+
+                  <Box>
+                    <Box
+                      sx={{
+                        display: "flex",
+                        flexWrap: "wrap",
+                        alignItems: "center",
+                        gap: 2,
+                        mt: 2,
+                        mb: 2,
+                      }}
+                    >
+                      <Typography variant="h6">Bot Tokens</Typography>
+                      <Button
+                        variant="outlined"
+                        size="small"
+                        component="a"
+                        href="https://t.me/botfather"
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        sx={{ textTransform: "none" }}
+                      >
+                        @BotFather
+                      </Button>
+                    </Box>
+                    <Typography variant="body2" color="text.secondary" sx={{ mb: 1 }}>
+                      Every bot must be admin in every Telegram store, mirrors
+                      included. A primary channel with &quot;Restrict saving
+                      content&quot; enabled cannot be forwarded from; the auto copy
+                      mode then re-uploads.
+                    </Typography>
+                    {config.telegram.bot.tokens.map((token, index) => (
+                      <BotTokenField
+                        key={index}
+                        index={index}
+                        value={token}
+                        onChange={(value) => updateBotToken(index, value)}
+                        onDelete={
+                          index > 0 ? () => removeBotToken(index) : undefined
+                        }
+                      />
+                    ))}
+                    <Button
+                      startIcon={<Add />}
+                      onClick={addBotToken}
+                      variant="outlined"
+                      size="small"
+                      sx={{ mt: 1 }}
+                    >
+                      Add Another Bot Token
+                    </Button>
+                  </Box>
+                </>
+              )}
+            </FormSection>
+
+            <FormSection title="Discord (Optional)">
+              <Typography variant="body2" color="text.secondary">
+                Discord channels can be stores too, as primaries or as mirrors.
+                Create an application at{" "}
+                <a
+                  href="https://discord.com/developers/applications"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                >
+                  <u>discord.com/developers</u>
+                </a>
+                , add a bot, enable the Message Content intent and invite it
+                with View Channel, Send Messages, Manage Messages, Read Message
+                History, Attach Files and Pin Messages.
+              </Typography>
+              <FormControlLabel
+                label="Enable the Discord backend"
+                control={
+                  <Checkbox
+                    checked={config.discord.enabled}
+                    onChange={(e) => updateDiscord("enabled", e.target.checked)}
+                  />
+                }
+              />
+              {config.discord.enabled && (
+                <>
+                  {config.discord.bot_tokens.map((token, index) => (
+                    <BotTokenField
+                      key={index}
+                      index={index}
+                      value={token}
+                      onChange={(value) => updateDiscordToken(index, value)}
+                      onDelete={
+                        index > 0
+                          ? () =>
+                              updateDiscord(
+                                "bot_tokens",
+                                config.discord.bot_tokens.filter(
+                                  (_, i) => i !== index
+                                )
+                              )
+                          : undefined
+                      }
+                    />
+                  ))}
+                  <Button
+                    startIcon={<Add />}
+                    onClick={() =>
+                      updateDiscord("bot_tokens", [
+                        ...config.discord.bot_tokens,
+                        "",
+                      ])
+                    }
+                    variant="outlined"
+                    size="small"
+                    sx={{ width: "fit-content" }}
+                  >
+                    Add Another Bot Token
+                  </Button>
+                  <FieldRow>
+                    <FormControl size="small" sx={{ minWidth: 260 }}>
+                      <InputLabel>Attachment Limit</InputLabel>
+                      <Select
+                        value={config.discord.max_file_size_bytes}
+                        label="Attachment Limit"
+                        onChange={(e) =>
+                          updateDiscord(
+                            "max_file_size_bytes",
+                            Number(e.target.value)
+                          )
+                        }
+                      >
+                        <MenuItem value={10000000}>
+                          10 MB (safe everywhere)
+                        </MenuItem>
+                        <MenuItem value={20000000}>
+                          20 MB (unboosted server, since Aug 2026)
+                        </MenuItem>
+                        <MenuItem value={50000000}>50 MB (boost level 2)</MenuItem>
+                        <MenuItem value={100000000}>
+                          100 MB (boost level 3)
+                        </MenuItem>
+                      </Select>
+                    </FormControl>
+                  </FieldRow>
+                  <Typography variant="body2" color="text.secondary">
+                    Files are cut into attachments of this size. A value above
+                    what the server allows makes every upload fail, so pick the
+                    tier of the server the channels are in.
+                  </Typography>
+                  <FormControlLabel
+                    label="Delete Discord messages when a file is removed"
+                    control={
+                      <Checkbox
+                        checked={config.discord.delete_messages_on_remove}
+                        onChange={(e) =>
+                          updateDiscord(
+                            "delete_messages_on_remove",
+                            e.target.checked
+                          )
+                        }
+                      />
+                    }
+                  />
+                </>
+              )}
+            </FormSection>
+
+            <FormSection title="VulquantaFS">
+              <Box>
+                <Typography variant="h6" sx={{ mb: 2 }}>
+                  Users
+                </Typography>
+                {config.vulquantafs.users.map((user, index) => (
+                  <UserField
+                    key={index}
+                    username={user.username}
+                    password={user.password}
+                    readonly={user.readonly}
+                    onUsernameChange={(username) =>
+                      updateUser(index, "username", username)
+                    }
+                    onPasswordChange={(password) =>
+                      updateUser(index, "password", password)
+                    }
+                    onReadonlyChange={(readonly) =>
+                      updateUser(index, "readonly", readonly)
+                    }
+                    onDelete={index > 0 ? () => removeUser(index) : undefined}
+                    canDelete={index > 0}
+                  />
+                ))}
+                <Button
+                  startIcon={<Add />}
+                  onClick={addUser}
+                  variant="outlined"
+                  size="small"
+                  sx={{ mt: 1, width: "fit-content" }}
+                >
+                  Add Another User
+                </Button>
+              </Box>
+              <Typography variant="h6" sx={{ mt: 2, mb: 1 }}>
+                JWT
+              </Typography>
+              <Box sx={{ display: "flex", flexWrap: "wrap", gap: 1, mb: 2 }}>
+                <ConfigTextField
+                  label="JWT Secret"
+                  value={config.vulquantafs.jwt.secret}
+                  onChange={(e) =>
+                    updateConfig("vulquantafs.jwt.secret", e.target.value)
+                  }
+                  sx={{ flex: 1 }}
+                />
+                <Button
+                  variant="outlined"
+                  size="small"
+                  startIcon={<Refresh />}
+                  onClick={regenerateJwtSecret}
+                  sx={{ minWidth: "120px" }}
+                >
+                  Regenerate
+                </Button>
+              </Box>
+              <Typography variant="h6" sx={{ mt: 2, mb: 1 }}>
+                Server
+              </Typography>
+              <FieldRow>
+                <ConfigTextField
+                  label="Host"
+                  value={config.vulquantafs.server.host}
+                  onChange={(e) =>
+                    updateConfig("vulquantafs.server.host", e.target.value)
+                  }
+                  width={200}
+                />
+                <ConfigTextField
+                  label="Port"
+                  type="number"
+                  value={config.vulquantafs.server.port}
+                  onChange={(e) =>
+                    updateConfig("vulquantafs.server.port", parseInt(e.target.value))
+                  }
+                  width={120}
+                />
+              </FieldRow>
+              <Typography variant="body2" color="text.secondary">
+                WebDAV server will be at{" "}
+                <code>
+                  http://{config.vulquantafs.server.host}:{config.vulquantafs.server.port}
+                  /webdav
+                </code>
+              </Typography>
+              <Typography variant="body2" color="text.secondary">
+                VulquantaFS server will be at{" "}
+                <code>
+                  http://{config.vulquantafs.server.host}:{config.vulquantafs.server.port}
+                </code>{" "}
+                {"("}Used in the{" "}
+                <a href={`${PAGES_URL}/telegram-mini-app/`}>
+                  <u>Telegram Mini App</u>
+                </a>
+                {")"}.
+              </Typography>
+            </FormSection>
+
+            <FormSection title="SFTP (Optional)">
+              <Typography variant="body2" color="text.secondary" sx={{ mb: 1 }}>
+                Serves the same file tree over SFTP, next to WebDAV, using the
+                same users and the same readonly flags. SSH cannot share the
+                HTTP port, so it needs a port of its own.
+              </Typography>
+              <FormControlLabel
+                label="Enable the SFTP interface"
+                control={
+                  <Checkbox
+                    checked={config.vulquantafs.sftp.enabled}
+                    onChange={(e) =>
+                      updateConfig("vulquantafs.sftp", {
+                        ...config.vulquantafs.sftp,
+                        enabled: e.target.checked,
+                      })
+                    }
+                  />
+                }
+              />
+              {config.vulquantafs.sftp.enabled && (
+                <>
+                  <FieldRow>
+                    <ConfigTextField
+                      label="Host"
+                      value={config.vulquantafs.sftp.host}
+                      onChange={(e) =>
+                        updateConfig("vulquantafs.sftp", {
+                          ...config.vulquantafs.sftp,
+                          host: e.target.value,
+                        })
+                      }
+                      width={200}
+                    />
+                    <ConfigTextField
+                      label="Port"
+                      type="number"
+                      value={config.vulquantafs.sftp.port}
+                      onChange={(e) =>
+                        updateConfig("vulquantafs.sftp", {
+                          ...config.vulquantafs.sftp,
+                          port: parseInt(e.target.value),
+                        })
+                      }
+                      width={120}
+                    />
+                  </FieldRow>
+                  <Typography variant="body2" color="text.secondary">
+                    Connect with{" "}
+                    <code>
+                      sftp -P {config.vulquantafs.sftp.port} &lt;user&gt;@
+                      {config.vulquantafs.sftp.host}
+                    </code>
+                  </Typography>
+                  <FieldRow>
+                    <ConfigTextField
+                      label="Host Key File"
+                      value={config.vulquantafs.sftp.host_key_file}
+                      onChange={(e) =>
+                        updateConfig("vulquantafs.sftp", {
+                          ...config.vulquantafs.sftp,
+                          host_key_file: e.target.value,
+                        })
+                      }
+                      width={280}
+                    />
+                    <ConfigTextField
+                      label="Upload Buffer (MB)"
+                      type="number"
+                      value={config.vulquantafs.sftp.upload_buffer_size_mb}
+                      onChange={(e) =>
+                        updateConfig("vulquantafs.sftp", {
+                          ...config.vulquantafs.sftp,
+                          upload_buffer_size_mb: parseInt(e.target.value),
+                        })
+                      }
+                      width={180}
+                    />
+                  </FieldRow>
+                  <Typography
+                    variant="body2"
+                    color="text.secondary"
+                    sx={{ mb: 1 }}
+                  >
+                    The host key is generated on first start and must be backed
+                    up — a new one on every restart makes clients refuse to
+                    connect. SFTP never announces an upload&apos;s size, so a
+                    file is buffered in memory up to the size above and spills
+                    to disk beyond it.
+                  </Typography>
+                  <ConfigTextField
+                    label="Authorized Keys Directory (optional)"
+                    value={config.vulquantafs.sftp.authorized_keys_dir}
+                    onChange={(e) =>
+                      updateConfig("vulquantafs.sftp", {
+                        ...config.vulquantafs.sftp,
+                        authorized_keys_dir: e.target.value,
+                      })
+                    }
+                    width={360}
+                  />
+                  <Typography variant="body2" color="text.secondary">
+                    Leave empty for password login only. Otherwise put one file
+                    per user in that directory, named after the username, in
+                    the usual <code>authorized_keys</code> format. The user
+                    still has to be listed above so the readonly flag applies.
+                  </Typography>
+                </>
+              )}
+            </FormSection>
+
+            <FormSection title="Encryption (Optional)">
+              <Typography variant="body2" color="text.secondary" sx={{ mb: 1 }}>
+                At-rest encryption with AES-256-GCM. When enabled, every file
+                is encrypted client-side before being uploaded; the Telegram
+                channel only ever sees ciphertext plus a public per-file salt.
+              </Typography>
+              <EncryptionField
+                config={config.vulquantafs.encryption}
+                onUpdate={(field, value) =>
+                  updateConfig("vulquantafs.encryption", {
+                    ...config.vulquantafs.encryption,
+                    [field]: value,
+                  })
+                }
+              />
+            </FormSection>
+
+            <FormSection title="Local Cache (Optional)">
+              <Typography variant="body2" color="text.secondary" sx={{ mb: 1 }}>
+                A cache on the data volume. Uploads are staged into it while
+                they stream to the primary store, so the mirrors read the
+                file from disk instead of downloading it from the primary
+                again; kept after replication, it also serves repeated
+                reads. It holds what the stores hold: ciphertext when
+                encryption is on, never plaintext. Keep the directory on the
+                mounted data volume so it survives a container restart, and
+                give it room for the budget plus one upload in flight.
+              </Typography>
+              <FormControlLabel
+                label="Enable the local cache"
+                control={
+                  <Checkbox
+                    checked={config.vulquantafs.cache.enabled}
+                    onChange={(e) =>
+                      updateConfig("vulquantafs.cache", {
+                        ...config.vulquantafs.cache,
+                        enabled: e.target.checked,
+                      })
+                    }
+                  />
+                }
+              />
+              {config.vulquantafs.cache.enabled && (
+                <>
+                  <FieldRow>
+                    <ConfigTextField
+                      label="Directory (relative to the data dir)"
+                      value={config.vulquantafs.cache.dir}
+                      onChange={(e) =>
+                        updateConfig("vulquantafs.cache", {
+                          ...config.vulquantafs.cache,
+                          dir: e.target.value,
+                        })
+                      }
+                      width={260}
+                    />
+                    <ConfigTextField
+                      label="Block size (KiB)"
+                      type="number"
+                      value={config.vulquantafs.cache.block_kb}
+                      onChange={(e) =>
+                        updateConfig("vulquantafs.cache", {
+                          ...config.vulquantafs.cache,
+                          block_kb: parseInt(e.target.value) || 0,
+                        })
+                      }
+                      error={config.vulquantafs.cache.block_kb < 64}
+                      helperText={
+                        config.vulquantafs.cache.block_kb < 64 ? "At least 64 KiB" : undefined
+                      }
+                      width={160}
+                    />
+                  </FieldRow>
+                  <FieldRow>
+                    <ConfigTextField
+                      label="Total budget (MB, 0 = unlimited)"
+                      type="number"
+                      value={config.vulquantafs.cache.max_size_mb}
+                      onChange={(e) =>
+                        updateConfig("vulquantafs.cache", {
+                          ...config.vulquantafs.cache,
+                          max_size_mb: parseInt(e.target.value) || 0,
+                        })
+                      }
+                      width={220}
+                    />
+                    <ConfigTextField
+                      label="Max cached versions (0 = unlimited)"
+                      type="number"
+                      value={config.vulquantafs.cache.max_files}
+                      onChange={(e) =>
+                        updateConfig("vulquantafs.cache", {
+                          ...config.vulquantafs.cache,
+                          max_files: parseInt(e.target.value) || 0,
+                        })
+                      }
+                      width={240}
+                    />
+                    <ConfigTextField
+                      label="Max staged version (MB, 0 = unlimited)"
+                      type="number"
+                      value={config.vulquantafs.cache.max_file_size_mb}
+                      onChange={(e) =>
+                        updateConfig("vulquantafs.cache", {
+                          ...config.vulquantafs.cache,
+                          max_file_size_mb: parseInt(e.target.value) || 0,
+                        })
+                      }
+                      width={260}
+                    />
+                  </FieldRow>
+                  <FieldRow>
+                    <ConfigTextField
+                      label="Keep free on disk (MB, 0 = off)"
+                      type="number"
+                      value={config.vulquantafs.cache.min_free_mb}
+                      onChange={(e) =>
+                        updateConfig("vulquantafs.cache", {
+                          ...config.vulquantafs.cache,
+                          min_free_mb: parseInt(e.target.value) || 0,
+                        })
+                      }
+                      helperText="Headroom for everything else in the data directory"
+                      width={220}
+                    />
+                    <ConfigTextField
+                      label="Drop entries unread for (hours, 0 = never)"
+                      type="number"
+                      value={config.vulquantafs.cache.max_age_hours}
+                      onChange={(e) =>
+                        updateConfig("vulquantafs.cache", {
+                          ...config.vulquantafs.cache,
+                          max_age_hours: parseInt(e.target.value) || 0,
+                        })
+                      }
+                      width={260}
+                    />
+                    <ConfigTextField
+                      label="Sweep down to (% of budget)"
+                      type="number"
+                      value={config.vulquantafs.cache.target_fill_percent}
+                      onChange={(e) =>
+                        updateConfig("vulquantafs.cache", {
+                          ...config.vulquantafs.cache,
+                          target_fill_percent: parseInt(e.target.value) || 0,
+                        })
+                      }
+                      error={
+                        config.vulquantafs.cache.target_fill_percent < 1 ||
+                        config.vulquantafs.cache.target_fill_percent > 100
+                      }
+                      helperText={
+                        config.vulquantafs.cache.target_fill_percent < 1 ||
+                        config.vulquantafs.cache.target_fill_percent > 100
+                          ? "Between 1 and 100"
+                          : "100 evicts only when an upload needs the room"
+                      }
+                      width={220}
+                    />
+                  </FieldRow>
+                  <FormControlLabel
+                    label="Stage uploads for the mirrors (the mirrors read the local copy instead of the primary)"
+                    control={
+                      <Checkbox
+                        checked={config.vulquantafs.cache.stage_uploads}
+                        onChange={(e) =>
+                          updateConfig("vulquantafs.cache", {
+                            ...config.vulquantafs.cache,
+                            stage_uploads: e.target.checked,
+                          })
+                        }
+                      />
+                    }
+                  />
+                  <FormControlLabel
+                    label="Keep entries for reads (evicted least-recently-used within the budget)"
+                    control={
+                      <Checkbox
+                        checked={config.vulquantafs.cache.keep_for_reads}
+                        onChange={(e) =>
+                          updateConfig("vulquantafs.cache", {
+                            ...config.vulquantafs.cache,
+                            keep_for_reads: e.target.checked,
+                          })
+                        }
+                      />
+                    }
+                  />
+                </>
+              )}
+            </FormSection>
+
+            <FormSection title="Large Folders (Optional)">
+              <Typography variant="body2" color="text.secondary" sx={{ mb: 1 }}>
+                A folder listing shows the size and dates of every file, and
+                those live in each file&apos;s descriptor message, not in the
+                directory tree. Without these settings a folder of 10,000
+                files costs about 20,000 store reads per listing.
+              </Typography>
+              <FormControlLabel
+                label="Keep size and dates in the metadata (every instance that writes must support it)"
+                control={
+                  <Checkbox
+                    checked={config.vulquantafs.listing.stat_in_metadata}
+                    onChange={(e) =>
+                      updateConfig("vulquantafs.listing", {
+                        ...config.vulquantafs.listing,
+                        stat_in_metadata: e.target.checked,
+                      })
+                    }
+                  />
+                }
+              />
+              <FormControlLabel
+                label="Check the content messages while listing (off: only on read)"
+                control={
+                  <Checkbox
+                    checked={config.vulquantafs.listing.validate_on_list}
+                    onChange={(e) =>
+                      updateConfig("vulquantafs.listing", {
+                        ...config.vulquantafs.listing,
+                        validate_on_list: e.target.checked,
+                      })
+                    }
+                  />
+                }
+              />
+              <FieldRow>
+                <ConfigTextField
+                  label="Messages kept in memory per channel"
+                  type="number"
+                  value={config.vulquantafs.listing.message_cache_size}
+                  onChange={(e) =>
+                    updateConfig("vulquantafs.listing", {
+                      ...config.vulquantafs.listing,
+                      message_cache_size: parseInt(e.target.value) || 0,
+                    })
+                  }
+                  error={config.vulquantafs.listing.message_cache_size < 1}
+                  helperText={
+                    config.vulquantafs.listing.message_cache_size < 1
+                      ? "At least 1"
+                      : undefined
+                  }
+                  width={260}
+                />
+              </FieldRow>
+            </FormSection>
+
+            <FormSection title="Transfer Performance (Optional)">
+              <Typography variant="body2" color="text.secondary" sx={{ mb: 1 }}>
+                How file bytes are moved to and from Telegram. Every setting
+                has a default that matches the behaviour you get without this
+                block, so leave it off unless you want to tune something.
+              </Typography>
+              <FormControlLabel
+                label="Tune transfer settings"
+                control={
+                  <Checkbox
+                    checked={config.vulquantafs.transfer.enabled}
+                    onChange={(e) =>
+                      updateConfig("vulquantafs.transfer", {
+                        ...config.vulquantafs.transfer,
+                        enabled: e.target.checked,
+                      })
+                    }
+                  />
+                }
+              />
+              {config.vulquantafs.transfer.enabled && (
+                <>
+                  <Typography variant="subtitle2" sx={{ mt: 1 }}>
+                    Downloads
+                  </Typography>
+                  <FieldRow>
+                    <ConfigTextField
+                      label="Piece Size (KB)"
+                      type="number"
+                      value={config.vulquantafs.transfer.download_piece_size_kb}
+                      onChange={(e) =>
+                        updateConfig("vulquantafs.transfer", {
+                          ...config.vulquantafs.transfer,
+                          download_piece_size_kb: parseInt(e.target.value),
+                        })
+                      }
+                      width={170}
+                    />
+                    <ConfigTextField
+                      label="Pieces In Flight"
+                      type="number"
+                      value={config.vulquantafs.transfer.download_pieces_in_flight}
+                      onChange={(e) =>
+                        updateConfig("vulquantafs.transfer", {
+                          ...config.vulquantafs.transfer,
+                          download_pieces_in_flight: parseInt(e.target.value),
+                        })
+                      }
+                      width={170}
+                    />
+                    <ConfigTextField
+                      label="Split Above (MB)"
+                      type="number"
+                      value={
+                        config.vulquantafs.transfer.parallel_download_threshold_mb
+                      }
+                      onChange={(e) =>
+                        updateConfig("vulquantafs.transfer", {
+                          ...config.vulquantafs.transfer,
+                          parallel_download_threshold_mb: parseInt(
+                            e.target.value
+                          ),
+                        })
+                      }
+                      width={170}
+                    />
+                  </FieldRow>
+                  <Typography
+                    variant="body2"
+                    color="text.secondary"
+                    sx={{ mb: 1 }}
+                  >
+                    A download is cut into pieces and several are fetched at
+                    once. Bytes have to be handed out in order, so a piece
+                    that arrives early waits its turn:{" "}
+                    <strong>
+                      peak buffering is{" "}
+                      {(
+                        (config.vulquantafs.transfer.download_piece_size_kb *
+                          config.vulquantafs.transfer.download_pieces_in_flight) /
+                        1024
+                      ).toFixed(0)}{" "}
+                      MiB per download
+                    </strong>
+                    , for every reader at the same time.
+                  </Typography>
+
+                  <Typography variant="subtitle2" sx={{ mt: 1 }}>
+                    Connections
+                  </Typography>
+                  <ConfigTextField
+                    label="Connections Per Bot"
+                    type="number"
+                    value={config.vulquantafs.transfer.connection_pool_size}
+                    onChange={(e) =>
+                      updateConfig("vulquantafs.transfer", {
+                        ...config.vulquantafs.transfer,
+                        connection_pool_size: parseInt(e.target.value),
+                      })
+                    }
+                    width={200}
+                  />
+                  <Typography
+                    variant="body2"
+                    color="text.secondary"
+                    sx={{ mb: 1 }}
+                  >
+                    Pieces are handed to the bot tokens above in turn, so each
+                    extra token is another connection a download can use. With
+                    a single token, raise this instead: one connection sends
+                    its requests one after another, so extra connections are
+                    what let one bot overlap transfers.
+                  </Typography>
+
+                  <Typography variant="subtitle2" sx={{ mt: 1 }}>
+                    Uploads
+                  </Typography>
+                  <FieldRow>
+                    <ConfigTextField
+                      label="Workers (Small Files)"
+                      type="number"
+                      value={config.vulquantafs.transfer.upload_workers_small}
+                      onChange={(e) =>
+                        updateConfig("vulquantafs.transfer", {
+                          ...config.vulquantafs.transfer,
+                          upload_workers_small: parseInt(e.target.value),
+                        })
+                      }
+                      width={190}
+                    />
+                    <ConfigTextField
+                      label="Workers (Large Files)"
+                      type="number"
+                      value={config.vulquantafs.transfer.upload_workers_big}
+                      onChange={(e) =>
+                        updateConfig("vulquantafs.transfer", {
+                          ...config.vulquantafs.transfer,
+                          upload_workers_big: parseInt(e.target.value),
+                        })
+                      }
+                      width={190}
+                    />
+                    <FormControl size="small" sx={{ minWidth: 150 }}>
+                      <InputLabel>Part Size (KB)</InputLabel>
+                      <Select
+                        label="Part Size (KB)"
+                        value={config.vulquantafs.transfer.upload_part_size_kb}
+                        onChange={(e) =>
+                          updateConfig("vulquantafs.transfer", {
+                            ...config.vulquantafs.transfer,
+                            upload_part_size_kb: Number(e.target.value),
+                          })
+                        }
+                      >
+                        {[64, 128, 256, 512].map((size) => (
+                          <MenuItem key={size} value={size}>
+                            {size}
+                          </MenuItem>
+                        ))}
+                      </Select>
+                    </FormControl>
+                    <ConfigTextField
+                      label="Tee Buffer per Mirror (MB)"
+                      type="number"
+                      value={config.vulquantafs.transfer.tee_buffer_mb}
+                      onChange={(e) =>
+                        updateConfig("vulquantafs.transfer", {
+                          ...config.vulquantafs.transfer,
+                          tee_buffer_mb: parseInt(e.target.value) || 1,
+                        })
+                      }
+                      width={220}
+                    />
+                  </FieldRow>
+                  <Typography
+                    variant="body2"
+                    color="text.secondary"
+                    sx={{ mb: 1 }}
+                  >
+                    The tee buffer only matters for file systems with Sync set
+                    to Tee: it is how much of the upload stream waits per
+                    mirror between the primary&apos;s reads and the
+                    mirror&apos;s upload. A full buffer pauses the primary
+                    until the mirror catches up, so a larger buffer smooths
+                    out a slow mirror at the cost of memory per upload in
+                    flight.
+                  </Typography>
+                  <Typography
+                    variant="body2"
+                    color="text.secondary"
+                    sx={{ mb: 1 }}
+                  >
+                    Telegram only accepts part sizes that divide 512 KB and
+                    caps them there, which is why this is a fixed list. More
+                    workers means more requests per second; if uploads start
+                    logging flood waits, lower this and the connection count
+                    before raising anything else.
+                  </Typography>
+
+                  <Typography variant="subtitle2" sx={{ mt: 1 }}>
+                    Chunk Cache
+                  </Typography>
+                  <FieldRow>
+                    <ConfigTextField
+                      label="Cache Budget (MB)"
+                      type="number"
+                      value={config.vulquantafs.transfer.chunk_cache_mb}
+                      onChange={(e) =>
+                        updateConfig("vulquantafs.transfer", {
+                          ...config.vulquantafs.transfer,
+                          chunk_cache_mb: parseInt(e.target.value),
+                        })
+                      }
+                      width={170}
+                    />
+                    <ConfigTextField
+                      label="Block Size (KB)"
+                      type="number"
+                      value={config.vulquantafs.transfer.chunk_cache_block_kb}
+                      onChange={(e) =>
+                        updateConfig("vulquantafs.transfer", {
+                          ...config.vulquantafs.transfer,
+                          chunk_cache_block_kb: parseInt(e.target.value),
+                        })
+                      }
+                      width={170}
+                    />
+                    <ConfigTextField
+                      label="Read-Ahead Blocks"
+                      type="number"
+                      value={config.vulquantafs.transfer.chunk_cache_readahead}
+                      onChange={(e) =>
+                        updateConfig("vulquantafs.transfer", {
+                          ...config.vulquantafs.transfer,
+                          chunk_cache_readahead: parseInt(e.target.value),
+                        })
+                      }
+                      width={170}
+                    />
+                  </FieldRow>
+                  <Typography variant="body2" color="text.secondary">
+                    Keeps downloaded blocks in memory, so readers that revisit
+                    bytes stop fetching them twice: seeking in a video, or an
+                    SFTP client walking a file in small reads. A budget of 0
+                    disables it. A read of a few kilobytes pulls a whole
+                    block, so a larger block serves more of the reads that
+                    follow and wastes more on readers that jump around.
+                  </Typography>
+                </>
+              )}
+            </FormSection>
+          </Paper>
+        </Box>
+
+        <ColumnResizeHandle
+          containerRef={columnsRef}
+          width={sidebarWidth}
+          onChange={setDragWidth}
+          onCommit={(width) => {
+            setDragWidth(null);
+            setSidebarWidth(width);
+          }}
+          onReset={() => {
+            setDragWidth(null);
+            setSidebarWidth(DEFAULT_SETTINGS.sidebarWidth);
+          }}
+        />
+
+        <Box
+          sx={{
+            width: { xs: "100%", lg: sidebarWidth },
+            maxWidth: { lg: "calc(100% - 522px)" },
+            flexShrink: 0,
+          }}
+        >
+          <Paper
+            className="dcfs-glass"
+            sx={{
+              p: 3,
+              position: { xs: "static", lg: "sticky" },
+              top: 24,
+              // Taller than the viewport, the panel scrolls on its own so
+              // the Docker command below the YAML stays reachable.
+              maxHeight: { lg: "calc(100vh - 48px)" },
+              overflowY: "auto",
+            }}
+          >
+            <Typography variant="h6" gutterBottom>
+              Generated Configuration
+            </Typography>
+
+            <Box sx={{ mb: 2 }}>
+              <Button
+                fullWidth
+                variant="contained"
+                startIcon={<Download />}
+                onClick={downloadConfig}
+                sx={{ mb: 1 }}
+              >
+                Download config.yaml
+              </Button>
+              <Button
+                fullWidth
+                variant="outlined"
+                startIcon={<ContentCopy />}
+                onClick={copyToClipboard}
+                sx={{ mb: 1 }}
+              >
+                Copy to Clipboard
+              </Button>
+              <Button
+                fullWidth
+                variant="outlined"
+                startIcon={<BugReport />}
+                onClick={downloadRedactedConfig}
+                sx={{ mb: 1 }}
+              >
+                Download redacted config
+              </Button>
+              <Typography
+                variant="body2"
+                color="text.secondary"
+                sx={{ mb: 1 }}
+              >
+                For bug reports: secrets are replaced with{' '}
+                <code>{"<redacted>"}</code>.
+              </Typography>
+              <LoadConfigButton
+                fullWidth
+                onLoad={loadConfig}
+                onError={(message) =>
+                  setImportResult({
+                    severity: "error",
+                    message: `The file could not be read: ${message}`,
+                    notes: [],
+                  })
+                }
+              />
+            </Box>
+
+            <Card
+              variant="outlined"
+              sx={{
+                borderColor: "rgba(148, 163, 184, 0.2)",
+                backgroundColor: "rgba(10, 16, 30, 0.8)",
+                borderRadius: 2,
+                overflow: "hidden",
+              }}
+            >
+              <CardContent sx={{ p: 0, "&:last-child": { pb: 0 } }}>
+                <Box
+                  sx={{
+                    display: "flex",
+                    alignItems: "center",
+                    gap: 0.5,
+                    px: 1.5,
+                    py: 1,
+                    borderBottom: "1px solid rgba(148, 163, 184, 0.15)",
+                  }}
+                >
+                  {["#ff5f57", "#febc2e", "#28c840"].map((color) => (
+                    <Box
+                      key={color}
+                      sx={{
+                        width: 10,
+                        height: 10,
+                        borderRadius: "50%",
+                        backgroundColor: color,
+                      }}
+                    />
+                  ))}
+                  <Typography
+                    variant="caption"
+                    sx={{
+                      ml: 1,
+                      color: "#64748b",
+                      fontFamily: "var(--font-geist-mono), monospace",
+                    }}
+                  >
+                    config.yaml
+                  </Typography>
+                </Box>
+                <SyntaxHighlighter
+                  language="yaml"
+                  style={vscDarkPlus}
+                  wrapLongLines
+                  customStyle={{
+                    fontSize: "0.75rem",
+                    margin: 0,
+                    background: "transparent",
+                  }}
+                  codeTagProps={{
+                    style: {
+                      ...vscDarkPlus["code[class*=\"language-\"]"],
+                      whiteSpace: "pre-wrap",
+                      wordBreak: "break-word",
+                    },
+                  }}
+                >
+                  {generateYaml()}
+                </SyntaxHighlighter>
+              </CardContent>
+            </Card>
+
+            <Divider sx={{ my: 3 }} />
+
+            <DockerRunPanel
+              image={DOCKERHUB_IMAGE}
+              ghcrImage={GHCR_IMAGE}
+              containerName="vulquantafs"
+              dataDir="/home/vulquantafs/.vulquantafs"
+              hostDirName=".vulquantafs"
+              ports={[
+                config.vulquantafs.server.port,
+                ...(config.vulquantafs.sftp.enabled ? [config.vulquantafs.sftp.port] : []),
+              ]}
+              envVars={
+                config.vulquantafs.encryption.enabled &&
+                config.vulquantafs.encryption.passphrase_source === "passphrase_env" &&
+                config.vulquantafs.encryption.passphrase_env.trim() !== ""
+                  ? [config.vulquantafs.encryption.passphrase_env.trim()]
+                  : []
+              }
+            />
+          </Paper>
+        </Box>
+      </Box>
+      </Container>
+      <CustomizePanel />
+    </div>
+  );
+}

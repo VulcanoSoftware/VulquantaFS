@@ -1,8 +1,8 @@
-"""Smoke-check a built TGDCFS image by serving SFTP from it and talking back.
+"""Smoke-check a built VulquantaFS image by serving SFTP from it and talking back.
 
 Building an image proves nothing about it running. Two things can break here
 that no unit test would catch: a dependency missing from the runtime layer, and
-the non-root ``tgdcfs`` user being unable to write the generated host key.
+the non-root ``vulquantafs`` user being unable to write the generated host key.
 
 ``main.py`` logs into Telegram before it serves anything, so the container
 cannot simply be started in CI. ``start_sftp_server`` takes the client map as an
@@ -17,7 +17,7 @@ Run it against an image with::
 or straight from a checkout with ``python scripts/docker_smoke_check.py``.
 
 Everything with a side effect lives under the ``__main__`` guard: this script
-points TGDCFS at a throwaway config through the environment, which would corrupt
+points VulquantaFS at a throwaway config through the environment, which would corrupt
 any process that merely imported it. The filename avoids pytest's collection
 patterns (``test_*.py`` and ``*_test.py``) for the same reason.
 """
@@ -28,7 +28,7 @@ import os
 import sys
 import tempfile
 
-PORT = int(os.environ.get("TGDCFS_SMOKE_PORT", "22222"))
+PORT = int(os.environ.get("VULQUANTAFS_SMOKE_PORT", "22222"))
 USERNAME = "smoke"
 PASSWORD = "smoke-password"  # noqa: S105 - throwaway credential for this check
 
@@ -42,7 +42,7 @@ telegram:
       - smoke_bot_token
   private_file_channel:
     - '1'
-tgdcfs:
+vulquantafs:
   users:
     {username}:
       password: {password}
@@ -69,13 +69,13 @@ logger = logging.getLogger("smoke")
 
 
 def prepare_environment() -> str:
-    """Write a throwaway config and point TGDCFS at it.
+    """Write a throwaway config and point VulquantaFS at it.
 
-    This has to happen before anything from ``tgdcfs`` is imported:
-    ``tgdcfs/auth/basic.py`` calls ``get_config()`` at import time, so the
+    This has to happen before anything from ``vulquantafs`` is imported:
+    ``vulquantafs/auth/basic.py`` calls ``get_config()`` at import time, so the
     environment must already be in place.
     """
-    data_dir = tempfile.mkdtemp(prefix="tgdcfs-smoke-")
+    data_dir = tempfile.mkdtemp(prefix="vulquantafs-smoke-")
     config_path = os.path.join(data_dir, "config.yaml")
 
     with open(config_path, "w", encoding="utf-8") as fh:
@@ -83,8 +83,8 @@ def prepare_environment() -> str:
             CONFIG_TEMPLATE.format(username=USERNAME, password=PASSWORD, port=PORT)
         )
 
-    os.environ["TGDCFS_DATA_DIR"] = data_dir
-    os.environ["TGDCFS_CONFIG_FILE"] = "config.yaml"
+    os.environ["VULQUANTAFS_DATA_DIR"] = data_dir
+    os.environ["VULQUANTAFS_CONFIG_FILE"] = "config.yaml"
     return data_dir
 
 
@@ -157,8 +157,8 @@ if __name__ == "__main__":
 
     import asyncssh
 
-    from tgdcfs.app.sftp import start_sftp_server
-    from tgdcfs.config import get_config
+    from vulquantafs.app.sftp import start_sftp_server
+    from vulquantafs.config import get_config
 
     try:
         asyncio.run(check_image())

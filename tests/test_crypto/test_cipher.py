@@ -1,4 +1,4 @@
-"""Unit tests for :mod:`tgdcfs.crypto.cipher`."""
+"""Unit tests for :mod:`vulquantafs.crypto.cipher`."""
 
 from __future__ import annotations
 
@@ -6,7 +6,7 @@ import os
 
 import pytest
 
-from tgdcfs.crypto.cipher import (
+from vulquantafs.crypto.cipher import (
     CHUNK_OVERHEAD,
     NONCE_SIZE,
     TAG_SIZE,

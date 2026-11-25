@@ -2,10 +2,10 @@
 
 import pytest
 
-from tgdcfs.crypto.header import HEADER_SIZE, FileHeader
-from tgdcfs.crypto.kdf import derive_file_key
-from tgdcfs.crypto.stream import EncryptingFileMessage
-from tgdcfs.reqres import FileMessageFromStream
+from vulquantafs.crypto.header import HEADER_SIZE, FileHeader
+from vulquantafs.crypto.kdf import derive_file_key
+from vulquantafs.crypto.stream import EncryptingFileMessage
+from vulquantafs.reqres import FileMessageFromStream
 
 MASTER_KEY = b"\x01" * 32
 CHUNK_SIZE = 64 * 1024

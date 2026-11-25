@@ -18,9 +18,9 @@ name: Sync README badges
 # so the workflow cannot run against its own commits.
 #
 # Besides the badges the sync script repoints the Pages and Docker Hub links
-# in the README. The web frontend (tgdcfs-gh-pages) needs no rewrite: it
+# in the README. The web frontend (vulquantafs-gh-pages) needs no rewrite: it
 # derives its Docker images and Pages links from the repository at build
-# time (see tgdcfs-gh-pages/next.config.ts).
+# time (see vulquantafs-gh-pages/next.config.ts).
 
 on:
   push:
