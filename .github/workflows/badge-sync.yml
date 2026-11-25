@@ -18,19 +18,25 @@ name: Sync README badges
 # so the workflow cannot run against its own commits.
 #
 # Besides the badges the sync script repoints the Pages and Docker Hub links
-# in the README. The web frontend (vulquantafs-gh-pages) needs no rewrite: it
+# in the README, including links left over from an earlier owner or an
+# earlier repository name (a rename or transfer heals on the next push). The web frontend (vulquantafs-gh-pages) needs no rewrite: it
 # derives its Docker images and Pages links from the repository at build
 # time (see vulquantafs-gh-pages/next.config.ts).
 
 on:
   push:
+    # Branches only: the commit step pushes back to github.ref_name, which
+    # makes no sense for a tag.
+    branches: [ "**" ]
   workflow_dispatch:
 
 permissions:
   contents: write
 
+# One run per branch: a shared group would let a push to one branch cancel
+# the sync of another.
 concurrency:
-  group: sync-readme-badges
+  group: sync-readme-badges-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
