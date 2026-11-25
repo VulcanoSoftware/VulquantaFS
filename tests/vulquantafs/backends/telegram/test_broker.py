@@ -207,6 +207,7 @@ class TestPoisonedBatch:
             return_exceptions=True,
         )
 
+        assert not isinstance(good, BaseException)
         assert _ids(good) == [1, 2]
         assert isinstance(bad, RuntimeError)
 
