@@ -13,7 +13,12 @@ from vulquantafs.core.repository.interface import (
     FDRepositoryResp,
     IFDRepository,
 )
-from vulquantafs.errors import MessageNotFound, RpcTimeoutError, TechnicalError
+from vulquantafs.errors import (
+    MessageNotFound,
+    RpcTimeoutError,
+    TechnicalError,
+    is_store_outage,
+)
 from vulquantafs.reqres import MessageResp
 
 logger = logging.getLogger(__name__)
@@ -407,7 +412,8 @@ class StoreFDRepository(IFDRepository):
                 f"Could not check the primary store for the parts of {fd.name}: "
                 f"{ex}; checking the mirrors"
             )
-            self._mirror_group.mark_primary_dead()
+            if is_store_outage(ex):
+                self._mirror_group.mark_primary_dead()
             file_messages = [None] * len(all_ids)
             fd.complete = False
 
@@ -522,8 +528,15 @@ class StoreFDRepository(IFDRepository):
         return empty
 
     async def _get_fd_text(self, fr: TGFSFileRef) -> Optional[str]:
-        """Read the FD JSON, falling back to mirror copies if needed."""
+        """Read the FD JSON, falling back to mirror copies if needed.
+
+        ``None`` means every place that could hold the descriptor said it
+        does not have it. A read that failed raises instead: a failed read
+        is not a missing file, and reporting it as one is what turned a
+        transient store problem into downloads of empty files.
+        """
         message = None
+        failure: Optional[Exception] = None
         acting = (
             self._mirror_group.store_for(fr.store)
             if self._mirror_group is not None
@@ -543,6 +556,7 @@ class StoreFDRepository(IFDRepository):
                     )
                 )[0]
             except Exception as ex:
+                failure = ex
                 logger.warning(
                     f"Could not read file descriptor {fr.message_id} for "
                     f"{fr.name} from the acting store {fr.store}: {ex}"
@@ -550,8 +564,14 @@ class StoreFDRepository(IFDRepository):
             if message and message.text:
                 return message.text
             message = None
+        # Skipping the primary is only worth it when a mirror copy of this
+        # very descriptor exists: without one there is nothing else to read
+        # from, and skipping turned one failed request into a minute of
+        # "not found" -- and an empty file -- for every such file.
         skip_primary = (
-            self._mirror_group is not None and self._mirror_group.primary_dead()
+            self._mirror_group is not None
+            and self._mirror_group.primary_dead()
+            and bool(fr.mirrors)
         )
         try:
             if acting is None and fr.owned_by(self.key) and not skip_primary:
@@ -562,22 +582,25 @@ class StoreFDRepository(IFDRepository):
                     )
                 )[0]
         except Exception as ex:
+            failure = ex
             logger.warning(
                 f"Could not read file descriptor {fr.message_id} for "
                 f"{fr.name} from the primary store: {ex}"
             )
             message = None
-            if self._mirror_group:
+            # A request that could not be built is a problem with this
+            # descriptor, not with the store: taking the primary away from
+            # every other file for a minute is how one bad id became a
+            # wave of empty downloads.
+            if self._mirror_group and is_store_outage(ex):
                 self._mirror_group.mark_primary_dead()
 
         if message and message.text:
             return message.text
 
-        if not self._mirror_group:
-            return None
-
+        group = self._mirror_group
         for store_key, mirror_mid in fr.mirrors.items():
-            if (api := self._mirror_group.store_for(store_key)) is None:
+            if group is None or (api := group.store_for(store_key)) is None:
                 continue
             try:
                 mirror_message = (
@@ -608,6 +631,11 @@ class StoreFDRepository(IFDRepository):
                 f"store {fr.store}, which is not configured here; it cannot be "
                 f"read from {self.key}"
             )
+        if failure is not None:
+            raise TechnicalError(
+                f"The file descriptor of {fr.name} could not be read: {failure}",
+                cause=str(failure) or type(failure).__name__,
+            )
         return None
 
     def _trust_recorded(self, fd: TGFSFileDesc) -> TGFSFileDesc:
@@ -637,7 +665,19 @@ class StoreFDRepository(IFDRepository):
         # re-express it relative to this store before touching anything.
         fr.relocate(self.key)
         self._rehome_ref(fr)
-        text = await self._get_fd_text(fr)
+        try:
+            text = await self._get_fd_text(fr)
+        except TechnicalError as ex:
+            # A read that failed is not a file that is gone: report it as
+            # unreadable, so a listing still works and a download raises
+            # instead of handing the client an empty file.
+            logger.error(
+                f"File descriptor (message_id: {fr.message_id}) for {fr.name} "
+                f"could not be read: {ex}"
+            )
+            missing = TGFSFileDesc.empty(fr.name)
+            missing.complete = False
+            return missing
 
         if not text:
             logging.error(

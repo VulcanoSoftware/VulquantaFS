@@ -19,7 +19,7 @@ from vulquantafs.core.multisource import (
 )
 from vulquantafs.core.repository.interface import IFileContentRepository
 from vulquantafs.core.tee import TeeUpload
-from vulquantafs.errors import TechnicalError
+from vulquantafs.errors import TechnicalError, is_store_outage
 from vulquantafs.reqres import (
     FileContent,
     Replica,
@@ -554,7 +554,7 @@ class StoreFileContentRepository(IFileContentRepository):
                 if isinstance(ex, TimeoutError) and can_fail_over:
                     stalled.add(store.key)
                 last_ex = ex
-                if store is self._store and self._mirror_group:
+                if store is self._store and self._mirror_group and is_store_outage(ex):
                     self._mirror_group.mark_primary_dead()
                 logger.warning(
                     f"Downloading part {part_idx} (message {mid}) of layout "
