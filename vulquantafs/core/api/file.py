@@ -618,6 +618,33 @@ class FileApi:
     ) -> TGFSFileDesc:
         return await self._file_desc_api.get_file_desc(fr, include_all_versions)
 
+    def ensure_readable(self, fr: TGFSFileRef, fd: TGFSFileDesc) -> None:
+        """Raise unless ``fd`` can serve a download of ``fr``.
+
+        No readable version means either the descriptor itself could not
+        be read, or every content message it lists is gone. Serving that
+        as a zero-byte file made a broken read look like a successful
+        download of an empty file, while the size in the listing kept
+        showing the real one -- and the SFTP open path, which only asks
+        for the descriptor and its content length, opened a handle of
+        size zero whose reads all answered EOF. An error lets the client
+        retry. A file that is genuinely empty stays servable.
+        """
+        if isinstance(fd, FileMessageEmpty):
+            return
+        fv = fd.get_latest_version()
+        if not fv.message_ids and not fv.pending:
+            recorded = fr.stat.size if fr.stat is not None else 0
+            if not fd.complete or recorded > 0:
+                raise TechnicalError(
+                    f"{fr.name} has no readable version: "
+                    + (
+                        "its file descriptor could not be read"
+                        if not fd.complete
+                        else f"none of its {recorded} bytes are still stored"
+                    )
+                )
+
     async def retrieve(
         self,
         fr: TGFSFileRef,
@@ -632,23 +659,8 @@ class FileApi:
                 yield b""
 
             return empty_file()
+        self.ensure_readable(fr, fd)
         fv = fd.get_latest_version()
-        if not fv.message_ids and not fv.pending:
-            # No readable version: either the descriptor itself could not be
-            # read, or every content message it lists is gone. Serving that
-            # as a zero-byte file made a broken read look like a successful
-            # download of an empty file, while the size in the listing kept
-            # showing the real one. An error lets the client retry.
-            recorded = fr.stat.size if fr.stat is not None else 0
-            if not fd.complete or recorded > 0:
-                raise TechnicalError(
-                    f"{fr.name} has no readable version: "
-                    + (
-                        "its file descriptor could not be read"
-                        if not fd.complete
-                        else f"none of its {recorded} bytes are still stored"
-                    )
-                )
 
         async def chunks():
             try:

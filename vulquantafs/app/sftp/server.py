@@ -461,7 +461,12 @@ class TGFSSFTPServer(asyncssh.SFTPServer):
     async def _open_for_read(self, resolved: ResolvedPath) -> ReadHandle:
         client = self._client(resolved.client_name)
         ops = Ops(client)
-        fd = await ops.desc(resolved.relative)
+        fr = ops.stat_file(resolved.relative)
+        fd = await client.file_api.desc(fr)
+        # A descriptor that could not be read must fail the open: a handle
+        # of size zero answers every read with EOF, which turned a store
+        # outage into successful downloads of empty files.
+        client.file_api.ensure_readable(fr, fd)
         size = await client.fc_repo.content_length(fd.get_latest_version())
         handle = ReadHandle(
             ops=ops,

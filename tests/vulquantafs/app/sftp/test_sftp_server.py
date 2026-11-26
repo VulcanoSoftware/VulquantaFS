@@ -15,6 +15,7 @@ from vulquantafs.core.model import (
     TGFSFileDesc,
     TGFSFileVersion,
 )
+from vulquantafs.errors import TechnicalError
 from vulquantafs.utils.time import ts
 from tests.vulquantafs.app.sftp.mocked_stats import MockedDescApi, mocked_stats
 
@@ -251,6 +252,24 @@ class TestReadWrite:
 
         assert await admin.fstat(handle) is not None
         assert handle.size == FILE_SIZE
+
+    async def test_open_for_read_refuses_an_unreadable_descriptor(self, admin, mocker):
+        """A descriptor that could not be read fails the open.
+
+        Letting the open through handed the client a handle of size zero:
+        every read answered EOF and the transfer ended as a successful
+        download of an empty file, which is how a store outage filled a
+        whole queue with empty files.
+        """
+        client = admin._clients["notes"]
+        client.file_api.ensure_readable = mocker.Mock(
+            side_effect=TechnicalError("broken.txt has no readable version")
+        )
+
+        with pytest.raises(asyncssh.SFTPFailure, match="no readable version"):
+            await admin.open(b"/notes/note.txt", 0x01, asyncssh.SFTPAttrs())
+
+        client.file_api.ensure_readable.assert_called_once()
 
     async def test_open_missing_file_for_read(self, admin):
         with pytest.raises(asyncssh.SFTPNoSuchFile):
