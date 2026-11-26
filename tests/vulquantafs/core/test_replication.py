@@ -279,6 +279,7 @@ class TestQueue:
         queue.enqueue("fs", "/dir/b.bin")
         queue.enqueue("fs", "/a.bin")  # idempotent
         queue.failed("fs", "/a.bin", "boom")
+        queue.flush()
 
         reloaded = ReplicationQueue(path)
         items = reloaded.pending("fs")
@@ -286,7 +287,23 @@ class TestQueue:
         assert items[0].attempts == 1 and items[0].last_error == "boom"
 
         reloaded.done("fs", "/a.bin")
+        reloaded.flush()
         assert [i.path for i in ReplicationQueue(path).pending("fs")] == ["/dir/b.bin"]
+
+    def test_done_and_failed_marks_are_debounced(self, tmp_path):
+        """Draining a backlog rewrites the queue file per interval, not per
+        item; flush lands the marks that are still pending."""
+        path = str(tmp_path / "queue.json")
+        queue = ReplicationQueue(path)
+        queue.enqueue("fs", "/a.bin")
+        queue.enqueue("fs", "/b.bin")
+        queue.done("fs", "/a.bin")
+
+        assert [i.path for i in queue.pending("fs")] == ["/b.bin"]
+        assert ReplicationQueue(path).pending("fs") != []  # not yet rewritten
+
+        queue.flush()
+        assert [i.path for i in ReplicationQueue(path).pending("fs")] == ["/b.bin"]
 
     def test_a_full_disk_does_not_fail_the_enqueue(self, tmp_path, monkeypatch, caplog):
         path = str(tmp_path / "queue.json")
@@ -474,10 +491,12 @@ class TestBackgroundSync:
         worker.start()
         try:
             await asyncio.wait_for(failed.wait(), timeout=2)
+            queue.flush()
             item = ReplicationQueue(path).pending("fs")[0]
             assert item.attempts == 1
             assert "store cancelled an in-flight request" in (item.last_error or "")
             await asyncio.wait_for(done.wait(), timeout=4)
+            queue.flush()
             assert not ReplicationQueue(path).pending("fs")
             assert (await stack.version("a.bin")).has_copy_in(stack.mirror.key)
         finally:

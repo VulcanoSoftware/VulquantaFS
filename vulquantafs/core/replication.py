@@ -46,6 +46,21 @@ logger = logging.getLogger(__name__)
 RETRY_BASE_SECONDS = 15.0
 RETRY_MAX_SECONDS = 15 * 60.0
 
+# How many queued files the worker heals at once: the stores batch and
+# throttle their requests fine when a few replications overlap, and a
+# backlog of tens of thousands of legacy files never drains one by one.
+HEAL_CONCURRENCY = 8
+
+# How many healed files are committed to the metadata in one push: each
+# push writes the whole tree to every metadata store, so a backlog may
+# not pay for one git commit per file.
+PUSH_BATCH = 100
+
+# The queue file is rewritten on every change; done and failed marks are
+# debounced so draining a large backlog does not rewrite the whole file
+# per item.
+SAVE_MIN_INTERVAL_S = 10.0
+
 
 def file_path(fr: TGFSFileRef) -> str:
     """Absolute path of a file ref inside its file system."""
@@ -93,6 +108,8 @@ class ReplicationQueue:
     _wakeups: Dict[str, asyncio.Event] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
+        self._last_save = 0.0
+        self._unsaved = False
         self._load()
 
     # -- persistence -------------------------------------------------------
@@ -129,6 +146,8 @@ class ReplicationQueue:
             with open(tmp, "w", encoding="utf-8") as fh:
                 json.dump(data, fh)
             os.replace(tmp, self.path)
+            self._last_save = time.monotonic()
+            self._unsaved = False
         except OSError as ex:
             # A full disk must not fail the write that enqueued the file:
             # the item stays in memory and the worker still gets to it; a
@@ -161,6 +180,17 @@ class ReplicationQueue:
             self.wakeup(fs_name).set()
         return len(new)
 
+    def _save_soon(self) -> None:
+        """Record a change, rewriting the file at most once per interval."""
+        self._unsaved = True
+        if time.monotonic() - self._last_save >= SAVE_MIN_INTERVAL_S:
+            self._save()
+
+    def flush(self) -> None:
+        """Persist debounced changes now."""
+        if self._unsaved:
+            self._save()
+
     def pending(self, fs_name: str) -> List[QueueItem]:
         return sorted(self._items.get(fs_name, {}).values(), key=lambda i: i.queued_at)
 
@@ -170,7 +200,7 @@ class ReplicationQueue:
 
     def done(self, fs_name: str, path: str) -> None:
         if self._items.get(fs_name, {}).pop(path, None) is not None:
-            self._save()
+            self._save_soon()
 
     def failed(self, fs_name: str, path: str, error: str) -> None:
         item = self._items.get(fs_name, {}).get(path)
@@ -181,7 +211,7 @@ class ReplicationQueue:
         item.not_before = time.time() + min(
             RETRY_BASE_SECONDS * 2 ** (item.attempts - 1), RETRY_MAX_SECONDS
         )
-        self._save()
+        self._save_soon()
 
     def retry_now(self, fs_name: Optional[str] = None) -> None:
         """Clear the backoff of every item (of one file system)."""
@@ -213,10 +243,15 @@ def queue_descriptor_gaps(client: "Client", queue: ReplicationQueue) -> int:
     group = getattr(client, "mirror_group", None)
     if group is None:
         return 0
+    refs = collect_file_refs(client.dir_api.root)
+    # Newest first: the files being worked with are protected first, and
+    # a backlog that takes hours must not start at the oldest file.
+    refs.sort(
+        key=lambda fr: fr.stat.modified_at if fr.stat else 0,
+        reverse=True,
+    )
     missing = [
-        file_path(fr)
-        for fr in collect_file_refs(client.dir_api.root)
-        if group.missing_fd_stores(fr.store, fr.mirrors)
+        file_path(fr) for fr in refs if group.missing_fd_stores(fr.store, fr.mirrors)
     ]
     if missing:
         logger.info(
@@ -235,6 +270,7 @@ class ReplicationWorker:
         self._queue = queue
         self._task: Optional[asyncio.Task[None]] = None
         self.last_report: Optional[BackfillReport] = None
+        self._dirty = 0
 
     @property
     def name(self) -> str:
@@ -267,8 +303,9 @@ class ReplicationWorker:
             await backfill_file(self._client, fr, verify=False, report=report)
             if report.failures:
                 raise RuntimeError("; ".join(report.failures))
-            if self._client.metadata_api:
-                await self._client.metadata_api.push()
+            self._dirty += 1
+            if self._dirty >= PUSH_BATCH:
+                await self._flush()
         except asyncio.CancelledError:
             task = asyncio.current_task()
             if task is None or task.cancelling():
@@ -302,12 +339,33 @@ class ReplicationWorker:
         self._queue.failed(self.name, path, error)
         return False
 
+    async def _flush(self) -> None:
+        """Commit the healed files to the metadata, persist the queue.
+
+        One push writes the whole tree, so the files healed since the
+        previous push all land together; a failure only delays them, the
+        next push carries the same tree state."""
+        self._queue.flush()
+        if not self._dirty:
+            return
+        self._dirty = 0
+        if self._client.metadata_api:
+            try:
+                await self._client.metadata_api.push()
+            except Exception as ex:
+                logger.warning("Could not push the replicated metadata: %s", ex)
+
     async def run_once(self) -> int:
         """Process everything that is ready; returns how many were done."""
+        ready = self._queue.ready(self.name)
         done = 0
-        for item in self._queue.ready(self.name):
-            if await self.process_one(item.path):
-                done += 1
+        for i in range(0, len(ready), HEAL_CONCURRENCY):
+            chunk = ready[i : i + HEAL_CONCURRENCY]
+            results = await asyncio.gather(
+                *(self.process_one(item.path) for item in chunk)
+            )
+            done += sum(1 for ok in results if ok)
+        await self._flush()
         return done
 
     async def run(self) -> None:

@@ -610,7 +610,7 @@ class FakeFDRepo:
         self.fd = fd
         self.saved = []
 
-    async def get(self, fr, include_all_versions=False):
+    async def get(self, fr, include_all_versions=False, validate=True):
         return self.fd
 
     async def save(self, fd, fr=None):

@@ -14,7 +14,7 @@ from vulquantafs.config import CacheConfig
 from vulquantafs.core.api import DirectoryApi, FileApi, FileDescApi, MetaDataApi
 from vulquantafs.core.local_cache import LocalCache
 from vulquantafs.core.mirror import MirrorGroup, MirrorStore
-from vulquantafs.core.model import TGFSDirectory, TGFSFileVersion
+from vulquantafs.core.model import FileStat, TGFSDirectory, TGFSFileVersion
 from vulquantafs.core.replication import (
     ReplicationQueue,
     ReplicationWorker,
@@ -748,3 +748,140 @@ class TestDescriptorMirrorHealing:
 
         assert queue_descriptor_gaps(client, queue) == 0  # type: ignore[arg-type]
         assert queue.pending("fs") == []
+
+    async def test_the_sweep_queues_newest_files_first(self, tmp_path):
+        """The files being worked with are protected first: a backlog that
+        takes hours must not start at the oldest file."""
+        queue = ReplicationQueue(path=str(tmp_path / "queue.json"))
+        stack = await Stack(telegram_like(), discord_like(), queue=queue).init()
+        await stack.put("old.bin", DATA)
+        await stack.put("new.bin", DATA)
+        for name, age in (("old.bin", 1_000), ("new.bin", 2_000)):
+            fr = stack.root.find_file(name)
+            fr.mirrors = {}
+            fr.stat = FileStat(size=len(DATA), created_at=age, modified_at=age)
+
+        queue_descriptor_gaps(self.client_of(stack), queue)  # type: ignore[arg-type]
+
+        assert [i.path for i in queue.pending("fs")] == ["/new.bin", "/old.bin"]
+
+
+class TestHealThroughput:
+    """A backlog of legacy files only drains when the heal skips work it
+    does not need: no part lookups, no content copies, no metadata push
+    per file, and no queue rewrite per item."""
+
+    def client_of(self, stack: Stack) -> object:
+        return type(
+            "C",
+            (),
+            {
+                "name": "fs",
+                "mirror_group": stack.mirror_group,
+                "fd_repo": stack.fd_repo,
+                "metadata_api": stack.metadata_api,
+                "dir_api": stack.dir_api,
+            },
+        )()
+
+    async def legacy(self, stack: Stack, name: str) -> None:
+        fr = stack.root.find_file(name)
+        dc = stack.mirror_group.store_for("dc:9")
+        assert dc is not None and fr.mirrors.get("dc:9") in dc.messages
+        del dc.messages[fr.mirrors["dc:9"]]
+        fr.mirrors = {}
+
+    async def test_the_heal_does_not_touch_content_that_is_already_mirrored(
+        self, tmp_path
+    ):
+        queue = ReplicationQueue(path=str(tmp_path / "queue.json"))
+        tg, dc = telegram_like(), discord_like()
+        stack = await Stack(tg, dc, queue=queue).init()
+        await stack.put("a.bin", DATA)
+        await self.legacy(stack, "a.bin")
+        queue.enqueue("fs", "/a.bin")
+        dc.calls.clear()
+        tg.calls.clear()
+
+        assert await ReplicationWorker(self.client_of(stack), queue).run_once() == 1  # type: ignore[arg-type]
+
+        assert "upload" not in dc.calls and "upload" not in tg.calls
+        fr = stack.root.find_file("a.bin")
+        assert fr.mirrors.get("dc:9") in dc.messages
+
+    async def test_healed_files_are_pushed_in_batches(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("vulquantafs.core.replication.PUSH_BATCH", 2)
+        queue = ReplicationQueue(path=str(tmp_path / "queue.json"))
+        stack = await Stack(telegram_like(), discord_like(), queue=queue).init()
+        for name, path in (
+            ("a.bin", "/a.bin"),
+            ("b.bin", "/b.bin"),
+            ("c.bin", "/c.bin"),
+        ):
+            await stack.put(name, DATA)
+            await self.legacy(stack, name)
+            queue.enqueue("fs", path)
+        pushes = 0
+        original = stack.metadata_api.push
+
+        async def counting_push(*args, **kwargs):
+            nonlocal pushes
+            pushes += 1
+            await original(*args, **kwargs)
+
+        stack.metadata_api.push = counting_push  # type: ignore[method-assign]
+
+        assert await ReplicationWorker(self.client_of(stack), queue).run_once() == 3  # type: ignore[arg-type]
+
+        assert pushes == 2  # one after the batch of two, one final flush
+
+    async def test_ready_files_are_healed_concurrently(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("vulquantafs.core.replication.HEAL_CONCURRENCY", 8)
+        queue = ReplicationQueue(path=str(tmp_path / "queue.json"))
+        stack = await Stack(telegram_like(), discord_like(), queue=queue).init()
+        for name in ("a.bin", "b.bin"):
+            await stack.put(name, DATA)
+        queue.enqueue("fs", "/a.bin")
+        queue.enqueue("fs", "/b.bin")
+        worker = ReplicationWorker(self.client_of(stack), queue)  # type: ignore[arg-type]
+        entered = []
+        second_in = asyncio.Event()
+
+        async def overlapping(path):
+            entered.append(path)
+            if len(entered) == 1:
+                await asyncio.wait_for(second_in.wait(), 2)
+            else:
+                second_in.set()
+            return True
+
+        worker.process_one = overlapping  # type: ignore[method-assign]
+
+        assert await worker.run_once() == 2
+        assert len(entered) == 2
+
+    async def test_serial_processing_would_time_out(self, tmp_path, monkeypatch):
+        """The guard for the test above: serial processing cannot pass it."""
+        monkeypatch.setattr("vulquantafs.core.replication.HEAL_CONCURRENCY", 1)
+        queue = ReplicationQueue(path=str(tmp_path / "queue.json"))
+        queue.enqueue("fs", "/a.bin")
+        queue.enqueue("fs", "/b.bin")
+        worker = ReplicationWorker(self.client_of_stack_only(), queue)  # type: ignore[arg-type]
+        entered = []
+        second_in = asyncio.Event()
+
+        async def overlapping(path):
+            entered.append(path)
+            if len(entered) == 1:
+                await asyncio.wait_for(second_in.wait(), 0.2)
+            else:
+                second_in.set()
+            return True
+
+        worker.process_one = overlapping  # type: ignore[method-assign]
+
+        with pytest.raises(asyncio.TimeoutError):
+            await worker.run_once()
+
+    def client_of_stack_only(self) -> object:
+        return type("C", (), {"name": "fs", "metadata_api": None})()
