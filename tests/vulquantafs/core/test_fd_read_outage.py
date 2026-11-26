@@ -12,16 +12,22 @@ the breaker, the primary is still asked when it is the only copy, and a
 failed read is reported as unreadable instead of missing.
 """
 
+import asyncio
 import datetime
 import logging
 import struct
+import time
+from typing import Optional
 
 import pytest
 
 from tests.fakes.store import FakeMessage, FakeStore
 from vulquantafs.core.mirror import MirrorGroup, MirrorStore
 from vulquantafs.core.model import TGFSDirectory, TGFSFileDesc, TGFSFileVersion
+from vulquantafs.core.repository.impl.fd import store_msg
 from vulquantafs.core.repository.impl.fd.store_msg import StoreFDRepository
+from vulquantafs.core.repository.impl.file_content import StoreFileContentRepository
+from vulquantafs.core.repository.impl import file_content
 from vulquantafs.errors import TechnicalError, is_store_outage
 
 
@@ -216,3 +222,205 @@ class TestFailedReadIsNotAMissingFile:
 
         assert fd.complete is False
         assert "not found" in caplog.text
+
+
+def _mirrored_text(mirror_part: int, primary_part: int = 77, own: bool = False) -> str:
+    """A descriptor whose one part also lives in the mirror."""
+    fd = TGFSFileDesc(name="a.txt")
+    mirrors = {"dc:9": [mirror_part]} if mirror_part else {}
+    if own:
+        mirrors["tg:111"] = [primary_part]
+    fd.add_version(
+        TGFSFileVersion(
+            id="v1",
+            updated_at=datetime.datetime.now(),
+            message_ids=[primary_part],
+            part_sizes=[5],
+            mirrors=mirrors,
+        )
+    )
+    return fd.to_json()
+
+
+class HangingPartsStore(FakeStore):
+    """A store that answers a descriptor but never its part lookup.
+
+    A backend whose network went away does not refuse the call: it stops
+    answering it. ``get_messages`` for the content messages is the one
+    that used to hang in front of a download's first byte.
+    """
+
+    part_ids: set = set()
+
+    async def get_messages(self, ids):
+        if self.part_ids & set(ids):
+            self.calls.append("get_messages(stuck)")
+            await asyncio.Event().wait()
+        return await super().get_messages(ids)
+
+
+class TestDownloadsDuringAnOutage:
+    """A download must not be held by a store the breaker took away.
+
+    Every download opens with a "are these parts still there" lookup. It
+    ran without a bound, so with the primary gone a single file waited out
+    the whole reconnect cycle of the Telegram client -- FileZilla drops a
+    transfer after 20 s of silence -- while a mirror held the file. These
+    tests pin that a mirrored file is served from its mirror, that a store
+    which stops answering is bounded, and that nothing turns into a
+    zero-byte success.
+    """
+
+    @pytest.mark.asyncio
+    async def test_the_parts_of_a_mirrored_file_do_not_wait_on_the_primary(self):
+        primary = FakeStore(key="tg:111")
+        mirror = FakeStore(key="dc:9")
+        text = _mirrored_text(mirror_part=44)
+        primary.messages[42] = _message(42, text)
+        primary.messages[77] = FakeMessage(77, document=b"12345")
+        mirror.messages[43] = _message(43, text)
+        mirror.messages[44] = FakeMessage(44, document=b"12345")
+        requested = _record_ids(primary)
+        group = _group(primary, mirror)
+        group.mark_primary_dead()
+        repo = StoreFDRepository(primary, mirror_group=group)
+        fr = TGFSDirectory.root_dir().create_file_ref("a.txt", 42)
+        fr.mirrors = {"dc:9": 43}
+
+        started = time.monotonic()
+        fd = await repo.get(fr)
+        elapsed = time.monotonic() - started
+
+        assert fd.get_latest_version().part_sizes == [5]
+        # Not one question went to the store the breaker had taken away.
+        assert requested == []
+        assert elapsed < 5
+
+    @pytest.mark.asyncio
+    async def test_a_version_that_lists_its_own_store_is_not_a_mirror(self):
+        """Every mirror group lists the owning store among the copies."""
+        primary = FakeStore(key="tg:111")
+        mirror = FakeStore(key="dc:9")
+        text = _mirrored_text(mirror_part=0)
+        primary.messages[42] = _message(42, text)
+        primary.messages[77] = FakeMessage(77, document=b"12345")
+        requested = _record_ids(primary)
+        group = _group(primary, mirror)
+        group.mark_primary_dead()
+        repo = StoreFDRepository(primary, mirror_group=group)
+        fr = TGFSDirectory.root_dir().create_file_ref("a.txt", 42)
+        fr.mirrors = {"dc:9": 43}
+        mirror.messages[43] = _message(43, _mirrored_text(mirror_part=0, own=True))
+
+        fd = await repo.get(fr)
+
+        # The only copy of the part is the primary's own, so it is still
+        # asked for it -- the short way round.
+        assert 77 in requested
+        assert fd.get_latest_version().part_sizes == [5]
+
+    @pytest.mark.asyncio
+    async def test_a_part_lookup_that_never_answers_is_bounded_and_served(
+        self, monkeypatch
+    ):
+        monkeypatch.setattr(store_msg, "PART_LOOKUP_TIMEOUT_S", 0.05)
+        primary = HangingPartsStore(key="tg:111")
+        primary.part_ids = {77}
+        mirror = FakeStore(key="dc:9")
+        text = _mirrored_text(mirror_part=44)
+        primary.messages[42] = _message(42, text)
+        primary.messages[77] = FakeMessage(77, document=b"12345")
+        mirror.messages[43] = _message(43, text)
+        mirror.messages[44] = FakeMessage(44, document=b"12345")
+        group = _group(primary, mirror)
+        repo = StoreFDRepository(primary, mirror_group=group)
+        fr = TGFSDirectory.root_dir().create_file_ref("a.txt", 42)
+
+        started = time.monotonic()
+        fd = await repo.get(fr)
+        elapsed = time.monotonic() - started
+
+        assert fd.get_latest_version().part_sizes == [5]
+        assert elapsed < 5
+        # A store that does not answer is a store that is down.
+        assert group.primary_dead()
+
+    @pytest.mark.asyncio
+    async def test_a_part_lookup_that_never_answers_without_a_mirror_raises(
+        self, monkeypatch, caplog
+    ):
+        monkeypatch.setattr(store_msg, "PART_LOOKUP_TIMEOUT_S", 0.05)
+        primary = HangingPartsStore(key="tg:111")
+        primary.part_ids = {77}
+        text = _descriptor_text()
+        primary.messages[42] = _message(42, text)
+        primary.messages[77] = FakeMessage(77, document=b"12345")
+        group = _group(primary, FakeStore(key="dc:9"))
+        repo = StoreFDRepository(primary, mirror_group=group)
+        fr = TGFSDirectory.root_dir().create_file_ref("a.txt", 42)
+
+        with caplog.at_level(logging.WARNING):
+            fd = await repo.get(fr)
+
+        # Nothing was verified, so the read is not complete -- and there is
+        # no version left to serve, which FileApi turns into an error, never
+        # into five zero bytes.
+        assert fd.complete is False
+        assert fd.get_versions(exclude_invalid=True) == []
+        assert "checking the mirrors" in caplog.text
+
+
+def _version(mirror_part: Optional[int] = None) -> TGFSFileVersion:
+    return TGFSFileVersion(
+        id="v1",
+        updated_at=datetime.datetime.now(),
+        message_ids=[77],
+        part_sizes=[5],
+        mirrors={"dc:9": [mirror_part]} if mirror_part else {},
+    )
+
+
+class TestContentReadsDuringAnOutage:
+    """The bytes themselves must not wait on a store that is gone either.
+
+    A read with nowhere to fail over to used to have no deadline at all:
+    with the primary taken away by the breaker and holding the only copy,
+    the transfer simply stopped, and the client's own 20 s timeout was the
+    only thing that ended it.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_dead_store_holding_the_only_copy_answers_before_the_client(
+        self, monkeypatch
+    ):
+        monkeypatch.setattr(file_content, "DEAD_STORE_READ_TIMEOUT_S", 0.05)
+        primary = FakeStore(key="tg:111")
+        primary.stuck = {"download_file"}
+        group = _group(primary, FakeStore(key="dc:9"))
+        group.mark_primary_dead()
+        repo = StoreFileContentRepository(primary, mirror_group=group)
+
+        stream = await repo.get(_version(), 0, -1, "a.txt")
+
+        started = time.monotonic()
+        with pytest.raises(TimeoutError):
+            async for _ in stream:
+                pass
+        assert time.monotonic() - started < 5
+
+    @pytest.mark.asyncio
+    async def test_the_bytes_come_from_the_mirror_while_the_primary_is_dead(self):
+        primary = FakeStore(key="tg:111")
+        primary.stuck = {"download_file"}
+        mirror = FakeStore(key="dc:9")
+        mirror.messages[44] = FakeMessage(44, document=b"12345")
+        group = _group(primary, mirror)
+        group.mark_primary_dead()
+        repo = StoreFileContentRepository(primary, mirror_group=group)
+
+        started = time.monotonic()
+        stream = await repo.get(_version(mirror_part=44), 0, -1, "a.txt")
+        data = b"".join([chunk async for chunk in stream])
+
+        assert data == b"12345"
+        assert time.monotonic() - started < 5

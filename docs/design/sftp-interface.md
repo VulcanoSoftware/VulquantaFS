@@ -88,6 +88,19 @@ here is sparse, so `Handle.seek` answers with a single solid data region and
 raises `ENXIO` past the end. Without it, transfers from an asyncssh-based
 client fail outright — which is exactly what the integration test caught.
 
+Every read is also bounded by the client's patience rather than by the
+store. Opening a file first reads its descriptor and checks that the part
+messages it lists still exist; with a store gone, that check used to have no
+deadline at all and waited out the backend's whole reconnect cycle, so an
+SFTP `OPEN` never answered — FileZilla drops a transfer after 20 seconds of
+silence — even though a mirror held both the descriptor and the bytes. The
+part check now gives a store the circuit breaker has taken away a short
+probe, and skips it entirely for a version every part of which a live mirror
+also holds. A content read with nowhere to fail over to is bounded the same
+way: an unreachable store answers with its error instead of holding the
+first byte until the client gives up. Nothing here weakens into a zero-byte
+success: a file that cannot be verified is an error, not an empty download.
+
 ### Writes: a size that is not known in advance
 
 Telegram uploads need the total size up front (it decides the part layout);

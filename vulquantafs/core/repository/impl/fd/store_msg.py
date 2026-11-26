@@ -23,8 +23,28 @@ from vulquantafs.reqres import MessageResp
 
 logger = logging.getLogger(__name__)
 
+# How long a store the breaker has taken away is still given to answer a
+# read. Every read that runs in front of a download's first byte has to
+# fit in the 20 s a client waits before dropping an idle transfer, so an
+# unreachable store gets a short probe: long enough for a store that is
+# merely slow to answer, short enough that the client still sees the
+# answer -- usually the file from a mirror, or an error -- in time.
+UNREACHABLE_PROBE_TIMEOUT_S = 3.0
 
-def _bounded_read(what: str, action: Awaitable) -> Awaitable:
+# Bound on the "are these parts still there" lookup, which every download
+# and listing does before it reads a single byte. It used to be
+# unbounded: with the primary gone, opening one file blocked for the whole
+# reconnect cycle of the Telegram client, FileZilla abandoned the transfer
+# after 20 s, and the retry hit the same wall -- while the mirror that
+# held the parts all along waited to be asked. A store that does not
+# answer within this window is treated as unavailable, exactly like one
+# that raised.
+PART_LOOKUP_TIMEOUT_S = 8.0
+
+
+def _bounded_read(
+    what: str, action: Awaitable, timeout: Optional[float] = None
+) -> Awaitable:
     """Bound one store read by ``transfer.upload_part_timeout_s``
 
     The same bound that keeps a silent part upload from freezing an
@@ -32,9 +52,12 @@ def _bounded_read(what: str, action: Awaitable) -> Awaitable:
     from freezing the write's own preparation: ``rpc_timeout_s`` is
     minutes, and a client whose read never comes back abandons the
     transfer long before the timeout converts the hang into an error
-    the failover can act on. ``0`` keeps reads unbounded.
+    the failover can act on. ``0`` keeps reads unbounded. ``timeout``
+    overrides the configured bound for reads that run in front of a
+    client waiting for its first byte of a download.
     """
-    timeout = get_config().vulquantafs.transfer.upload_part_timeout_s
+    if timeout is None:
+        timeout = get_config().vulquantafs.transfer.upload_part_timeout_s
     if not timeout:
         return action
 
@@ -274,6 +297,29 @@ class StoreFDRepository(IFDRepository):
             return dict(existing or {})
         return await self._mirror_group.mirror_fd(fd.to_json(), existing, skip=skip)
 
+    def _fully_mirrored(self, version: TGFSFileVersion) -> bool:
+        """Whether every part of ``version`` has a copy in a live mirror.
+
+        Only then can a read skip the store that owns the version: without
+        a mirror copy of a single part, that part has nowhere else to come
+        from and the owner is still the only one who can answer.
+        """
+        group = self._mirror_group
+        if group is None or not version.message_ids:
+            return False
+        for j in range(len(version.message_ids)):
+            if not any(
+                # A version lists its own store among its ``mirrors``; that
+                # copy is the one being skipped, not a way around it.
+                key != self.key
+                and j < len(ids)
+                and ids[j] > 0
+                and group.store_for(key) is not None
+                for key, ids in version.mirrors.items()
+            ):
+                return False
+        return True
+
     async def _lookup_mirror_parts(
         self, missing: List[Tuple[str, int]]
     ) -> Dict[Tuple[str, int], int]:
@@ -397,9 +443,50 @@ class StoreFDRepository(IFDRepository):
             # to another store's namespace and must never be sent here.
             if self._accepts(self._message_api, mid)
         ]
+        primary_down = (
+            self._mirror_group is not None and self._mirror_group.primary_dead()
+        )
+        # A part with a mirror copy cannot profit from a question to a
+        # primary the breaker already took away: the answer is the
+        # mirror's, and asking anyway is what held a download for the whole
+        # reconnect cycle of the Telegram client -- far past the 20 s a
+        # client waits before it drops an idle transfer -- while the mirror
+        # that would have served the bytes waited to be asked. Parts with
+        # no mirror copy are still asked for, because they are the only
+        # copy, but on the short probe.
+        skipped = (
+            [
+                mid
+                for version in versions
+                if version.owned_by(self.key) and self._fully_mirrored(version)
+                for mid in version.message_ids
+                if mid > 0
+            ]
+            if primary_down
+            else []
+        )
+        asked_ids = [mid for mid in all_ids if mid not in set(skipped)]
+        if skipped:
+            logger.warning(
+                f"Serving the parts of {fd.name} from the mirrors: the "
+                f"primary store is marked down"
+            )
+            # Nothing was verified against the owner; the stat writer and
+            # the backfill must not take this read as complete.
+            fd.complete = False
         try:
             file_messages = (
-                await self._message_api.get_messages(all_ids) if all_ids else []
+                await _bounded_read(
+                    f"the parts of {fd.name}",
+                    self._message_api.get_messages(asked_ids),
+                    timeout=(
+                        UNREACHABLE_PROBE_TIMEOUT_S
+                        if primary_down
+                        else PART_LOOKUP_TIMEOUT_S
+                    ),
+                )
+                if asked_ids
+                else []
             )
         except Exception as ex:
             # An unreachable primary (banned channel, network down) must
@@ -414,7 +501,7 @@ class StoreFDRepository(IFDRepository):
             )
             if is_store_outage(ex):
                 self._mirror_group.mark_primary_dead()
-            file_messages = [None] * len(all_ids)
+            file_messages = [None] * len(asked_ids)
             fd.complete = False
 
         message_map = {msg.message_id: msg for msg in file_messages if msg}
@@ -579,6 +666,18 @@ class StoreFDRepository(IFDRepository):
                     await _bounded_read(
                         f"the read of file descriptor {fr.message_id} for {fr.name}",
                         self._message_api.get_messages([fr.message_id]),
+                        # A primary the breaker took away gets the short
+                        # probe: this read runs before a download's first
+                        # byte, and the client gives up on a silent
+                        # transfer after 20 s. Nothing else holds this
+                        # descriptor, so it is still worth asking -- just
+                        # not for longer than the client waits.
+                        timeout=(
+                            UNREACHABLE_PROBE_TIMEOUT_S
+                            if self._mirror_group is not None
+                            and self._mirror_group.primary_dead()
+                            else None
+                        ),
                     )
                 )[0]
         except Exception as ex:
