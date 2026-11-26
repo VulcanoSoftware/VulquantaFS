@@ -91,14 +91,16 @@ class FileApi:
             return
         if self._written_gaps_only and fd is not None and self._mirror_group:
             # A write that filled the mirrors itself only hands its gaps to
-            # the queue: a store that lacks a copy, and a version that a
-            # failed-over acting store owns while the primary has none.
+            # the queue: a store that lacks a content copy, a version that
+            # a failed-over acting store owns while the primary has none,
+            # and a descriptor whose mirror write failed -- such a file is
+            # unreadable while its descriptor's only store is down.
             if not any(
                 self._mirror_group.missing_stores(version)
                 or not version.owned_by(self._store_key)
                 for version in fd.get_versions()
                 if version.is_valid()
-            ):
+            ) and not self._mirror_group.missing_fd_stores(fr.store, fr.mirrors):
                 return
         await self._on_written(fr)
 

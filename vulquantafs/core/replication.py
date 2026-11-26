@@ -28,9 +28,13 @@ import logging
 import os
 import time
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Dict, List, Optional
+from typing import TYPE_CHECKING, Dict, Iterable, List, Optional
 
-from vulquantafs.core.backfill import BackfillReport, backfill_file
+from vulquantafs.core.backfill import (
+    BackfillReport,
+    backfill_file,
+    collect_file_refs,
+)
 from vulquantafs.core.model import TGFSDirectory, TGFSFileRef
 
 if TYPE_CHECKING:
@@ -146,6 +150,17 @@ class ReplicationQueue:
             self._save()
         self.wakeup(fs_name).set()
 
+    def enqueue_many(self, fs_name: str, paths: Iterable[str]) -> int:
+        """Queue several paths, persisted once; returns how many are new."""
+        items = self._items.setdefault(fs_name, {})
+        new = [path for path in paths if path not in items]
+        for path in new:
+            items[path] = QueueItem(path=path, queued_at=time.time())
+        if new:
+            self._save()
+            self.wakeup(fs_name).set()
+        return len(new)
+
     def pending(self, fs_name: str) -> List[QueueItem]:
         return sorted(self._items.get(fs_name, {}).values(), key=lambda i: i.queued_at)
 
@@ -182,6 +197,34 @@ class ReplicationQueue:
             fs_name: [item.to_dict() for item in self.pending(fs_name)]
             for fs_name in self._items
         }
+
+
+def queue_descriptor_gaps(client: "Client", queue: ReplicationQueue) -> int:
+    """Queue every file whose descriptor has no copy in a mirror store.
+
+    A tee write mirrors the descriptor together with the content, but a
+    mirror that was down at write time keeps the file without one, and
+    files written before mirrors were configured never got one. Such a
+    file's descriptor lives only in the primary, so while that store is
+    down nothing can even tell what the file contains -- the one gap the
+    read path cannot fail over from. The queue is idempotent, so the
+    worker heals the gap during the next healthy period, which is the
+    only time it can."""
+    group = client.mirror_group
+    if group is None:
+        return 0
+    missing = [
+        file_path(fr)
+        for fr in collect_file_refs(client.dir_api.root)
+        if group.missing_fd_stores(fr.store, fr.mirrors)
+    ]
+    if missing:
+        logger.info(
+            "Queueing the descriptor mirror of %d file(s) in '%s'",
+            len(missing),
+            client.name,
+        )
+    return queue.enqueue_many(client.name, missing)
 
 
 class ReplicationWorker:

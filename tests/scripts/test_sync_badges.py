@@ -93,7 +93,10 @@ def test_links_written_under_the_old_owner_and_name_follow_a_rename():
     assert "https://vulcanosoftware.github.io/VulquantaFS/docs/)" in synced
     assert "https://vulcanosoftware.github.io/VulquantaFS/getting-started/)" in synced
     assert "https://vulcanosoftware.github.io/VulquantaFS/config-generator/)" in synced
-    assert "https://vulcanosoftware.github.io/VulquantaFS/docs/developers/fork-setup/" in synced
+    assert (
+        "https://vulcanosoftware.github.io/VulquantaFS/docs/developers/fork-setup/"
+        in synced
+    )
 
 
 # A README committed while the repository was still called ``tgdcfs``. GitHub
@@ -116,7 +119,10 @@ def test_a_readme_written_under_the_legacy_name_heals_to_the_new_one():
     assert "https://vulcanosoftware.github.io/VulquantaFS/docs/)" in synced
     assert "https://vulcanosoftware.github.io/VulquantaFS/getting-started/)" in synced
     assert "https://vulcanosoftware.github.io/VulquantaFS/config-generator/)" in synced
-    assert "https://vulcanosoftware.github.io/VulquantaFS/docs/developers/fork-setup/" in synced
+    assert (
+        "https://vulcanosoftware.github.io/VulquantaFS/docs/developers/fork-setup/"
+        in synced
+    )
 
 
 def test_site_links_under_an_unlisted_old_name_are_healed_too():

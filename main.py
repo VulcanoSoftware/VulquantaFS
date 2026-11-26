@@ -21,7 +21,11 @@ from vulquantafs.core import Client, Clients
 from vulquantafs.core.client import StoreFactory
 from vulquantafs.core.local_cache import CacheSweeper, LocalCache
 from vulquantafs.core.metadata_healing import MetadataHealWorker
-from vulquantafs.core.replication import ReplicationQueue, ReplicationWorker
+from vulquantafs.core.replication import (
+    ReplicationQueue,
+    ReplicationWorker,
+    queue_descriptor_gaps,
+)
 from vulquantafs.utils.message_cache import set_message_cache_size
 
 
@@ -104,7 +108,9 @@ def start_replication_workers(
     ``tee`` writes it closes the gaps a failed mirror write left behind,
     so a store that was temporarily down is caught up without manual
     action. It also drains the bytes a ``write_ack: cache`` write left
-    on the local disk.
+    on the local disk. On start every file whose descriptor lacks a
+    mirror copy is queued, so the gap is healed while the stores are up
+    instead of surfacing as unreadable files during an outage.
     """
     workers: List[ReplicationWorker] = []
     for filesystem in config.filesystems.values():
@@ -113,6 +119,7 @@ def start_replication_workers(
             continue
         if not filesystem.mirrors and filesystem.write_ack != "cache":
             continue
+        queue_descriptor_gaps(client, replication)
         worker = ReplicationWorker(client, replication)
         worker.start()
         workers.append(worker)

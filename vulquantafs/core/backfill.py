@@ -67,10 +67,10 @@ class BackfillReport:
         }
 
 
-def _collect_file_refs(directory: TGFSDirectory) -> List[TGFSFileRef]:
+def collect_file_refs(directory: TGFSDirectory) -> List[TGFSFileRef]:
     refs = list(directory.find_files())
     for child in directory.find_dirs():
-        refs.extend(_collect_file_refs(child))
+        refs.extend(collect_file_refs(child))
     return refs
 
 
@@ -367,7 +367,7 @@ async def backfill_mirrors(
         )
         return report
 
-    refs = _collect_file_refs(client.dir_api.root)
+    refs = collect_file_refs(client.dir_api.root)
 
     # Newest first: load descriptors to know each file's timestamp.
     dated: List[Tuple[TGFSFileRef, int]] = []
@@ -424,4 +424,4 @@ async def create_backfill_task(client: "Client", total_files: int) -> str:
 
 
 def count_files(client: "Client") -> int:
-    return len(_collect_file_refs(client.dir_api.root))
+    return len(collect_file_refs(client.dir_api.root))

@@ -1502,9 +1502,7 @@ class TestLoginAsBots:
             )
             client.disconnect = mocker.AsyncMock()
             client.get_me = mocker.AsyncMock(return_value=mocker.Mock(username="b"))
-            client.start = mocker.AsyncMock(
-                side_effect=RpcCallFailError(request=None)
-            )
+            client.start = mocker.AsyncMock(side_effect=RpcCallFailError(request=None))
             clients.append(client)
             return client
 
@@ -1512,7 +1510,9 @@ class TestLoginAsBots:
             "vulquantafs.backends.telegram.impl.telethon._RPCOnlyTelegramClient",
             side_effect=make_client,
         )
-        mocker.patch("vulquantafs.backends.telegram.impl.telethon.BOT_LOGIN_RETRY_DELAY", 0)
+        mocker.patch(
+            "vulquantafs.backends.telegram.impl.telethon.BOT_LOGIN_RETRY_DELAY", 0
+        )
 
         with pytest.raises(TechnicalError):
             await login_as_bots(mock_config_single_token)
