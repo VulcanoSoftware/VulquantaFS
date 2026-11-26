@@ -28,12 +28,10 @@ class TestPropfindRequest:
     async def test_from_request_with_propname(self, mocker):
         mock_request = mocker.Mock(spec=Request)
         mock_request.headers = {"Depth": "0"}
-        mock_request.body = mocker.AsyncMock(
-            return_value=b"""<?xml version="1.0"?>
+        mock_request.body = mocker.AsyncMock(return_value=b"""<?xml version="1.0"?>
             <D:propfind xmlns:D="DAV:">
                 <D:propname/>
-            </D:propfind>"""
-        )
+            </D:propfind>""")
 
         result = await PropfindRequest.from_request(mock_request)
 
@@ -43,12 +41,10 @@ class TestPropfindRequest:
     async def test_from_request_with_allprop(self, mocker):
         mock_request = mocker.Mock(spec=Request)
         mock_request.headers = {"Depth": "1"}
-        mock_request.body = mocker.AsyncMock(
-            return_value=b"""<?xml version="1.0"?>
+        mock_request.body = mocker.AsyncMock(return_value=b"""<?xml version="1.0"?>
             <D:propfind xmlns:D="DAV:">
                 <D:allprop/>
-            </D:propfind>"""
-        )
+            </D:propfind>""")
 
         result = await PropfindRequest.from_request(mock_request)
 
@@ -58,16 +54,14 @@ class TestPropfindRequest:
     async def test_from_request_with_specific_props(self, mocker):
         mock_request = mocker.Mock(spec=Request)
         mock_request.headers = {"Depth": "1"}
-        mock_request.body = mocker.AsyncMock(
-            return_value=b"""<?xml version="1.0"?>
+        mock_request.body = mocker.AsyncMock(return_value=b"""<?xml version="1.0"?>
             <D:propfind xmlns:D="DAV:">
                 <D:prop>
                     <D:displayname/>
                     <D:getcontentlength/>
                     <D:invalidprop/>
                 </D:prop>
-            </D:propfind>"""
-        )
+            </D:propfind>""")
 
         result = await PropfindRequest.from_request(mock_request)
 

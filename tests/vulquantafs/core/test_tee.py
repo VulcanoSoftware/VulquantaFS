@@ -738,3 +738,13 @@ class TestDescriptorMirrorHealing:
 
         assert queue_descriptor_gaps(self.client_of(stack), queue) == 0  # type: ignore[arg-type]
         assert queue.pending("fs") == []
+
+    async def test_a_client_without_a_mirror_group_attribute_is_not_swept(
+        self, tmp_path
+    ):
+        """Duck-typed clients in tests and partial stubs survive the sweep."""
+        queue = ReplicationQueue(path=str(tmp_path / "queue.json"))
+        client = type("C", (), {"name": "fs"})()
+
+        assert queue_descriptor_gaps(client, queue) == 0  # type: ignore[arg-type]
+        assert queue.pending("fs") == []

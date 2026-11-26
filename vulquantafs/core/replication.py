@@ -210,7 +210,7 @@ def queue_descriptor_gaps(client: "Client", queue: ReplicationQueue) -> int:
     read path cannot fail over from. The queue is idempotent, so the
     worker heals the gap during the next healthy period, which is the
     only time it can."""
-    group = client.mirror_group
+    group = getattr(client, "mirror_group", None)
     if group is None:
         return 0
     missing = [
