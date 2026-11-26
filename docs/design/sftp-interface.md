@@ -122,13 +122,21 @@ Other SFTP sessions cannot open the same path for writing until the handle
 is closed or aborted. A new file can only enter the tree after the storage
 backend accepts its complete stream; an explicit close without writes
 creates an empty file. With a GitHub tree as the primary metadata store, CLOSE
-confirms a new primary-owned file after the content backend accepts the
-file and its reference is committed to the local SQLite upload journal.
-It does not wait behind a GitHub stats or tree commit. The local file is
-immediately readable. A background worker batches references for GitHub,
-retries with backoff without dropping entries, and queues the usual mirror
-sync. Entries not yet confirmed by GitHub are replayed on restart. Other
-metadata layouts retain their existing persistence rules.
+confirms a new file after the content backend accepts it and its reference
+is committed to the local SQLite upload journal. That holds for a file the
+acting store took over while the primary was down just as much as for one
+the primary holds: the reference names the store that owns the content, and
+waiting for GitHub there was what turned a bulk upload during an outage into
+failed transfers -- a file that had landed answered an error, so the client
+retried into its own name and asked whether to overwrite it, once per file
+that missed the commit deadline. CLOSE does not wait behind a GitHub stats
+or tree commit; it only does so when the journal is unavailable, and then a
+commit past its deadline is still not a failed write: the name stays in the
+tree, readable, while the commit retries in the background. The local file
+is immediately readable either way. A background worker batches references
+for GitHub, retries with backoff without dropping entries, and queues the
+usual mirror sync. Entries not yet confirmed by GitHub are replayed on
+restart. Other metadata layouts retain their existing persistence rules.
 
 Mount `VULQUANTAFS_DATA_DIR` on writable persistent storage and keep its
 `uploads/` directory when restarting or replacing the server. Until the

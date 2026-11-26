@@ -15,6 +15,7 @@ from vulquantafs.crypto.path_names import encrypt_path_name
 from vulquantafs.errors import (
     DirectoryIsNotEmpty,
     FileOrDirectoryDoesNotExist,
+    PendingCommitError,
     TechnicalError,
 )
 from vulquantafs.utils.time import FIRST_DAY_OF_EPOCH
@@ -51,10 +52,11 @@ AWAITED_COMMIT_WINDOW = 0.025
 # ... but never longer than this. A GitHub read timeout plus the write
 # thread's inline retries can hold the shared batch for half a minute and
 # more; a client that does not hear its CLOSE reply within about 20 s drops
-# the connection and aborts the upload. Past this bound the caller hears a
-# failure instead while the commit keeps retrying in the background, so a
-# retransmission appends a version to the same reference instead of finding
-# a server that never answers.
+# the connection and aborts the upload. Past this bound the caller hears
+# ``PendingCommitError`` while the commit keeps retrying in the background: a
+# completed upload answers it as success -- the reference is in the tree and
+# the file is readable -- while code with a rollback to run still sees a
+# failure.
 AWAITED_COMMIT_MAX_WAIT = 15.0
 
 # GitHub refuses a tree whose request carries a whole repository: the
@@ -820,13 +822,14 @@ class GithubDirectory(TGFSDirectory):
         # away during the commit. By this point the content already exists.
         done, _ = await asyncio.wait({committed}, timeout=AWAITED_COMMIT_MAX_WAIT)
         if not done:
-            # GitHub is too slow to answer the commit. Answer the client
+            # GitHub is too slow to answer the commit. Answer the caller
             # anyway: holding the reply past what it waits for gets the
             # connection killed and the upload aborted mid-bulk. The
-            # reference stays in the tree and the worker keeps retrying,
-            # so a retransmission appends a version to the same file.
+            # reference stays in the tree, readable, and the worker keeps
+            # retrying, so a write that already landed reports success
+            # instead of sending its client into an overwrite prompt.
             committed.cancel()
-            raise TechnicalError(
+            raise PendingCommitError(
                 f"Timed out after {AWAITED_COMMIT_MAX_WAIT:g}s waiting for "
                 f"the file reference of {name} to be committed to "
                 f"{self._ghc.repo_name}; the content is stored and the "

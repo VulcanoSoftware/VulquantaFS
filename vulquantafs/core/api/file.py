@@ -24,7 +24,11 @@ from vulquantafs.core.model import (
     TGFSFileVersion,
 )
 from vulquantafs.core.repository.interface import FDRepositoryResp
-from vulquantafs.errors import FileOrDirectoryDoesNotExist, TechnicalError
+from vulquantafs.errors import (
+    FileOrDirectoryDoesNotExist,
+    PendingCommitError,
+    TechnicalError,
+)
 from vulquantafs.reqres import (
     FileContent,
     FileMessage,
@@ -402,7 +406,15 @@ class FileApi:
         journal_file_ref: bool = False,
     ) -> TGFSFileDesc:
         resp = await self._file_desc_api.create_file_desc(file_msg)
-        if journal_file_ref and resp.store in (None, self._store_key):
+        if journal_file_ref:
+            # Journal every stored upload, whichever store took the bytes.
+            # While the primary is down the acting store holds the content
+            # and the reference belongs to that store, but waiting for its
+            # commit on GitHub is what turned a bulk upload into failed
+            # transfers: a stats commit can hold the branch past the
+            # deadline, and the client then retried into a name that was
+            # already there. The journal makes the reference durable here
+            # first and commits it in the background.
             staged = self._metadata_api.stage_upload(
                 where, file_msg.name, resp.message_id, resp.mirrors, resp.store
             )
@@ -412,13 +424,17 @@ class FileApi:
                 return resp.fd
         if defer_file_ref:
             fr = await where.create_file_ref_deferred(file_msg.name, resp.message_id)
+            pending = True
         else:
-            fr = await where.create_file_ref_async(file_msg.name, resp.message_id)
+            fr, pending = await self._await_file_ref(
+                where, file_msg.name, resp.message_id
+            )
         fr.mirrors = dict(resp.mirrors)
         fr.store = resp.store
-        if defer_file_ref:
-            # Legacy non-blocking create: the reference may still be
-            # pending. SFTP does not use this for a completed transfer.
+        if defer_file_ref or pending:
+            # Legacy non-blocking create, or a reference whose commit is
+            # still running: the name is in the tree and its content is
+            # stored, so only the mirror sync is left to schedule.
             self._metadata_api.request_push()
         elif where.file_refs_persist_on_create and fr.owned_by(self._store_key):
             # The pathname and its primary descriptor are already durable
@@ -437,6 +453,35 @@ class FileApi:
         await self.stats.record(fr, resp.fd)
         await self._written(fr, resp.fd)
         return resp.fd
+
+    async def _await_file_ref(
+        self, where: TGFSDirectory, name: str, message_id: int
+    ) -> tuple[TGFSFileRef, bool]:
+        """Create the reference and wait for its commit; report a commit
+        that is still running as a completed write.
+
+        Past its deadline the commit worker keeps retrying while the
+        reference is already in the tree, so the file is listed and
+        readable straight away. Answering an error for it made the client
+        retry the upload, find the very name it had just written and ask
+        its user whether to overwrite -- once for every file of a bulk run
+        that missed the bound. Only a create that left no reference behind
+        is a failure.
+        """
+        try:
+            return await where.create_file_ref_async(name, message_id), False
+        except PendingCommitError as ex:
+            found = [
+                ref for ref in where.find_files([name]) if ref.message_id == message_id
+            ]
+            if not found:
+                raise
+            logger.warning(
+                f"{name} is in the tree with message_id={message_id} and its "
+                f"content is stored; only the metadata commit is still "
+                f"running: {ex}"
+            )
+            return found[0], True
 
     async def _push_new_file_ref(self, fr: TGFSFileRef) -> None:
         try:

@@ -28,6 +28,19 @@ class TechnicalError(Exception):
         self.http_error = http_error
 
 
+class PendingCommitError(TechnicalError):
+    """The content is stored and the name is in the tree; only the commit
+    that makes the reference durable is still running.
+
+    The reference is live for every reader in this process, so a caller
+    whose write already landed must not answer a failure: a client retries
+    a failure, finds the name it just wrote, and asks whether to overwrite
+    it -- and the retransmission appends a second version of the same
+    bytes. Only the code that has something left to wait for (a copy whose
+    rollback depends on the commit) treats this as an error.
+    """
+
+
 class RpcTimeoutError(TechnicalError):
     """A call into a store stayed silent past its deadline.
 
