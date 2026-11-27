@@ -488,6 +488,12 @@ class StoreFDRepository(IFDRepository):
                 if asked_ids
                 else []
             )
+            # An answer is the proof the breaker waits for: without it the
+            # primary stays "dead" for the full window after it recovered,
+            # and every version that fully trusts its mirrors spends that
+            # minute asking a mirror that just went down.
+            if primary_down and self._mirror_group is not None:
+                self._mirror_group.mark_primary_alive()
         except Exception as ex:
             # An unreachable primary (banned channel, network down) must
             # not make every file look invalid while a mirror has it: treat
@@ -695,6 +701,11 @@ class StoreFDRepository(IFDRepository):
                 self._mirror_group.mark_primary_dead()
 
         if message and message.text:
+            # A primary that answers again ends its own outage: keeping the
+            # breaker open after a successful read would send the next
+            # files to mirrors that may just have gone down themselves.
+            if self._mirror_group is not None:
+                self._mirror_group.mark_primary_alive()
             return message.text
 
         group = self._mirror_group

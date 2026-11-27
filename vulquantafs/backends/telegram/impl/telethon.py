@@ -26,7 +26,7 @@ from telethon.tl.types import InputDocumentFileLocation, PeerChannel
 
 from vulquantafs.backends.telegram.interface import ITDLibClient
 from vulquantafs.config import Config, get_config
-from vulquantafs.errors import TechnicalError, UnDownloadableMessage
+from vulquantafs.errors import RpcTimeoutError, TechnicalError, UnDownloadableMessage
 from vulquantafs.reqres import (
     DeleteMessagesReq,
     Document,
@@ -115,6 +115,29 @@ class TelethonAPI(ITDLibClient):
     def _transfer_client(self) -> TelegramClient:
         return next(self.__transfer_cycle)
 
+    def _drop_silent_sender(self, client: TelegramClient) -> None:
+        """Discard a sender whose request went unanswered.
+
+        This client disables Telethon's update loop, so nothing pings the
+        connection: when the network disappears with its packets dropped
+        instead of refused, the socket stays half-open, ``is_connected()``
+        keeps saying True, and every request hangs until the caller's
+        bound cancels it -- the store stays dead even after the network
+        returns, because Telethon only redials when it notices the
+        disconnect, which never happens. Dropping the sender forces the
+        next call through a fresh ``connect()``.
+        """
+
+        async def drop():
+            try:
+                async with self._reconnect_locks[id(client)]:
+                    if client.is_connected():
+                        await asyncio.wait_for(client.disconnect(), 5.0)
+            except Exception:
+                logger.exception("Dropping a Telegram sender that went silent failed")
+
+        asyncio.get_running_loop().create_task(drop())
+
     async def _connected_rpc(
         self, what: str, client: TelegramClient, action: Callable[[], Awaitable[T]]
     ) -> T:
@@ -131,6 +154,12 @@ class TelethonAPI(ITDLibClient):
         try:
             return await self._bounded(what, run())
         except asyncio.CancelledError as ex:
+            # The request died mid-flight -- to a caller's bound or at
+            # shutdown. Whatever the state the sender is in now, a call
+            # that comes later must start from a connection that is
+            # verifiably fresh, not from the half-open one this request
+            # was hanging on.
+            self._drop_silent_sender(client)
             task = asyncio.current_task()
             if task is None or task.cancelling():
                 raise
@@ -140,6 +169,11 @@ class TelethonAPI(ITDLibClient):
             raise ConnectionError(
                 f"Telegram transport cancelled the request during {what}"
             ) from ex
+        except RpcTimeoutError:
+            # The bound of ``_bounded`` fired before any caller's: same
+            # silence, same wedged sender, same way out.
+            self._drop_silent_sender(client)
+            raise
 
     async def __get_messages(self, *args, **kwargs) -> Sequence[tlt.Message]:
         messages = await self._connected_rpc(

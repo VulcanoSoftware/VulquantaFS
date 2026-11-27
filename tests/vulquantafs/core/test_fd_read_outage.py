@@ -195,6 +195,41 @@ class TestDeadPrimaryWithoutMirror:
         assert 42 not in requested
 
 
+class TestBreakerRecovery:
+    """A breaker that never closes keeps sending files to a mirror that
+    went down itself after the primary recovered: Telegram coming back
+    has to end the outage, not merely stop extending it."""
+
+    @pytest.mark.asyncio
+    async def test_a_parts_read_the_primary_answers_closes_the_breaker(self):
+        primary = FakeStore(key="tg:111")
+        mirror = FakeStore(key="dc:9")
+        _with_part(primary, 42)
+        group = _group(primary, mirror)
+        group.mark_primary_dead()
+        repo = StoreFDRepository(primary, mirror_group=group)
+        fr = TGFSDirectory.root_dir().create_file_ref("a.txt", 42)
+
+        fd = await repo.get(fr)
+
+        assert not group.primary_dead()
+        assert fd.get_latest_version().part_sizes == [5]
+
+    @pytest.mark.asyncio
+    async def test_a_descriptor_read_from_the_primary_closes_the_breaker(self):
+        primary = FakeStore(key="tg:111")
+        mirror = FakeStore(key="dc:9")
+        primary.messages[42] = _message(42, TEXT)
+        group = _group(primary, mirror)
+        group.mark_primary_dead()
+        repo = StoreFDRepository(primary, mirror_group=group)
+        fr = TGFSDirectory.root_dir().create_file_ref("a.txt", 42)
+
+        await repo.get(fr, validate=False)
+
+        assert not group.primary_dead()
+
+
 class TestFailedReadIsNotAMissingFile:
     @pytest.mark.asyncio
     async def test_the_descriptor_is_marked_unreadable_and_logged(self, caplog):
