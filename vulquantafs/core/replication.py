@@ -49,7 +49,7 @@ RETRY_MAX_SECONDS = 15 * 60.0
 # How many queued files the worker heals at once: the stores batch and
 # throttle their requests fine when a few replications overlap, and a
 # backlog of tens of thousands of legacy files never drains one by one.
-HEAL_CONCURRENCY = 8
+HEAL_CONCURRENCY = 16
 
 # How many healed files are committed to the metadata in one push: each
 # push writes the whole tree to every metadata store, so a backlog may
@@ -340,20 +340,22 @@ class ReplicationWorker:
         return False
 
     async def _flush(self) -> None:
-        """Commit the healed files to the metadata, persist the queue.
+        """Hand the healed files to the metadata pusher, persist the queue.
 
         One push writes the whole tree, so the files healed since the
-        previous push all land together; a failure only delays them, the
-        next push carries the same tree state."""
+        previous request all land together. The push itself is requested,
+        not awaited: a whole-tree commit to slow metadata stores can take
+        tens of seconds, and at one stall per batch that stall alone
+        dwarfed the healing it interrupted. The coalescer writes in the
+        background while healing continues; a failed write only delays
+        the files, the next push carries the same tree state, and the
+        startup sweep repairs whatever never landed."""
         self._queue.flush()
         if not self._dirty:
             return
         self._dirty = 0
         if self._client.metadata_api:
-            try:
-                await self._client.metadata_api.push()
-            except Exception as ex:
-                logger.warning("Could not push the replicated metadata: %s", ex)
+            self._client.metadata_api.request_push()
 
     async def run_once(self) -> int:
         """Process everything that is ready; returns how many were done."""

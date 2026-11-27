@@ -822,14 +822,14 @@ class TestHealThroughput:
             await self.legacy(stack, name)
             queue.enqueue("fs", path)
         pushes = 0
-        original = stack.metadata_api.push
+        original = stack.metadata_api.request_push
 
-        async def counting_push(*args, **kwargs):
+        def counting_request_push(*args, **kwargs):
             nonlocal pushes
             pushes += 1
-            await original(*args, **kwargs)
+            original(*args, **kwargs)
 
-        stack.metadata_api.push = counting_push  # type: ignore[method-assign]
+        stack.metadata_api.request_push = counting_request_push  # type: ignore[method-assign]
 
         assert await ReplicationWorker(self.client_of(stack), queue).run_once() == 3  # type: ignore[arg-type]
 
