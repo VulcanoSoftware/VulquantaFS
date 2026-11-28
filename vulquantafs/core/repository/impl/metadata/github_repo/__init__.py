@@ -74,6 +74,12 @@ STATS_COMMIT_ATTEMPTS = 3
 SYNC_COMMIT_ATTEMPTS = 3
 GITHUB_PAGE_SIZE = 100
 
+# Root-path blob that carries the replication queue's remote snapshot.
+# ``_is_managed_blob`` does not claim it (the segment parses as neither a
+# reference nor ``.gitkeep``), so a full sync leaves it alone; every
+# backup simply replaces it.
+REPLICATION_BACKUP_PATH = "replication-queue-backup.b64"
+
 
 def _blob_sha(content: str) -> str:
     """The git blob sha of ``content``, as GitHub will report it."""
@@ -493,6 +499,68 @@ class GithubRepoMetadataRepository(IMetaDataRepository):
                 )
                 if len(refs) > 1:
                     _put_file_refs(repo, branch, refs[1:])
+
+    async def store_replication_backup(self, data: bytes) -> bool:
+        """Commit one snapshot of the replication queue to the branch root.
+
+        The payload is gzipped JSON travelling base64-encoded, since the
+        tree API's elements carry text. Replaces the previous snapshot in
+        place; without a branch yet there is nothing worth backing up."""
+        overlay = [
+            InputGitTreeElement(
+                path=REPLICATION_BACKUP_PATH,
+                mode="100644",
+                type="blob",
+                content=base64.b64encode(data).decode("ascii"),
+            )
+        ]
+        try:
+            async with self._ghc.lock:
+                await self._ghc.write(
+                    commit_tree_overlay,
+                    self._ghc.repo,
+                    self._ghc.commit,
+                    overlay,
+                    "Back up the replication queue",
+                )
+        except GithubException as ex:
+            if getattr(ex, "status", None) == 404:
+                return False
+            raise
+        return True
+
+    async def load_replication_backup(self) -> Optional[bytes]:
+        """The stored snapshot, or ``None`` when there is none."""
+        repo, branch = self._ghc.repo, self._ghc.commit
+        try:
+            ref = repo.get_git_ref(f"heads/{branch}")
+            commit = repo.get_git_commit(ref.object.sha)
+            tree = repo.get_git_tree(commit.tree.sha, recursive=True)
+            if tree.truncated:
+                entries: Sequence[_TreeEntry] = self._walk_tree()
+            else:
+                entries = [
+                    _TreeEntry(path=e.path, type=e.type, sha=e.sha, mode=e.mode)
+                    for e in tree.tree
+                ]
+        except GithubException as ex:
+            if getattr(ex, "status", None) == 404:
+                return None
+            raise
+        entry = next(
+            (
+                e
+                for e in entries
+                if e.type == "blob" and e.path == REPLICATION_BACKUP_PATH
+            ),
+            None,
+        )
+        if entry is None:
+            return None
+        blob = repo.get_git_blob(entry.sha)
+        # PyGithub hands out the blob's content base64-encoded; the raw
+        # bytes are the base64 text the backup committed.
+        return base64.b64decode(base64.b64decode(blob.content).decode("ascii"))
 
     def _desired_blobs(self) -> Set[str]:
         """The blob paths the in-memory tree implies."""

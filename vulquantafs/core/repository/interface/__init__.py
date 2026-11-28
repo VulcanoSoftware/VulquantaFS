@@ -153,6 +153,16 @@ class IMetaDataRepository(metaclass=ABCMeta):
         """Persist journaled removals, which bypass incremental writes."""
         await self.push_full()
 
+    async def store_replication_backup(self, data: bytes) -> bool:
+        """Keep one snapshot of a replication queue as a backup; the local
+        file stays the source of truth. ``False`` when this store does
+        not keep one."""
+        return False
+
+    async def load_replication_backup(self) -> Optional[bytes]:
+        """The stored queue snapshot, if any; ``None`` when there is none."""
+        return None
+
     @abstractmethod
     async def get(self) -> TGFSMetadata:
         pass
