@@ -7,7 +7,7 @@ from typing import Dict, List, Optional, Set, Tuple
 from vulquantafs.reqres import GetMessagesReq, GetMessagesResp, MessageResp
 from vulquantafs.utils.message_cache import channel_cache
 
-from .interface import TDLibApi
+from .interface import ITDLibClient, TDLibApi
 
 # How long a batch collects further requests before it is sent. Counted from
 # the *first* pending request, so a steady stream of requests cannot keep
@@ -19,6 +19,19 @@ DELAY = 0.5
 # reached a Telegram descriptor, or a corrupt file reference -- makes the
 # client fail while serializing the request, before anything is sent.
 MAX_MESSAGE_ID = 2**31 - 1
+
+# How long one batch attempt may stay silent before it is abandoned. Every
+# caller bounds its own wait far below the wide ``rpc_timeout_s`` leash of
+# an RPC, and cancelling that wait only abandons the answer, not the
+# request: the RPC keeps running in the single collector task, so one
+# sender wedged in a half-open connection -- the state a packet-dropping
+# outage leaves behind -- held the collector, and with it every queued
+# request of every download, stuck for as long as the silence lasted. An
+# attempt that outlives this bound is cancelled, which is exactly what
+# lets ``_connected_rpc`` drop the wedged sender, so a later attempt
+# starts from a fresh connection and answers as soon as the store is
+# actually back.
+ATTEMPT_TIMEOUT_S = 8.0
 
 
 logger = logging.getLogger(__name__)
@@ -142,20 +155,31 @@ class MessageBroker:
         bot = self.tdlib.next_bot
         for _ in range(self.__bots_count):
             try:
-                return await bot.get_messages(
-                    GetMessagesReq(chat=self.private_file_channel, message_ids=ids)
+                return await asyncio.wait_for(
+                    bot.get_messages(
+                        GetMessagesReq(chat=self.private_file_channel, message_ids=ids)
+                    ),
+                    ATTEMPT_TIMEOUT_S,
                 )
             except Exception as ex:
                 e = ex
-                me = await bot.get_me()
+                name = await self.__bot_name(bot)
                 logger.error(
-                    f"{me.name} failed to get messages: {ex}, retrying with next bot..."
+                    f"{name} failed to get messages: {ex}, retrying with next bot..."
                 )
                 bot = self.tdlib.next_bot
         if e is None:
             raise RuntimeError("no bot was available to get messages")
         logger.error(f"All bots failed to get messages: {e}")
         raise e
+
+    @staticmethod
+    async def __bot_name(bot: ITDLibClient) -> str:
+        """The failing bot's name for the log, itself kept on a leash."""
+        try:
+            return (await asyncio.wait_for(bot.get_me(), ATTEMPT_TIMEOUT_S)).name
+        except Exception:
+            return "a bot"
 
     async def __fetch(
         self, ids: Set[int]

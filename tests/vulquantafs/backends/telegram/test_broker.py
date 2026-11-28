@@ -175,6 +175,70 @@ class TestFailover:
             await broker.get_messages([1])
 
 
+class WedgedBot(FakeBot):
+    """A bot that answers only after its first batch was abandoned.
+
+    The state a packet-dropping outage leaves behind: the connection is
+    half-open, the request is sent and never answered, and the client
+    still claims to be connected. Only the attempt bound of the broker
+    gets the collector past it.
+    """
+
+    def __init__(self, name: str = "wedged", silent: int = 1):
+        super().__init__(name)
+        self.attempts = 0
+        self.silent = silent
+
+    async def get_messages(self, req) -> GetMessagesResp:
+        self.attempts += 1
+        if self.attempts <= self.silent:
+            await asyncio.Event().wait()
+        return await super().get_messages(req)
+
+
+class TestSilentSender:
+    """A silent sender must hold the single collector task no longer
+
+    than its attempt bound. The callers bound their own wait at 3 s and
+    fail over to the mirrors, but their cancelling only abandons the
+    answer -- the request kept running in the collector, which is the
+    one task every queued request shares. A sender wedged after an
+    outage then held *every* download's probes stuck for as long as the
+    silence lasted, even after the store had recovered: no batch was
+    ever sent again, so nothing ever noticed the network was back.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_silent_attempt_is_abandoned_and_the_next_bot_serves(self, mocker):
+        mocker.patch.object(mb, "ATTEMPT_TIMEOUT_S", 0.2)
+        wedged = WedgedBot()
+        healthy = FakeBot("healthy")
+        broker = _broker(wedged, healthy)
+
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(broker.get_messages([11]), 0.05)
+
+        answer = await broker.get_messages([12])
+
+        assert _ids(answer) == [12]
+        assert wedged.attempts >= 1
+        assert healthy.batches
+
+    @pytest.mark.asyncio
+    async def test_a_collector_behind_an_always_silent_bot_fails_its_batch(
+        self, mocker
+    ):
+        mocker.patch.object(mb, "ATTEMPT_TIMEOUT_S", 0.2)
+        wedged = WedgedBot(silent=10)
+        broker = _broker(wedged)
+
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(broker.get_messages([11]), 0.05)
+
+        with pytest.raises(asyncio.TimeoutError):
+            await broker.get_messages([12])
+
+
 class TestPoisonedBatch:
     """One unusable id must not cost the other requests in the window.
 
