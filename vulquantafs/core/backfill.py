@@ -387,6 +387,10 @@ async def _sync_ref(
             fr.message_id != resp.message_id or fr.store != resp.store
         ):
             await client.metadata_api.flush_uploads(ref=fr)
+        # The ref mutates in place; a store whose committed blob names the
+        # old state (a tree store has no write-through hook for mirror
+        # bookkeeping) has to hear about it before the values move.
+        fr.location.note_ref_update(fr, (fr.message_id, dict(fr.mirrors), fr.store))
         fr.message_id = resp.message_id
         fr.mirrors = dict(resp.mirrors)
         fr.store = resp.store
