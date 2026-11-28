@@ -136,7 +136,7 @@ class TestMain:
                 name: type("C", (), {"name": name})() for name in ("media", "notes")
             }
 
-            workers = start_replication_workers(clients, config, queue)
+            workers = await start_replication_workers(clients, config, queue)
             try:
                 # "media" has mirrors and gets a worker for every sync
                 # mode; "notes" has none and gets nothing.
@@ -244,7 +244,10 @@ class TestMain:
         mock_create_clients = mocker.patch("main.create_clients")
         mock_create_app = mocker.patch("main.create_app")
         mock_run_server = mocker.patch("main.run_server")
-        mocker.patch("main.start_replication_workers", return_value=[])
+        mocker.patch(
+            "main.start_replication_workers",
+            new=mocker.AsyncMock(return_value=[]),
+        )
         mock_config = mocker.Mock()
         mock_config.vulquantafs.server.host = "0.0.0.0"
         mock_config.vulquantafs.server.port = 9000

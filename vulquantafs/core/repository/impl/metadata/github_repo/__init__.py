@@ -39,8 +39,11 @@ from .gh_directory import (
     TREE_OVERLAY_ACTION_LIMIT,
     GithubConfig,
     GithubDirectory,
+    _PendingRefUpdate,
     _put_file_refs,
     commit_tree_overlay,
+    file_ref_segment,
+    parse_ref_segment,
 )
 from .stats_file import STATS_COMMIT_PREFIX, STATS_FILE_NAME
 from .tree_snapshot import TreeSnapshot, snapshot_file_name
@@ -70,6 +73,12 @@ STATS_COMMIT_ATTEMPTS = 3
 # How often the full-tree sync commit is retried when the branch moved.
 SYNC_COMMIT_ATTEMPTS = 3
 GITHUB_PAGE_SIZE = 100
+
+# Root-path blob that carries the replication queue's remote snapshot.
+# ``_is_managed_blob`` does not claim it (the segment parses as neither a
+# reference nor ``.gitkeep``), so a full sync leaves it alone; every
+# backup simply replaces it.
+REPLICATION_BACKUP_PATH = "replication-queue-backup.b64"
 
 
 def _blob_sha(content: str) -> str:
@@ -221,6 +230,7 @@ class GithubRepoMetadataRepository(IMetaDataRepository):
             # write-through hooks to a possibly unreachable primary.
             await self.push_full()
             return
+        await self._flush_ref_updates()
         # The incremental writes already landed while the tree was mutated;
         # what is left is the batched file-reference deletions.
         if not self._ghc.pending_drops:
@@ -254,6 +264,72 @@ class GithubRepoMetadataRepository(IMetaDataRepository):
         self._ghc.pending_drops.update(paths)
         if not self._ghc.pending_drops_since:
             self._ghc.pending_drops_since = time.monotonic()
+
+    async def _flush_ref_updates(self) -> None:
+        """Re-commit the blobs of refs whose stored state moved (see
+        ``GithubDirectory.note_ref_update``): one overlay commit that
+        creates the new segments and drops the superseded ones, so a
+        restart can never read the outdated segment back."""
+        if not self._ghc.pending_ref_updates:
+            return
+        async with self._ghc.lock:
+            updates = self._ghc.pending_ref_updates
+            self._ghc.pending_ref_updates = []
+            # The tree is read on the event loop (it is mutated there); only
+            # the commit runs on the writer thread.
+            creates: Set[str] = set()
+            drops: Set[str] = set()
+            for update in updates:
+                drops.add(update.committed_path)
+                fr = update.file_ref
+                if not any(ref is fr for ref in update.directory.find_files([fr.name])):
+                    continue
+                creates.add(update.directory._ref_path_of(fr))
+            drops -= creates
+            try:
+                await self._ghc.write(
+                    self._commit_ref_updates, sorted(creates), sorted(drops)
+                )
+            except GithubException as ex:
+                if getattr(ex, "status", None) == 404:
+                    # No branch yet: a fresh store holds no blobs; the first
+                    # full sync creates them under their current segments.
+                    return
+                self._requeue_ref_updates(updates)
+            except Exception:
+                self._requeue_ref_updates(updates)
+
+    def _requeue_ref_updates(self, updates: list[_PendingRefUpdate]) -> None:
+        logger.exception(
+            f"Committing {len(updates)} file reference update(s) to "
+            f"{self._ghc.repo_name} failed; they are queued for the "
+            "next metadata push"
+        )
+        self._ghc.pending_ref_updates.extend(updates)
+
+    def _commit_ref_updates(self, creates: Sequence[str], drops: Sequence[str]) -> None:
+        """Overlay the ref updates on the branch head in one commit.
+
+        Blocking; raises when the commit does not land, and retried from
+        the queued updates on the next metadata push.
+        """
+        overlay = [
+            InputGitTreeElement(path, "100644", "blob", content="") for path in creates
+        ]
+        overlay += [
+            InputGitTreeElement(path, "100644", "blob", sha=None) for path in drops
+        ]
+        if not overlay:
+            return
+        commit_tree_overlay(
+            self._ghc.repo,
+            self._ghc.commit,
+            overlay,
+            f"Update {len(creates)} file reference(s)",
+        )
+        logger.info(
+            f"Updated {len(creates)} file reference(s) in {self._ghc.repo_name}"
+        )
 
     def _commit_drops(self, paths: list[str]) -> None:
         """Overlay the pending deletions on the branch head in one commit.
@@ -424,6 +500,68 @@ class GithubRepoMetadataRepository(IMetaDataRepository):
                 if len(refs) > 1:
                     _put_file_refs(repo, branch, refs[1:])
 
+    async def store_replication_backup(self, data: bytes) -> bool:
+        """Commit one snapshot of the replication queue to the branch root.
+
+        The payload is gzipped JSON travelling base64-encoded, since the
+        tree API's elements carry text. Replaces the previous snapshot in
+        place; without a branch yet there is nothing worth backing up."""
+        overlay = [
+            InputGitTreeElement(
+                path=REPLICATION_BACKUP_PATH,
+                mode="100644",
+                type="blob",
+                content=base64.b64encode(data).decode("ascii"),
+            )
+        ]
+        try:
+            async with self._ghc.lock:
+                await self._ghc.write(
+                    commit_tree_overlay,
+                    self._ghc.repo,
+                    self._ghc.commit,
+                    overlay,
+                    "Back up the replication queue",
+                )
+        except GithubException as ex:
+            if getattr(ex, "status", None) == 404:
+                return False
+            raise
+        return True
+
+    async def load_replication_backup(self) -> Optional[bytes]:
+        """The stored snapshot, or ``None`` when there is none."""
+        repo, branch = self._ghc.repo, self._ghc.commit
+        try:
+            ref = repo.get_git_ref(f"heads/{branch}")
+            commit = repo.get_git_commit(ref.object.sha)
+            tree = repo.get_git_tree(commit.tree.sha, recursive=True)
+            if tree.truncated:
+                entries: Sequence[_TreeEntry] = self._walk_tree()
+            else:
+                entries = [
+                    _TreeEntry(path=e.path, type=e.type, sha=e.sha, mode=e.mode)
+                    for e in tree.tree
+                ]
+        except GithubException as ex:
+            if getattr(ex, "status", None) == 404:
+                return None
+            raise
+        entry = next(
+            (
+                e
+                for e in entries
+                if e.type == "blob" and e.path == REPLICATION_BACKUP_PATH
+            ),
+            None,
+        )
+        if entry is None:
+            return None
+        blob = repo.get_git_blob(entry.sha)
+        # PyGithub hands out the blob's content base64-encoded; the raw
+        # bytes are the base64 text the backup committed.
+        return base64.b64decode(base64.b64decode(blob.content).decode("ascii"))
+
     def _desired_blobs(self) -> Set[str]:
         """The blob paths the in-memory tree implies."""
         if self.metadata is None:
@@ -474,9 +612,13 @@ class GithubRepoMetadataRepository(IMetaDataRepository):
         self, directory: TGFSDirectory, path: str, fr: TGFSFileRef
     ) -> str:
         if isinstance(directory, GithubDirectory) and directory._ghc is self._ghc:
-            segment = directory._file_ref_storage_name(fr.name, fr.message_id)
+            segment = directory._file_ref_storage_name(
+                fr.name, fr.message_id, fr.mirrors
+            )
         else:
-            segment = f"{self._encode_segment(fr.name)}.{fr.message_id}"
+            segment = file_ref_segment(
+                self._encode_segment(fr.name), fr.message_id, fr.mirrors
+            )
         return GithubDirectory.join_path(path, segment)
 
     @staticmethod
@@ -489,8 +631,11 @@ class GithubRepoMetadataRepository(IMetaDataRepository):
             return True
         if segment == STATS_FILE_NAME:
             return False
-        _, _, suffix = segment.rpartition(".")
-        return suffix.isdigit()
+        try:
+            parse_ref_segment(segment)
+        except ValueError:
+            return False
+        return True
 
     def _sync_tree_commit(self, desired_blobs: Set[str]) -> None:
         """Diff the repo against the desired blobs and commit the delta.
@@ -987,6 +1132,32 @@ class GithubRepoMetadataRepository(IMetaDataRepository):
         )
         return entries
 
+    def _attach_loaded_ref(
+        self,
+        directory: GithubDirectory,
+        name: str,
+        message_id: int,
+        mirrors: dict[str, int],
+    ) -> None:
+        """Attach one ref rebuilt from the repo, superseding stale blobs.
+
+        A ref whose descriptor moved can leave its previous segment behind
+        until a full sync removes it; of two segments for one name the
+        freshest wins -- the highest descriptor id, then the one that
+        carries mirror copies.
+        """
+        existing = directory.find_files([name])
+        if existing:
+            current = existing[0]
+            if (message_id, bool(mirrors)) <= (
+                current.message_id,
+                bool(current.mirrors),
+            ):
+                return
+            directory.files.remove(current)
+        fr = directory.attach_file_ref(name, message_id)
+        fr.mirrors = mirrors
+
     def _build_from_tree(
         self, entries: Sequence[_TreeEntry], root: GithubDirectory
     ) -> None:
@@ -1010,12 +1181,15 @@ class GithubRepoMetadataRepository(IMetaDataRepository):
                     self._dir_at(parent_path, dirs).stats_sha = entry.sha
                     continue
                 try:
-                    stored_name, message_id = segment.rsplit(".", 1)
+                    stored_name, message_id, mirrors = parse_ref_segment(segment)
                     file_name, _ = self._decode_name(stored_name)
                     # attach, not create: the directory's date is the git
                     # history's, not the moment this tree was rebuilt.
-                    self._dir_at(parent_path, dirs).attach_file_ref(
-                        file_name, int(message_id)
+                    self._attach_loaded_ref(
+                        self._dir_at(parent_path, dirs),
+                        file_name,
+                        message_id,
+                        mirrors,
                     )
                 except ValueError:
                     logger.warning(
@@ -1138,9 +1312,9 @@ class GithubRepoMetadataRepository(IMetaDataRepository):
                     if content.name == STATS_FILE_NAME:
                         parent_dir.stats_sha = content.sha
                         continue
-                    stored_name, message_id = content.name.rsplit(".", 1)
+                    stored_name, message_id, mirrors = parse_ref_segment(content.name)
                     file_name, _ = self._decode_name(stored_name)
-                    parent_dir.attach_file_ref(file_name, int(message_id))
+                    self._attach_loaded_ref(parent_dir, file_name, message_id, mirrors)
                 except ValueError:
                     logger.warning(
                         f"Invalid name format for {content.name}, expected a format like 'name.message_id'"

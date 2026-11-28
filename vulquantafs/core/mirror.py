@@ -181,6 +181,18 @@ class MirrorGroup:
         """Mirror stores that hold no complete copy of ``version``."""
         return [key for key in self.store_keys if not version.has_copy_in(key)]
 
+    def missing_fd_stores(
+        self, owned_store: Optional[str], recorded: Dict[str, int]
+    ) -> List[str]:
+        """Mirror stores that hold no copy of a file's descriptor.
+
+        ``recorded`` is the file ref's ``mirrors`` map; the store the
+        descriptor itself lives in counts as having it."""
+        have = {key for key, mid in recorded.items() if mid > 0}
+        if owned_store:
+            have.add(owned_store)
+        return [key for key in self.store_keys if key not in have]
+
     async def mirror_parts(
         self,
         message_ids: List[int],

@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import datetime
 import logging
 import time
@@ -15,6 +16,7 @@ from vulquantafs.crypto.path_names import encrypt_path_name
 from vulquantafs.errors import (
     DirectoryIsNotEmpty,
     FileOrDirectoryDoesNotExist,
+    PendingCommitError,
     TechnicalError,
 )
 from vulquantafs.utils.time import FIRST_DAY_OF_EPOCH
@@ -26,6 +28,61 @@ from .stats_file import STATS_FILE_NAME
 logger = logging.getLogger(__name__)
 
 T = TypeVar("T")
+
+# A tree store's file reference is an empty blob whose PATH carries the
+# state: ``<name>.<descriptor id>``, plus -- when the ref records
+# descriptor copies in mirror stores -- ``.m<payload>``, where the payload
+# joins ``<base64url store key>=<message id>`` pairs with commas. Base64url
+# holds no dot, comma or equals sign once the padding is stripped, so the
+# segments stay unambiguous and the loader reads them from the tree listing
+# it already fetches -- no per-blob content round trips. A segment change
+# (a mirror was recorded) is committed as a create of the new path plus a
+# drop of the old one, in one commit.
+REF_MIRROR_MARK = "m"
+
+
+def file_ref_segment(name: str, message_id: int, mirrors: dict[str, int]) -> str:
+    """The on-repo file name ``<name>.<id>[.m<payload>]``."""
+    segment = f"{name}.{message_id}"
+    payload = ",".join(
+        f"{base64.urlsafe_b64encode(key.encode()).decode().rstrip('=')}={mid}"
+        for key, mid in sorted(mirrors.items())
+        if mid
+    )
+    if payload:
+        segment = f"{segment}.{REF_MIRROR_MARK}{payload}"
+    return segment
+
+
+def parse_ref_segment(segment: str) -> tuple[str, int, dict[str, int]]:
+    """``(stored name, descriptor id, mirrors)`` of a blob path segment.
+
+    Raises ``ValueError`` for anything that is not a file-reference
+    segment (foreign blobs, stats files); callers log or skip it.
+    """
+    stored_name, tail = segment.rsplit(".", 1)
+    mirrors: dict[str, int] = {}
+    if not tail.isdecimal():
+        mirrors = _decode_mirror_tail(tail)
+        stored_name, tail = stored_name.rsplit(".", 1)
+        if not tail.isdecimal():
+            raise ValueError(f"no descriptor id in {segment!r}")
+    return stored_name, int(tail), mirrors
+
+
+def _decode_mirror_tail(tail: str) -> dict[str, int]:
+    if not tail.startswith(REF_MIRROR_MARK):
+        raise ValueError(f"unrecognized file reference suffix in {tail!r}")
+    mirrors: dict[str, int] = {}
+    for part in tail[1:].split(","):
+        encoded, sep, mid = part.partition("=")
+        if not sep or not encoded or not mid.isdecimal():
+            raise ValueError(f"malformed mirror entry in {tail!r}")
+        padded = encoded + "=" * (-len(encoded) % 4)
+        key = base64.urlsafe_b64decode(padded).decode()
+        mirrors[key] = int(mid)
+    return mirrors
+
 
 # A dropped connection (GitHub or the network hiccups for a few seconds) is
 # tried again briefly; a WebDAV client gives up after about 20 s.
@@ -51,10 +108,11 @@ AWAITED_COMMIT_WINDOW = 0.025
 # ... but never longer than this. A GitHub read timeout plus the write
 # thread's inline retries can hold the shared batch for half a minute and
 # more; a client that does not hear its CLOSE reply within about 20 s drops
-# the connection and aborts the upload. Past this bound the caller hears a
-# failure instead while the commit keeps retrying in the background, so a
-# retransmission appends a version to the same reference instead of finding
-# a server that never answers.
+# the connection and aborts the upload. Past this bound the caller hears
+# ``PendingCommitError`` while the commit keeps retrying in the background: a
+# completed upload answers it as success -- the reference is in the tree and
+# the file is readable -- while code with a rollback to run still sees a
+# failure.
 AWAITED_COMMIT_MAX_WAIT = 15.0
 
 # GitHub refuses a tree whose request carries a whole repository: the
@@ -171,6 +229,23 @@ class _PendingRef:
 
 
 @dataclass
+class _PendingRefUpdate:
+    """A file reference whose committed blob no longer names its state.
+
+    The tree store keeps no write-through hook for in-place mutations of
+    an existing ref (the descriptor heal records its mirrors that way),
+    so the mutation reports itself through ``note_ref_update``; ``push``
+    re-commits the blob under the ref's new segment and drops the
+    superseded path in the same commit. ``committed_path`` is the path
+    the repo still holds at registration time.
+    """
+
+    directory: "GithubDirectory"
+    file_ref: TGFSFileRef
+    committed_path: str
+
+
+@dataclass
 class GithubConfig:
     gh: Github
     repo_name: str
@@ -202,6 +277,16 @@ class GithubConfig:
     # (``create_file_ref_deferred``). Touched on the event loop only; the
     # drain empties it one ``lock``-covered commit at a time.
     pending_refs: list[_PendingRef] = field(
+        default_factory=list,
+        compare=False,
+        repr=False,
+    )
+    # File references whose committed blob no longer names their stored
+    # state (the descriptor heal recorded mirrors, a promotion relocated
+    # the descriptor). ``note_ref_update`` registers, ``push`` flushes
+    # batches into one overlay commit that creates the new segment and
+    # drops the old. Touched on the event loop only.
+    pending_ref_updates: list[_PendingRefUpdate] = field(
         default_factory=list,
         compare=False,
         repr=False,
@@ -532,12 +617,17 @@ class GithubDirectory(TGFSDirectory):
             return encrypt_path_name(key, self.name)
         return self.name
 
-    def _file_ref_storage_name(self, name: str, message_id: int) -> str:
-        """On-repo filename ``<name>.<id>``, with ``<name>`` encrypted if keyed."""
+    def _file_ref_storage_name(
+        self,
+        name: str,
+        message_id: int,
+        mirrors: Optional[dict[str, int]] = None,
+    ) -> str:
+        """On-repo filename ``<name>.<id>[.m<payload>]``, with ``<name>``
+        encrypted if keyed."""
         key = self._ghc.name_key
-        if key is not None:
-            return f"{encrypt_path_name(key, name)}.{message_id}"
-        return f"{name}.{message_id}"
+        stored = encrypt_path_name(key, name) if key is not None else name
+        return file_ref_segment(stored, message_id, mirrors or {})
 
     def _message_name(self, name: str) -> str:
         """``name`` as it may appear in a commit message: encrypted when
@@ -820,13 +910,14 @@ class GithubDirectory(TGFSDirectory):
         # away during the commit. By this point the content already exists.
         done, _ = await asyncio.wait({committed}, timeout=AWAITED_COMMIT_MAX_WAIT)
         if not done:
-            # GitHub is too slow to answer the commit. Answer the client
+            # GitHub is too slow to answer the commit. Answer the caller
             # anyway: holding the reply past what it waits for gets the
             # connection killed and the upload aborted mid-bulk. The
-            # reference stays in the tree and the worker keeps retrying,
-            # so a retransmission appends a version to the same file.
+            # reference stays in the tree, readable, and the worker keeps
+            # retrying, so a write that already landed reports success
+            # instead of sending its client into an overwrite prompt.
             committed.cancel()
-            raise TechnicalError(
+            raise PendingCommitError(
                 f"Timed out after {AWAITED_COMMIT_MAX_WAIT:g}s waiting for "
                 f"the file reference of {name} to be committed to "
                 f"{self._ghc.repo_name}; the content is stored and the "
@@ -865,9 +956,44 @@ class GithubDirectory(TGFSDirectory):
             self._deferred_refs.add(self._ghc.pending_refs_flusher)
         return file_ref
 
-    def _ref_storage_path(self, name: str, file_message_id: int) -> str:
+    def _ref_storage_path(
+        self,
+        name: str,
+        file_message_id: int,
+        mirrors: Optional[dict[str, int]] = None,
+    ) -> str:
         return self.join_path(
-            self._github_path, self._file_ref_storage_name(name, file_message_id)
+            self._github_path,
+            self._file_ref_storage_name(name, file_message_id, mirrors),
+        )
+
+    def _ref_path_of(self, fr: TGFSFileRef) -> str:
+        return self._ref_storage_path(fr.name, fr.message_id, fr.mirrors)
+
+    def note_ref_update(
+        self,
+        fr: TGFSFileRef,
+        previous: tuple[int, dict[str, int], Optional[str]],
+    ) -> None:
+        """Report that ``fr``'s committed blob no longer names its state.
+
+        ``previous`` is the ``(message_id, mirrors, store)`` the repo blob
+        still names; the next ``push`` re-commits the blob under the ref's
+        current segment and drops that path in the same commit, so a
+        restart reads the mirrors back instead of finding every descriptor
+        copy lost. A no-op when the segment did not move.
+        """
+        message_id, mirrors, _store = previous
+        committed = self._file_ref_storage_name(fr.name, message_id, mirrors)
+        current = self._file_ref_storage_name(fr.name, fr.message_id, fr.mirrors)
+        if committed == current:
+            return
+        self._ghc.pending_ref_updates.append(
+            _PendingRefUpdate(
+                directory=self,
+                file_ref=fr,
+                committed_path=self.join_path(self._github_path, committed),
+            )
         )
 
     def _put_file_ref(self, name: str, file_message_id: int) -> None:
@@ -930,7 +1056,11 @@ class GithubDirectory(TGFSDirectory):
         candidates ``_drop_file_ref`` deletes, encrypted first."""
         candidates = []
         if self._ghc.name_key is not None:
+            candidates.append(
+                self._file_ref_storage_name(fr.name, fr.message_id, fr.mirrors)
+            )
             candidates.append(self._file_ref_storage_name(fr.name, fr.message_id))
+        candidates.append(file_ref_segment(fr.name, fr.message_id, fr.mirrors))
         candidates.append(f"{fr.name}.{fr.message_id}")
         return {
             self.join_path(self._github_path, segment)
@@ -941,10 +1071,15 @@ class GithubDirectory(TGFSDirectory):
         """Remove the file reference blob from the repo. Blocking; a blob
         that cannot be found is logged, not raised."""
         # The ref may be stored under its encrypted or its legacy-plaintext
-        # name (mixed repos), so try the encrypted form first, then plaintext.
+        # name (mixed repos), with or without a mirror payload, so try the
+        # exact current forms first, then the payload-less ones.
         candidates = []
         if self._ghc.name_key is not None:
+            candidates.append(
+                self._file_ref_storage_name(fr.name, fr.message_id, fr.mirrors)
+            )
             candidates.append(self._file_ref_storage_name(fr.name, fr.message_id))
+        candidates.append(file_ref_segment(fr.name, fr.message_id, fr.mirrors))
         candidates.append(f"{fr.name}.{fr.message_id}")
 
         for segment in dict.fromkeys(candidates):  # de-dup, keep order

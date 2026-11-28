@@ -1,7 +1,19 @@
+import struct
 from http import HTTPStatus
 from typing import Iterable, Optional
 
 from .error_code import ErrorCode
+
+# Errors that say one request can never work, not that a store is down: an
+# id the protocol cannot encode, a malformed reply, a wrong type.
+DATA_ERRORS = (
+    ArithmeticError,
+    LookupError,
+    TypeError,
+    ValueError,
+    UnicodeError,
+    struct.error,
+)
 
 
 class TechnicalError(Exception):
@@ -14,6 +26,19 @@ class TechnicalError(Exception):
         super().__init__(message)
         self.cause = cause
         self.http_error = http_error
+
+
+class PendingCommitError(TechnicalError):
+    """The content is stored and the name is in the tree; only the commit
+    that makes the reference durable is still running.
+
+    The reference is live for every reader in this process, so a caller
+    whose write already landed must not answer a failure: a client retries
+    a failure, finds the name it just wrote, and asks whether to overwrite
+    it -- and the retransmission appends a second version of the same
+    bytes. Only the code that has something left to wait for (a copy whose
+    rollback depends on the commit) treats this as an error.
+    """
 
 
 class RpcTimeoutError(TechnicalError):
@@ -40,3 +65,23 @@ class BusinessError(TechnicalError):
 class AggregatedError(Exception):
     def __init__(self, errors: Iterable[Exception]):
         super().__init__("\n".join(str(e) for e in errors))
+
+
+def is_store_outage(ex: BaseException) -> bool:
+    """Whether ``ex`` says the store is unreachable, not that a request failed.
+
+    The read path marks a store dead -- taking it away from every file for
+    the next minute -- on any exception today. A request that could not
+    even be built says nothing about the store's health, though: one
+    message id the protocol cannot encode used to disable the primary for
+    a minute, and every file read in that minute came back as an empty
+    file.
+    """
+    seen: set = set()
+    current: Optional[BaseException] = ex
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, DATA_ERRORS):
+            return False
+        current = current.__cause__ or current.__context__
+    return True

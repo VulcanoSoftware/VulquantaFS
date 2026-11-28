@@ -18,19 +18,41 @@ restart does not lose pending copies. Items are paths, which makes the
 queue idempotent: a file queued twice is processed once, and a file
 whose copies are already complete is a no-op. Failures keep the item and
 back off; nothing is ever dropped silently.
+
+The file is the only copy the server can trust, so the queue is also
+snapshotted to the file system's metadata stores every so often: when
+the data directory is lost, the metadata tree still derives the
+descriptor gaps, but the content gaps a failed mirror write left behind
+exist only in the queue. A snapshot is a backup, never the source of
+truth -- it is only read when the local file is gone, and a stale one
+at worst queues files that are already complete, which the idempotent
+heal treats as a no-op.
 """
 
 from __future__ import annotations
 
 import asyncio
+import gzip
 import json
 import logging
 import os
 import time
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Dict, List, Optional
+from typing import (
+    TYPE_CHECKING,
+    Awaitable,
+    Callable,
+    Dict,
+    Iterable,
+    List,
+    Optional,
+)
 
-from vulquantafs.core.backfill import BackfillReport, backfill_file
+from vulquantafs.core.backfill import (
+    BackfillReport,
+    backfill_file,
+    collect_file_refs,
+)
 from vulquantafs.core.model import TGFSDirectory, TGFSFileRef
 
 if TYPE_CHECKING:
@@ -41,6 +63,27 @@ logger = logging.getLogger(__name__)
 # Backoff after a failed item, growing with consecutive failures.
 RETRY_BASE_SECONDS = 15.0
 RETRY_MAX_SECONDS = 15 * 60.0
+
+# How many queued files the worker heals at once: the stores batch and
+# throttle their requests fine when a few replications overlap, and a
+# backlog of tens of thousands of legacy files never drains one by one.
+HEAL_CONCURRENCY = 16
+
+# How many healed files are committed to the metadata in one push: each
+# push writes the whole tree to every metadata store, so a backlog may
+# not pay for one git commit per file.
+PUSH_BATCH = 100
+
+# The queue file is rewritten on every change; done and failed marks are
+# debounced so draining a large backlog does not rewrite the whole file
+# per item.
+SAVE_MIN_INTERVAL_S = 10.0
+
+# How often the queue's remote snapshot is committed to the metadata
+# stores at most. Each snapshot is one small commit; a backlog changes
+# the queue constantly, so the interval keeps that to a handful of
+# commits per hour.
+BACKUP_MIN_INTERVAL_S = 300.0
 
 
 def file_path(fr: TGFSFileRef) -> str:
@@ -87,8 +130,18 @@ class ReplicationQueue:
     path: Optional[str]
     _items: Dict[str, Dict[str, QueueItem]] = field(default_factory=dict)
     _wakeups: Dict[str, asyncio.Event] = field(default_factory=dict)
+    # Per file system: the coroutine that stores a snapshot's bytes in
+    # its metadata store, registered by the startup wiring.
+    _backups: Dict[str, Callable[[bytes], Awaitable[None]]] = field(
+        default_factory=dict
+    )
 
     def __post_init__(self) -> None:
+        self._last_save = 0.0
+        self._unsaved = False
+        self._backup_dirty: Dict[str, bool] = {}
+        self._backup_tasks: Dict[str, "asyncio.Task[None]"] = {}
+        self._backup_last: Dict[str, float] = {}
         self._load()
 
     # -- persistence -------------------------------------------------------
@@ -125,6 +178,8 @@ class ReplicationQueue:
             with open(tmp, "w", encoding="utf-8") as fh:
                 json.dump(data, fh)
             os.replace(tmp, self.path)
+            self._last_save = time.monotonic()
+            self._unsaved = False
         except OSError as ex:
             # A full disk must not fail the write that enqueued the file:
             # the item stays in memory and the worker still gets to it; a
@@ -144,7 +199,31 @@ class ReplicationQueue:
         if path not in items:
             items[path] = QueueItem(path=path, queued_at=time.time())
             self._save()
+            self._request_backup(fs_name)
         self.wakeup(fs_name).set()
+
+    def enqueue_many(self, fs_name: str, paths: Iterable[str]) -> int:
+        """Queue several paths, persisted once; returns how many are new."""
+        items = self._items.setdefault(fs_name, {})
+        new = [path for path in paths if path not in items]
+        for path in new:
+            items[path] = QueueItem(path=path, queued_at=time.time())
+        if new:
+            self._save()
+            self._request_backup(fs_name)
+            self.wakeup(fs_name).set()
+        return len(new)
+
+    def _save_soon(self) -> None:
+        """Record a change, rewriting the file at most once per interval."""
+        self._unsaved = True
+        if time.monotonic() - self._last_save >= SAVE_MIN_INTERVAL_S:
+            self._save()
+
+    def flush(self) -> None:
+        """Persist debounced changes now."""
+        if self._unsaved:
+            self._save()
 
     def pending(self, fs_name: str) -> List[QueueItem]:
         return sorted(self._items.get(fs_name, {}).values(), key=lambda i: i.queued_at)
@@ -155,7 +234,8 @@ class ReplicationQueue:
 
     def done(self, fs_name: str, path: str) -> None:
         if self._items.get(fs_name, {}).pop(path, None) is not None:
-            self._save()
+            self._save_soon()
+            self._request_backup(fs_name)
 
     def failed(self, fs_name: str, path: str, error: str) -> None:
         item = self._items.get(fs_name, {}).get(path)
@@ -166,7 +246,8 @@ class ReplicationQueue:
         item.not_before = time.time() + min(
             RETRY_BASE_SECONDS * 2 ** (item.attempts - 1), RETRY_MAX_SECONDS
         )
-        self._save()
+        self._save_soon()
+        self._request_backup(fs_name)
 
     def retry_now(self, fs_name: Optional[str] = None) -> None:
         """Clear the backoff of every item (of one file system)."""
@@ -177,11 +258,181 @@ class ReplicationQueue:
                 item.not_before = 0.0
             self.wakeup(name).set()
 
+    def restore(self, fs_name: str, items: List[QueueItem]) -> int:
+        """Re-queue the items of a remote snapshot; returns how many are new.
+
+        Local items stay ahead: a snapshot can be a few minutes stale, so
+        anything the local file (or the startup sweep) already knows is
+        kept as it is.
+        """
+        current = self._items.setdefault(fs_name, {})
+        new = [item for item in items if item.path not in current]
+        for item in new:
+            current[item.path] = item
+        if new:
+            self._save()
+        return len(new)
+
     def to_dict(self) -> Dict[str, List[dict]]:
         return {
             fs_name: [item.to_dict() for item in self.pending(fs_name)]
             for fs_name in self._items
         }
+
+    # -- remote backup -------------------------------------------------------
+
+    def register_backup(
+        self, fs_name: str, push: Callable[[bytes], Awaitable[None]]
+    ) -> None:
+        """Give the queue a way to store a snapshot of ``fs_name`` in its
+        metadata store."""
+        self._backups[fs_name] = push
+
+    def _request_backup(self, fs_name: str) -> None:
+        """Ask for a fresh snapshot, cheap enough for every queue change.
+
+        The work happens in one task per file system that coalesces the
+        changes made while it runs and paces itself to the interval, so a
+        draining backlog costs a handful of commits instead of one per
+        file. No event loop (an early synchronous caller) simply skips
+        the snapshot; the next change on the loop takes it along."""
+        if fs_name not in self._backups:
+            return
+        self._backup_dirty[fs_name] = True
+        task = self._backup_tasks.get(fs_name)
+        if task is not None and not task.done():
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        self._backup_tasks[fs_name] = loop.create_task(self._run_backup(fs_name))
+
+    async def _run_backup(self, fs_name: str) -> None:
+        push = self._backups[fs_name]
+        while self._backup_dirty.get(fs_name):
+            self._backup_dirty[fs_name] = False
+            since = time.monotonic() - self._backup_last.get(fs_name, 0.0)
+            if since < BACKUP_MIN_INTERVAL_S:
+                await asyncio.sleep(BACKUP_MIN_INTERVAL_S - since)
+            snapshot = encode_queue_backup(self.pending(fs_name))
+            try:
+                await push(snapshot)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception(
+                    f"Backing up the replication queue of '{fs_name}' failed"
+                )
+            self._backup_last[fs_name] = time.monotonic()
+
+
+def encode_queue_backup(items: List[QueueItem]) -> bytes:
+    """One gzipped snapshot of a file system's pending queue."""
+    return gzip.compress(json.dumps([item.to_dict() for item in items]).encode())
+
+
+def parse_queue_backup(data: bytes) -> List[QueueItem]:
+    """The items of a snapshot; raises on anything it cannot read."""
+    entries = json.loads(gzip.decompress(data))
+    return [
+        QueueItem(
+            path=entry["path"],
+            queued_at=float(entry.get("queued_at", time.time())),
+            attempts=int(entry.get("attempts", 0)),
+            last_error=entry.get("last_error"),
+        )
+        for entry in entries
+    ]
+
+
+async def push_queue_backup(client: "Client", snapshot: bytes) -> None:
+    """Store one queue snapshot in ``client``'s metadata stores."""
+    api = client.metadata_api
+    if api is None:
+        return
+    await api.store_replication_backup(snapshot)
+
+
+def queue_backup_pusher(client: "Client") -> Callable[[bytes], Awaitable[None]]:
+    """The backup push registered for one file system: its metadata stores."""
+
+    async def push(snapshot: bytes) -> None:
+        await push_queue_backup(client, snapshot)
+
+    return push
+
+
+async def restore_replication_backups(
+    clients: Dict[str, "Client"], replication: ReplicationQueue
+) -> None:
+    """Seed an empty local queue from the metadata stores' snapshots.
+
+    Runs at startup, before the sweep. The local file is the truth; only
+    when it is gone (a fresh data directory) do the snapshots matter, and
+    only for work the metadata tree cannot derive -- the content gaps a
+    failed mirror write left behind. A stale snapshot at worst queues
+    files that are already complete, which the heal treats as a no-op."""
+    if replication.path and os.path.exists(replication.path):
+        return
+    for client in clients.values():
+        name = getattr(client, "name", None)
+        api = getattr(client, "metadata_api", None)
+        if name is None or api is None:
+            continue
+        try:
+            data = await api.load_replication_backup()
+        except Exception:
+            logger.exception(f"Could not read the replication queue backup of '{name}'")
+            continue
+        if not data:
+            continue
+        try:
+            items = parse_queue_backup(data)
+        except Exception:
+            logger.exception(f"The replication queue backup of '{name}' is unreadable")
+            continue
+        restored = replication.restore(name, items)
+        if restored:
+            logger.info(
+                "Restored %d replication queue item(s) of '%s' from its "
+                "metadata store",
+                restored,
+                name,
+            )
+
+
+def queue_descriptor_gaps(client: "Client", queue: ReplicationQueue) -> int:
+    """Queue every file whose descriptor has no copy in a mirror store.
+
+    A tee write mirrors the descriptor together with the content, but a
+    mirror that was down at write time keeps the file without one, and
+    files written before mirrors were configured never got one. Such a
+    file's descriptor lives only in the primary, so while that store is
+    down nothing can even tell what the file contains -- the one gap the
+    read path cannot fail over from. The queue is idempotent, so the
+    worker heals the gap during the next healthy period, which is the
+    only time it can."""
+    group = getattr(client, "mirror_group", None)
+    if group is None:
+        return 0
+    refs = collect_file_refs(client.dir_api.root)
+    # Newest first: the files being worked with are protected first, and
+    # a backlog that takes hours must not start at the oldest file.
+    refs.sort(
+        key=lambda fr: fr.stat.modified_at if fr.stat else 0,
+        reverse=True,
+    )
+    missing = [
+        file_path(fr) for fr in refs if group.missing_fd_stores(fr.store, fr.mirrors)
+    ]
+    if missing:
+        logger.info(
+            "Queueing the descriptor mirror of %d file(s) in '%s'",
+            len(missing),
+            client.name,
+        )
+    return queue.enqueue_many(client.name, missing)
 
 
 class ReplicationWorker:
@@ -192,6 +443,7 @@ class ReplicationWorker:
         self._queue = queue
         self._task: Optional[asyncio.Task[None]] = None
         self.last_report: Optional[BackfillReport] = None
+        self._dirty = 0
 
     @property
     def name(self) -> str:
@@ -224,8 +476,9 @@ class ReplicationWorker:
             await backfill_file(self._client, fr, verify=False, report=report)
             if report.failures:
                 raise RuntimeError("; ".join(report.failures))
-            if self._client.metadata_api:
-                await self._client.metadata_api.push()
+            self._dirty += 1
+            if self._dirty >= PUSH_BATCH:
+                await self._flush()
         except asyncio.CancelledError:
             task = asyncio.current_task()
             if task is None or task.cancelling():
@@ -259,12 +512,35 @@ class ReplicationWorker:
         self._queue.failed(self.name, path, error)
         return False
 
+    async def _flush(self) -> None:
+        """Hand the healed files to the metadata pusher, persist the queue.
+
+        One push writes the whole tree, so the files healed since the
+        previous request all land together. The push itself is requested,
+        not awaited: a whole-tree commit to slow metadata stores can take
+        tens of seconds, and at one stall per batch that stall alone
+        dwarfed the healing it interrupted. The coalescer writes in the
+        background while healing continues; a failed write only delays
+        the files, the next push carries the same tree state, and the
+        startup sweep repairs whatever never landed."""
+        self._queue.flush()
+        if not self._dirty:
+            return
+        self._dirty = 0
+        if self._client.metadata_api:
+            self._client.metadata_api.request_push()
+
     async def run_once(self) -> int:
         """Process everything that is ready; returns how many were done."""
+        ready = self._queue.ready(self.name)
         done = 0
-        for item in self._queue.ready(self.name):
-            if await self.process_one(item.path):
-                done += 1
+        for i in range(0, len(ready), HEAL_CONCURRENCY):
+            chunk = ready[i : i + HEAL_CONCURRENCY]
+            results = await asyncio.gather(
+                *(self.process_one(item.path) for item in chunk)
+            )
+            done += sum(1 for ok in results if ok)
+        await self._flush()
         return done
 
     async def run(self) -> None:

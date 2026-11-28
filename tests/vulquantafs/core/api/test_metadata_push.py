@@ -165,6 +165,43 @@ async def test_upload_batches_retry_without_losing_uploads_staged_in_flight(tmp_
         await api.close()
 
 
+async def test_acting_store_uploads_survive_a_restart_with_their_store(tmp_path):
+    """A journaled upload from the acting store comes back naming that store.
+
+    While the primary is down the bytes live on the acting store, so the
+    reference has to carry its key; a restart that published it as a
+    primary-owned file would point readers at a message that is not there.
+    """
+    published: list[tuple[str, str | None]] = []
+
+    class Repo(CountingRepo):
+        async def get(self):
+            return TGFSMetadata(TGFSDirectory.root_dir())
+
+        async def push_upload_refs(self, refs, *, full=False):
+            published.extend((ref.name, ref.store) for ref in refs)
+
+    path = str(tmp_path / "uploads.sqlite3")
+    root = TGFSDirectory.root_dir()
+    ref = root.create_file_ref("512KB.txt", 555)
+    ref.mirrors = {"tg:1": 556}
+    ref.store = "dc:9"
+    journal = UploadJournal(path, None)
+    journal.add(ref)
+    journal.close()  # the process died before the batch reached GitHub
+
+    api = MetaDataApi(Repo(), upload_journal=UploadJournal(path, None))
+    await api.init()
+    try:
+        restored = api.get_root_directory().find_file("512KB.txt")
+        assert restored.store == "dc:9"
+        await api.flush_uploads(directory=api.get_root_directory())
+        assert published == [("512KB.txt", "dc:9")]
+        assert UploadJournal(path, None).load() == []
+    finally:
+        await api.close()
+
+
 async def test_mutation_flush_targets_only_its_subtree(tmp_path):
     class Repo(CountingRepo):
         async def get(self):

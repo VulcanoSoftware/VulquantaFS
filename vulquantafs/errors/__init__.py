@@ -1,4 +1,9 @@
-from .base import RpcTimeoutError, TechnicalError
+from .base import (
+    PendingCommitError,
+    RpcTimeoutError,
+    TechnicalError,
+    is_store_outage,
+)
 from .path import (
     DirectoryIsNotEmpty,
     FileOrDirectoryAlreadyExists,
@@ -22,6 +27,8 @@ from .vulquantafs import (
 
 __all__ = [
     "TechnicalError",
+    "PendingCommitError",
+    "is_store_outage",
     "RpcTimeoutError",
     "DirectoryIsNotEmpty",
     "FileOrDirectoryAlreadyExists",

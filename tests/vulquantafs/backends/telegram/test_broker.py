@@ -28,15 +28,25 @@ class FakeBot:
     short-circuit be exercised.
     """
 
-    def __init__(self, name: str = "bot", fail: Optional[Exception] = None):
+    def __init__(
+        self,
+        name: str = "bot",
+        fail: Optional[Exception] = None,
+        reject: Sequence[int] = (),
+    ):
         self.name = name
         self.fail = fail
+        # Ids this bot refuses, the way Telegram rejects an id it cannot
+        # address; the rest of a batch is fine on its own.
+        self.reject = set(reject)
         self.batches: List[tuple] = []
 
     async def get_messages(self, req) -> GetMessagesResp:
         self.batches.append(tuple(sorted(req.message_ids)))
         if self.fail:
             raise self.fail
+        if self.reject.intersection(req.message_ids):
+            raise RuntimeError("id rejected")
         messages = [_message(mid) for mid in req.message_ids]
         cache = channel_cache(req.chat).id
         for message in messages:
@@ -163,3 +173,114 @@ class TestFailover:
 
         with pytest.raises(RuntimeError, match="boom"):
             await broker.get_messages([1])
+
+
+class WedgedBot(FakeBot):
+    """A bot that answers only after its first batch was abandoned.
+
+    The state a packet-dropping outage leaves behind: the connection is
+    half-open, the request is sent and never answered, and the client
+    still claims to be connected. Only the attempt bound of the broker
+    gets the collector past it.
+    """
+
+    def __init__(self, name: str = "wedged", silent: int = 1):
+        super().__init__(name)
+        self.attempts = 0
+        self.silent = silent
+
+    async def get_messages(self, req) -> GetMessagesResp:
+        self.attempts += 1
+        if self.attempts <= self.silent:
+            await asyncio.Event().wait()
+        return await super().get_messages(req)
+
+
+class TestSilentSender:
+    """A silent sender must hold the single collector task no longer
+
+    than its attempt bound. The callers bound their own wait at 3 s and
+    fail over to the mirrors, but their cancelling only abandons the
+    answer -- the request kept running in the collector, which is the
+    one task every queued request shares. A sender wedged after an
+    outage then held *every* download's probes stuck for as long as the
+    silence lasted, even after the store had recovered: no batch was
+    ever sent again, so nothing ever noticed the network was back.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_silent_attempt_is_abandoned_and_the_next_bot_serves(self, mocker):
+        mocker.patch.object(mb, "ATTEMPT_TIMEOUT_S", 0.2)
+        wedged = WedgedBot()
+        healthy = FakeBot("healthy")
+        broker = _broker(wedged, healthy)
+
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(broker.get_messages([11]), 0.05)
+
+        answer = await broker.get_messages([12])
+
+        assert _ids(answer) == [12]
+        assert wedged.attempts >= 1
+        assert healthy.batches
+
+    @pytest.mark.asyncio
+    async def test_a_collector_behind_an_always_silent_bot_fails_its_batch(
+        self, mocker
+    ):
+        mocker.patch.object(mb, "ATTEMPT_TIMEOUT_S", 0.2)
+        wedged = WedgedBot(silent=10)
+        broker = _broker(wedged)
+
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(broker.get_messages([11]), 0.05)
+
+        with pytest.raises(asyncio.TimeoutError):
+            await broker.get_messages([12])
+
+
+class TestPoisonedBatch:
+    """One unusable id must not cost the other requests in the window.
+
+    A descriptor can name a 19-digit Discord snowflake while it is fed to
+    the Telegram channel (written when the other store was the primary).
+    MTProto cannot encode that id at all, so the request used to fail
+    before it left, and every file whose descriptor shared the batch was
+    served as an empty file although its parts were in the channel.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_foreign_id_is_answered_missing_and_never_sent(self):
+        bot = FakeBot()
+        broker = _broker(bot)
+
+        result = await broker.get_messages([1, 1574871427142914142])
+
+        assert bot.batches == [(1,)]
+        assert result[0] is not None and result[0].message_id == 1
+        assert result[1] is None
+
+    @pytest.mark.asyncio
+    async def test_a_rejected_id_does_not_fail_the_other_requests(self):
+        bot = FakeBot(reject=[42])
+        broker = _broker(bot)
+
+        good, bad = await asyncio.gather(
+            broker.get_messages([1, 2]),
+            broker.get_messages([42]),
+            return_exceptions=True,
+        )
+
+        assert not isinstance(good, BaseException)
+        assert _ids(good) == [1, 2]
+        assert isinstance(bad, RuntimeError)
+
+    @pytest.mark.asyncio
+    async def test_a_request_sharing_a_rejected_id_keeps_its_other_ids(self):
+        bot = FakeBot(reject=[42])
+        broker = _broker(bot)
+
+        result = await broker.get_messages([7, 42])
+
+        assert result[0] is not None and result[0].message_id == 7
+        assert result[1] is None

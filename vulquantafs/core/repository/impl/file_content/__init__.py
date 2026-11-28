@@ -19,7 +19,7 @@ from vulquantafs.core.multisource import (
 )
 from vulquantafs.core.repository.interface import IFileContentRepository
 from vulquantafs.core.tee import TeeUpload
-from vulquantafs.errors import TechnicalError
+from vulquantafs.errors import TechnicalError, is_store_outage
 from vulquantafs.reqres import (
     FileContent,
     Replica,
@@ -40,6 +40,15 @@ LIVE_TEE_BUFFER_BYTES = 1024 * 1024
 # be split across bots, so this multiplies with the per-message
 # concurrency -- keep it small.
 PART_PREFETCH_CONCURRENCY = 2
+
+# How long a store the breaker has taken away is still given to answer a
+# content read when it holds the only copy. There is no failover to fall
+# back to then, but an unreachable store must not hold the first byte of a
+# download past the client's own patience either: the client drops an idle
+# transfer after about 20 s, so the honest error -- nothing can serve this
+# file right now -- has to arrive before that.
+DEAD_STORE_READ_TIMEOUT_S = 5.0
+
 # How much of a write-back upload is taken off the request at a time.
 STAGE_READ_CHUNK = 1024 * 1024
 
@@ -536,6 +545,16 @@ class StoreFileContentRepository(IFileContentRepository):
                 other.key not in stalled for other, _ in sources[idx + 1 :]
             )
             deadline = PIECE_FAILOVER_TIMEOUT_S if can_fail_over else None
+            if (
+                deadline is None
+                and store is self._store
+                and self._mirror_group is not None
+                and self._mirror_group.primary_dead()
+            ):
+                # The only copy sits on a store the breaker took away. No
+                # failover is possible, but waiting out its reconnect cycle
+                # costs the client the transfer; bound the read instead.
+                deadline = DEAD_STORE_READ_TIMEOUT_S
             try:
                 async with asyncio.timeout(deadline):
                     resp = await store.download_file(mid, begin + served, end)
@@ -554,7 +573,7 @@ class StoreFileContentRepository(IFileContentRepository):
                 if isinstance(ex, TimeoutError) and can_fail_over:
                     stalled.add(store.key)
                 last_ex = ex
-                if store is self._store and self._mirror_group:
+                if store is self._store and self._mirror_group and is_store_outage(ex):
                     self._mirror_group.mark_primary_dead()
                 logger.warning(
                     f"Downloading part {part_idx} (message {mid}) of layout "

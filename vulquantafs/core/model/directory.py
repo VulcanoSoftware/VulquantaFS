@@ -67,11 +67,13 @@ class TGFSFileRef:
         """
         if self.owned_by(primary_key) or self.store is None:
             return
+        previous = (self.message_id, dict(self.mirrors), self.store)
         self.mirrors.setdefault(self.store, self.message_id)
         if (mid := self.mirrors.get(primary_key)) and mid > 0:
             del self.mirrors[primary_key]
             self.message_id = mid
             self.store = primary_key
+        self.location.note_ref_update(self, previous)
 
     def delete(self) -> None:
         self.location.delete_file_ref(self)
@@ -198,6 +200,15 @@ class TGFSDirectory:
 
     def _touch_modified(self) -> None:
         self.modified_at = datetime.datetime.now()
+
+    def note_ref_update(
+        self,
+        fr: "TGFSFileRef",
+        previous: tuple[int, Dict[str, int], Optional[str]],
+    ) -> None:
+        """A store-backed directory may have to re-commit ``fr``'s blob
+        after its stored state moved (see ``GithubDirectory``); a plain
+        directory holds no blob state and does nothing."""
 
     def to_dict(self) -> TGFSDirectorySerialized:
         return TGFSDirectorySerialized(
@@ -367,6 +378,8 @@ class TGFSDirectory:
         # and so does whether it changed since the start.
         moved.stat = fr.stat
         moved.stat_epoch = fr.stat_epoch
+        # The create committed the blob before the mirrors arrived.
+        moved.location.note_ref_update(moved, (moved.message_id, {}, None))
         try:
             self.delete_file_ref(fr)
         except Exception:
@@ -415,6 +428,7 @@ class TGFSDirectory:
         moved.store = fr.store
         moved.stat = fr.stat
         moved.stat_epoch = fr.stat_epoch
+        moved.location.note_ref_update(moved, (moved.message_id, {}, None))
         try:
             await self.delete_file_ref_async(fr)
         except Exception:

@@ -1,7 +1,7 @@
 import asyncio
+import inspect
 import json
 import logging
-from itertools import chain
 from typing import Awaitable, Callable, Dict, List, Optional, Tuple
 
 from vulquantafs.backends.base import IStore
@@ -13,13 +13,38 @@ from vulquantafs.core.repository.interface import (
     FDRepositoryResp,
     IFDRepository,
 )
-from vulquantafs.errors import MessageNotFound, RpcTimeoutError, TechnicalError
+from vulquantafs.errors import (
+    MessageNotFound,
+    RpcTimeoutError,
+    TechnicalError,
+    is_store_outage,
+)
 from vulquantafs.reqres import MessageResp
 
 logger = logging.getLogger(__name__)
 
+# How long a store the breaker has taken away is still given to answer a
+# read. Every read that runs in front of a download's first byte has to
+# fit in the 20 s a client waits before dropping an idle transfer, so an
+# unreachable store gets a short probe: long enough for a store that is
+# merely slow to answer, short enough that the client still sees the
+# answer -- usually the file from a mirror, or an error -- in time.
+UNREACHABLE_PROBE_TIMEOUT_S = 3.0
 
-def _bounded_read(what: str, action: Awaitable) -> Awaitable:
+# Bound on the "are these parts still there" lookup, which every download
+# and listing does before it reads a single byte. It used to be
+# unbounded: with the primary gone, opening one file blocked for the whole
+# reconnect cycle of the Telegram client, FileZilla abandoned the transfer
+# after 20 s, and the retry hit the same wall -- while the mirror that
+# held the parts all along waited to be asked. A store that does not
+# answer within this window is treated as unavailable, exactly like one
+# that raised.
+PART_LOOKUP_TIMEOUT_S = 8.0
+
+
+def _bounded_read(
+    what: str, action: Awaitable, timeout: Optional[float] = None
+) -> Awaitable:
     """Bound one store read by ``transfer.upload_part_timeout_s``
 
     The same bound that keeps a silent part upload from freezing an
@@ -27,9 +52,12 @@ def _bounded_read(what: str, action: Awaitable) -> Awaitable:
     from freezing the write's own preparation: ``rpc_timeout_s`` is
     minutes, and a client whose read never comes back abandons the
     transfer long before the timeout converts the hang into an error
-    the failover can act on. ``0`` keeps reads unbounded.
+    the failover can act on. ``0`` keeps reads unbounded. ``timeout``
+    overrides the configured bound for reads that run in front of a
+    client waiting for its first byte of a download.
     """
-    timeout = get_config().vulquantafs.transfer.upload_part_timeout_s
+    if timeout is None:
+        timeout = get_config().vulquantafs.transfer.upload_part_timeout_s
     if not timeout:
         return action
 
@@ -70,6 +98,83 @@ class StoreFDRepository(IFDRepository):
             and self._local_versions is not None
             and self._local_versions(version.id)
         )
+
+    @staticmethod
+    def _accepts(store, message_id: int) -> bool:
+        """Whether ``store`` can address ``message_id``.
+
+        Stores outside this package (a test double, an embedding app's own
+        implementation) may not carry the capability; they are trusted, the
+        way they were before it existed.
+        """
+        accepts = getattr(store, "accepts_message_id", None)
+        if accepts is None:
+            return True
+        answer = accepts(message_id)
+        if inspect.iscoroutine(answer):
+            # A double that answers every attribute with a mock coroutine.
+            answer.close()
+            return True
+        return bool(answer)
+
+    def _foreign_store_of(self, message_id: int) -> Optional[str]:
+        """The configured store an id can belong to, when this one cannot.
+
+        A descriptor written while another store was the primary records
+        its ids without a store -- "the primary", which tgfs always meant.
+        An id is only meaningful inside the store that issued it, though:
+        a 19-digit Discord snowflake can never name a Telegram message.
+        Asking the primary for one used to fail the whole batched request,
+        which cost every file read in the same window its descriptor and so
+        served it as an empty file, while its recorded size stayed correct.
+        """
+        if not message_id or self._accepts(self._message_api, message_id):
+            return None
+        group = self._mirror_group
+        if group is None:
+            return None
+        for key in group.store_keys:
+            store = group.store_for(key)
+            if store is not None and self._accepts(store, message_id):
+                return key
+        return None
+
+    def _rehome_ref(self, fr: TGFSFileRef) -> None:
+        """Point a ref whose id belongs elsewhere at that store."""
+        if not fr.owned_by(self.key):
+            return
+        key = self._foreign_store_of(fr.message_id)
+        if key is not None:
+            logger.warning(
+                f"File descriptor {fr.message_id} of {fr.name} cannot belong to "
+                f"{self.key}; reading it from {key}"
+            )
+            fr.store = key
+
+    def _rehome_versions(self, fd: TGFSFileDesc) -> None:
+        """Record the store that owns versions whose ids this one cannot hold."""
+        for version in fd.get_versions():
+            if not version.owned_by(self.key) or not version.message_ids:
+                continue
+            if any(
+                self._accepts(self._message_api, mid)
+                for mid in version.message_ids
+                if mid > 0
+            ):
+                continue
+            holders = {
+                key
+                for mid in version.message_ids
+                if mid > 0
+                if (key := self._foreign_store_of(mid)) is not None
+            }
+            if len(holders) != 1:
+                continue
+            version.store = holders.pop()
+            logger.warning(
+                f"Content of {fd.name}@{version.id} cannot live in {self.key}; "
+                f"reading it from {version.store}"
+            )
 
     @property
     def key(self) -> str:
@@ -192,6 +297,29 @@ class StoreFDRepository(IFDRepository):
             return dict(existing or {})
         return await self._mirror_group.mirror_fd(fd.to_json(), existing, skip=skip)
 
+    def _fully_mirrored(self, version: TGFSFileVersion) -> bool:
+        """Whether every part of ``version`` has a copy in a live mirror.
+
+        Only then can a read skip the store that owns the version: without
+        a mirror copy of a single part, that part has nowhere else to come
+        from and the owner is still the only one who can answer.
+        """
+        group = self._mirror_group
+        if group is None or not version.message_ids:
+            return False
+        for j in range(len(version.message_ids)):
+            if not any(
+                # A version lists its own store among its ``mirrors``; that
+                # copy is the one being skipped, not a way around it.
+                key != self.key
+                and j < len(ids)
+                and ids[j] > 0
+                and group.store_for(key) is not None
+                for key, ids in version.mirrors.items()
+            ):
+                return False
+        return True
+
     async def _lookup_mirror_parts(
         self, missing: List[Tuple[str, int]]
     ) -> Dict[Tuple[str, int], int]:
@@ -306,17 +434,66 @@ class StoreFDRepository(IFDRepository):
         # Only ids that belong to this store are looked up here; a version
         # relocated from a former primary is checked against the mirrors.
 
-        all_ids = list(
-            chain(
-                *(
-                    version.message_ids
-                    for version in versions
-                    if version.owned_by(self.key)
-                )
-            )
+        all_ids = [
+            mid
+            for version in versions
+            if version.owned_by(self.key)
+            for mid in version.message_ids
+            # An id this store cannot hold is not a missing part: it belongs
+            # to another store's namespace and must never be sent here.
+            if self._accepts(self._message_api, mid)
+        ]
+        primary_down = (
+            self._mirror_group is not None and self._mirror_group.primary_dead()
         )
+        # A part with a mirror copy cannot profit from a question to a
+        # primary the breaker already took away: the answer is the
+        # mirror's, and asking anyway is what held a download for the whole
+        # reconnect cycle of the Telegram client -- far past the 20 s a
+        # client waits before it drops an idle transfer -- while the mirror
+        # that would have served the bytes waited to be asked. Parts with
+        # no mirror copy are still asked for, because they are the only
+        # copy, but on the short probe.
+        skipped = (
+            [
+                mid
+                for version in versions
+                if version.owned_by(self.key) and self._fully_mirrored(version)
+                for mid in version.message_ids
+                if mid > 0
+            ]
+            if primary_down
+            else []
+        )
+        asked_ids = [mid for mid in all_ids if mid not in set(skipped)]
+        if skipped:
+            logger.warning(
+                f"Serving the parts of {fd.name} from the mirrors: the "
+                f"primary store is marked down"
+            )
+            # Nothing was verified against the owner; the stat writer and
+            # the backfill must not take this read as complete.
+            fd.complete = False
         try:
-            file_messages = await self._message_api.get_messages(all_ids)
+            file_messages = (
+                await _bounded_read(
+                    f"the parts of {fd.name}",
+                    self._message_api.get_messages(asked_ids),
+                    timeout=(
+                        UNREACHABLE_PROBE_TIMEOUT_S
+                        if primary_down
+                        else PART_LOOKUP_TIMEOUT_S
+                    ),
+                )
+                if asked_ids
+                else []
+            )
+            # An answer is the proof the breaker waits for: without it the
+            # primary stays "dead" for the full window after it recovered,
+            # and every version that fully trusts its mirrors spends that
+            # minute asking a mirror that just went down.
+            if primary_down and self._mirror_group is not None:
+                self._mirror_group.mark_primary_alive()
         except Exception as ex:
             # An unreachable primary (banned channel, network down) must
             # not make every file look invalid while a mirror has it: treat
@@ -328,8 +505,9 @@ class StoreFDRepository(IFDRepository):
                 f"Could not check the primary store for the parts of {fd.name}: "
                 f"{ex}; checking the mirrors"
             )
-            self._mirror_group.mark_primary_dead()
-            file_messages = [None] * len(all_ids)
+            if is_store_outage(ex):
+                self._mirror_group.mark_primary_dead()
+            file_messages = [None] * len(asked_ids)
             fd.complete = False
 
         message_map = {msg.message_id: msg for msg in file_messages if msg}
@@ -443,8 +621,15 @@ class StoreFDRepository(IFDRepository):
         return empty
 
     async def _get_fd_text(self, fr: TGFSFileRef) -> Optional[str]:
-        """Read the FD JSON, falling back to mirror copies if needed."""
+        """Read the FD JSON, falling back to mirror copies if needed.
+
+        ``None`` means every place that could hold the descriptor said it
+        does not have it. A read that failed raises instead: a failed read
+        is not a missing file, and reporting it as one is what turned a
+        transient store problem into downloads of empty files.
+        """
         message = None
+        failure: Optional[Exception] = None
         acting = (
             self._mirror_group.store_for(fr.store)
             if self._mirror_group is not None
@@ -464,6 +649,7 @@ class StoreFDRepository(IFDRepository):
                     )
                 )[0]
             except Exception as ex:
+                failure = ex
                 logger.warning(
                     f"Could not read file descriptor {fr.message_id} for "
                     f"{fr.name} from the acting store {fr.store}: {ex}"
@@ -471,8 +657,14 @@ class StoreFDRepository(IFDRepository):
             if message and message.text:
                 return message.text
             message = None
+        # Skipping the primary is only worth it when a mirror copy of this
+        # very descriptor exists: without one there is nothing else to read
+        # from, and skipping turned one failed request into a minute of
+        # "not found" -- and an empty file -- for every such file.
         skip_primary = (
-            self._mirror_group is not None and self._mirror_group.primary_dead()
+            self._mirror_group is not None
+            and self._mirror_group.primary_dead()
+            and bool(fr.mirrors)
         )
         try:
             if acting is None and fr.owned_by(self.key) and not skip_primary:
@@ -480,25 +672,45 @@ class StoreFDRepository(IFDRepository):
                     await _bounded_read(
                         f"the read of file descriptor {fr.message_id} for {fr.name}",
                         self._message_api.get_messages([fr.message_id]),
+                        # A primary the breaker took away gets the short
+                        # probe: this read runs before a download's first
+                        # byte, and the client gives up on a silent
+                        # transfer after 20 s. Nothing else holds this
+                        # descriptor, so it is still worth asking -- just
+                        # not for longer than the client waits.
+                        timeout=(
+                            UNREACHABLE_PROBE_TIMEOUT_S
+                            if self._mirror_group is not None
+                            and self._mirror_group.primary_dead()
+                            else None
+                        ),
                     )
                 )[0]
         except Exception as ex:
+            failure = ex
             logger.warning(
                 f"Could not read file descriptor {fr.message_id} for "
                 f"{fr.name} from the primary store: {ex}"
             )
             message = None
-            if self._mirror_group:
+            # A request that could not be built is a problem with this
+            # descriptor, not with the store: taking the primary away from
+            # every other file for a minute is how one bad id became a
+            # wave of empty downloads.
+            if self._mirror_group and is_store_outage(ex):
                 self._mirror_group.mark_primary_dead()
 
         if message and message.text:
+            # A primary that answers again ends its own outage: keeping the
+            # breaker open after a successful read would send the next
+            # files to mirrors that may just have gone down themselves.
+            if self._mirror_group is not None:
+                self._mirror_group.mark_primary_alive()
             return message.text
 
-        if not self._mirror_group:
-            return None
-
+        group = self._mirror_group
         for store_key, mirror_mid in fr.mirrors.items():
-            if (api := self._mirror_group.store_for(store_key)) is None:
+            if group is None or (api := group.store_for(store_key)) is None:
                 continue
             try:
                 mirror_message = (
@@ -520,6 +732,20 @@ class StoreFDRepository(IFDRepository):
                     f"store {store_key}"
                 )
                 return mirror_message.text
+        if fr.store is not None and fr.store != self.key:
+            # Nothing was even asked: the ref names a store this file system
+            # does not have (a renamed or removed store). Say so instead of
+            # leaving a bare "not found" and an empty file behind it.
+            logger.warning(
+                f"File descriptor {fr.message_id} of {fr.name} is recorded in "
+                f"store {fr.store}, which is not configured here; it cannot be "
+                f"read from {self.key}"
+            )
+        if failure is not None:
+            raise TechnicalError(
+                f"The file descriptor of {fr.name} could not be read: {failure}",
+                cause=str(failure) or type(failure).__name__,
+            )
         return None
 
     def _trust_recorded(self, fd: TGFSFileDesc) -> TGFSFileDesc:
@@ -548,7 +774,20 @@ class StoreFDRepository(IFDRepository):
         # After a promotion the ref may still describe the former primary;
         # re-express it relative to this store before touching anything.
         fr.relocate(self.key)
-        text = await self._get_fd_text(fr)
+        self._rehome_ref(fr)
+        try:
+            text = await self._get_fd_text(fr)
+        except TechnicalError as ex:
+            # A read that failed is not a file that is gone: report it as
+            # unreadable, so a listing still works and a download raises
+            # instead of handing the client an empty file.
+            logger.error(
+                f"File descriptor (message_id: {fr.message_id}) for {fr.name} "
+                f"could not be read: {ex}"
+            )
+            missing = TGFSFileDesc.empty(fr.name)
+            missing.complete = False
+            return missing
 
         if not text:
             logging.error(
@@ -561,6 +800,7 @@ class StoreFDRepository(IFDRepository):
         fd = TGFSFileDesc.from_dict(json.loads(text), name=fr.name)
         for version in fd.get_versions():
             version.relocate(self.key)
+        self._rehome_versions(fd)
         if not validate:
             return self._trust_recorded(fd)
         return await self._validate_fv(fd, include_all_versions)

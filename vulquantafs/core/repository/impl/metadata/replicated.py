@@ -380,6 +380,35 @@ class ReplicatedMetadataRepository(IMetaDataRepository):
             # boot. Keep the journal until it has the removals as well.
             raise TechnicalError("Waiting for metadata stores: " + ", ".join(stale))
 
+    async def store_replication_backup(self, data: bytes) -> bool:
+        stored = False
+        for store in self._stores:
+            if store.repo.write_in_cooldown():
+                continue
+            try:
+                async with self._store_locks[store.key]:
+                    stored = await store.repo.store_replication_backup(data) or stored
+            except Exception as ex:
+                logger.warning(
+                    f"Backing up the replication queue to store "
+                    f"{store.key} failed: {ex}"
+                )
+        return stored
+
+    async def load_replication_backup(self) -> Optional[bytes]:
+        for store in self._stores:
+            try:
+                data = await store.repo.load_replication_backup()
+            except Exception as ex:
+                logger.warning(
+                    f"Reading the replication queue backup from store "
+                    f"{store.key} failed: {ex}"
+                )
+                continue
+            if data is not None:
+                return data
+        return None
+
     async def _push(self, all_full: bool = False, include_stale: bool = False) -> None:
         if not self.metadata:
             raise MetadataNotInitialized()

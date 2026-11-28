@@ -88,6 +88,19 @@ here is sparse, so `Handle.seek` answers with a single solid data region and
 raises `ENXIO` past the end. Without it, transfers from an asyncssh-based
 client fail outright — which is exactly what the integration test caught.
 
+Every read is also bounded by the client's patience rather than by the
+store. Opening a file first reads its descriptor and checks that the part
+messages it lists still exist; with a store gone, that check used to have no
+deadline at all and waited out the backend's whole reconnect cycle, so an
+SFTP `OPEN` never answered — FileZilla drops a transfer after 20 seconds of
+silence — even though a mirror held both the descriptor and the bytes. The
+part check now gives a store the circuit breaker has taken away a short
+probe, and skips it entirely for a version every part of which a live mirror
+also holds. A content read with nowhere to fail over to is bounded the same
+way: an unreachable store answers with its error instead of holding the
+first byte until the client gives up. Nothing here weakens into a zero-byte
+success: a file that cannot be verified is an error, not an empty download.
+
 ### Writes: a size that is not known in advance
 
 Telegram uploads need the total size up front (it decides the part layout);
@@ -122,13 +135,21 @@ Other SFTP sessions cannot open the same path for writing until the handle
 is closed or aborted. A new file can only enter the tree after the storage
 backend accepts its complete stream; an explicit close without writes
 creates an empty file. With a GitHub tree as the primary metadata store, CLOSE
-confirms a new primary-owned file after the content backend accepts the
-file and its reference is committed to the local SQLite upload journal.
-It does not wait behind a GitHub stats or tree commit. The local file is
-immediately readable. A background worker batches references for GitHub,
-retries with backoff without dropping entries, and queues the usual mirror
-sync. Entries not yet confirmed by GitHub are replayed on restart. Other
-metadata layouts retain their existing persistence rules.
+confirms a new file after the content backend accepts it and its reference
+is committed to the local SQLite upload journal. That holds for a file the
+acting store took over while the primary was down just as much as for one
+the primary holds: the reference names the store that owns the content, and
+waiting for GitHub there was what turned a bulk upload during an outage into
+failed transfers -- a file that had landed answered an error, so the client
+retried into its own name and asked whether to overwrite it, once per file
+that missed the commit deadline. CLOSE does not wait behind a GitHub stats
+or tree commit; it only does so when the journal is unavailable, and then a
+commit past its deadline is still not a failed write: the name stays in the
+tree, readable, while the commit retries in the background. The local file
+is immediately readable either way. A background worker batches references
+for GitHub, retries with backoff without dropping entries, and queues the
+usual mirror sync. Entries not yet confirmed by GitHub are replayed on
+restart. Other metadata layouts retain their existing persistence rules.
 
 Mount `VULQUANTAFS_DATA_DIR` on writable persistent storage and keep its
 `uploads/` directory when restarting or replacing the server. Until the

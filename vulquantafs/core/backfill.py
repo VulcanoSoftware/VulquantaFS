@@ -21,7 +21,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, List, Optional, Tuple
 
 from vulquantafs.core.local_cache import version_cache_for
-from vulquantafs.core.mirror import MirrorStore
+from vulquantafs.core.mirror import MirrorGroup, MirrorStore
 from vulquantafs.core.model import (
     TGFSDirectory,
     TGFSFileDesc,
@@ -67,10 +67,10 @@ class BackfillReport:
         }
 
 
-def _collect_file_refs(directory: TGFSDirectory) -> List[TGFSFileRef]:
+def collect_file_refs(directory: TGFSDirectory) -> List[TGFSFileRef]:
     refs = list(directory.find_files())
     for child in directory.find_dirs():
-        refs.extend(_collect_file_refs(child))
+        refs.extend(collect_file_refs(child))
     return refs
 
 
@@ -202,6 +202,15 @@ async def _distribute_pending(
     return True
 
 
+def _fd_missing(mirror_group: MirrorGroup, fr: TGFSFileRef) -> set[str]:
+    """Stores that hold no copy of the file's descriptor."""
+    return (
+        set(mirror_group.store_keys)
+        - {key for key, mid in fr.mirrors.items() if mid > 0}
+        - {fr.store}
+    )
+
+
 async def backfill_file(
     client: "Client", fr: TGFSFileRef, verify: bool, report: BackfillReport
 ) -> None:
@@ -212,10 +221,49 @@ async def backfill_file(
     if fd_repo is None:
         return
 
-    fd = await fd_repo.get(fr, include_all_versions=True)  # type: ignore[call-arg]
+    # The trust-recorded descriptor knows its own mirror layout, so the
+    # common heal -- every content copy already in place, only the
+    # descriptor's mirror copies missing -- needs no part lookups at all.
+    # A backlog of tens of thousands of such files never drains when each
+    # one pays for validating its parts against the stores first.
+    fd = await fd_repo.get(fr, include_all_versions=True, validate=False)  # type: ignore[call-arg]
     if not fd.complete:
         # A store outage can make validation return a partial descriptor.
         # Do not drop queued work or save an incompletely checked version list.
+        report.failures.append(f"{fr.name}: file descriptor is temporarily unavailable")
+        return
+    if not fd.get_versions():
+        return
+
+    content_gaps = mirror_group is None or any(
+        # All versions, invalid ones included: a pending version is
+        # invalid until its bytes reach a store, and a broken one may
+        # still be served from a mirror -- both need the read below.
+        v.pending
+        or mirror_group.missing_stores(v)
+        or not v.owned_by(mirror_group.primary.key)
+        for v in fd.get_versions()
+    )
+    if mirror_group is not None and not verify and not content_gaps:
+        fd_missing = _fd_missing(mirror_group, fr)
+        if not fd_missing:
+            return
+        resp = await fd_repo.save(fd, fr)
+        await _sync_ref(client, fr, resp)
+        fds_still_missing = _fd_missing(mirror_group, fr)
+        if len(fds_still_missing) < len(fd_missing):
+            report.fds_mirrored += 1
+        if fds_still_missing:
+            report.failures.append(
+                f"{fr.name}: could not refresh the descriptor in "
+                f"{', '.join(sorted(fds_still_missing))}"
+            )
+        return
+
+    # Content work needs the validated read: part sizes and validity come
+    # from the stores, not from the recorded JSON.
+    fd = await fd_repo.get(fr, include_all_versions=True)  # type: ignore[call-arg]
+    if not fd.complete:
         report.failures.append(f"{fr.name}: file descriptor is temporarily unavailable")
         return
     if not fd.get_versions():
@@ -306,11 +354,7 @@ async def backfill_file(
             # needed for replication.
             cache.release()
 
-    fd_missing = (
-        set(mirror_group.store_keys)
-        - {key for key, mid in fr.mirrors.items() if mid > 0}
-        - {fr.store}
-    )
+    fd_missing = _fd_missing(mirror_group, fr)
 
     if changed or fd_missing:
         # Commit point: the (possibly updated) mirrors map is persisted
@@ -343,6 +387,10 @@ async def _sync_ref(
             fr.message_id != resp.message_id or fr.store != resp.store
         ):
             await client.metadata_api.flush_uploads(ref=fr)
+        # The ref mutates in place; a store whose committed blob names the
+        # old state (a tree store has no write-through hook for mirror
+        # bookkeeping) has to hear about it before the values move.
+        fr.location.note_ref_update(fr, (fr.message_id, dict(fr.mirrors), fr.store))
         fr.message_id = resp.message_id
         fr.mirrors = dict(resp.mirrors)
         fr.store = resp.store
@@ -367,7 +415,7 @@ async def backfill_mirrors(
         )
         return report
 
-    refs = _collect_file_refs(client.dir_api.root)
+    refs = collect_file_refs(client.dir_api.root)
 
     # Newest first: load descriptors to know each file's timestamp.
     dated: List[Tuple[TGFSFileRef, int]] = []
@@ -424,4 +472,4 @@ async def create_backfill_task(client: "Client", total_files: int) -> str:
 
 
 def count_files(client: "Client") -> int:
-    return len(_collect_file_refs(client.dir_api.root))
+    return len(collect_file_refs(client.dir_api.root))

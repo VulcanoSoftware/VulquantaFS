@@ -295,6 +295,12 @@ class MetaDataApi:
                 # rely on the tree having landed when the block exits.
                 await self.__write()
 
+    async def store_replication_backup(self, data: bytes) -> bool:
+        return await self.__metadata_repo.store_replication_backup(data)
+
+    async def load_replication_backup(self) -> bytes | None:
+        return await self.__metadata_repo.load_replication_backup()
+
     async def push(self, *, require_success: bool = False) -> None:
         if self.__batch_depth and not require_success:
             self.__pending = True

@@ -7,6 +7,7 @@ from vulquantafs.core.api.file import FileApi
 from vulquantafs.core.api.file_desc import FileDescApi
 from vulquantafs.core.api.metadata import MetaDataApi
 from vulquantafs.core.model import (
+    FileStat,
     TGFSDirectory,
     TGFSFileDesc,
     TGFSFileRef,
@@ -15,6 +16,7 @@ from vulquantafs.core.model import (
 from vulquantafs.errors import (
     FileOrDirectoryAlreadyExists,
     FileOrDirectoryDoesNotExist,
+    PendingCommitError,
     TechnicalError,
 )
 from vulquantafs.reqres import (
@@ -606,6 +608,50 @@ class TestFileApi:
         mock_file_desc_api.get_file_desc.assert_called_once_with(sample_file_ref, False)
 
     @pytest.mark.asyncio
+    async def test_retrieve_refuses_to_serve_an_unreadable_descriptor(
+        self, file_api, mock_file_desc_api, sample_file_ref
+    ):
+        """A descriptor that could not be read is an error, not an empty file.
+
+        Serving the stand-in as zero bytes made a broken read look like a
+        successful download of an empty file, while the listing kept showing
+        the size the descriptor recorded.
+        """
+        unreadable = TGFSFileDesc.empty("broken.txt")
+        unreadable.complete = False
+        mock_file_desc_api.get_file_desc.return_value = unreadable
+
+        with pytest.raises(TechnicalError, match="descriptor could not be read"):
+            await file_api.retrieve(sample_file_ref, 0, -1, "broken.txt")
+
+    @pytest.mark.asyncio
+    async def test_retrieve_refuses_a_file_whose_parts_are_all_gone(
+        self, file_api, mock_file_desc_api, sample_file_ref
+    ):
+        sample_file_ref.stat = FileStat(size=524288, created_at=0, modified_at=0)
+        mock_file_desc_api.get_file_desc.return_value = TGFSFileDesc.empty("gone.txt")
+
+        with pytest.raises(TechnicalError, match="524288 bytes are still stored"):
+            await file_api.retrieve(sample_file_ref, 0, -1, "gone.txt")
+
+    @pytest.mark.asyncio
+    async def test_retrieve_still_serves_a_file_that_is_really_empty(
+        self, file_api, mock_file_desc_api, sample_file_ref
+    ):
+        sample_file_ref.stat = FileStat(size=0, created_at=0, modified_at=0)
+        mock_file_desc_api.get_file_desc.return_value = TGFSFileDesc.empty("empty.txt")
+
+        async def no_chunks():
+            return
+            yield b""  # pragma: no cover
+
+        mock_file_desc_api.download_file_at_version.return_value = no_chunks()
+
+        result = await file_api.retrieve(sample_file_ref, 0, -1, "empty.txt")
+
+        assert [chunk async for chunk in result] == []
+
+    @pytest.mark.asyncio
     async def test_retrieve_regular_file(
         self, file_api, mock_file_desc_api, sample_file_ref, sample_file_desc
     ):
@@ -925,3 +971,106 @@ class TestFileApi:
         assert root.find_files() == []
         mock_metadata_api.push.assert_awaited_once()
         mock_file_desc_api.get_file_desc.assert_not_awaited()
+
+
+class TestUploadsThatLandedAreNotFailures:
+    """A write a store accepted must not answer a failure because the
+    metadata commit recording it is late.
+
+    In the third bulk retest a 20k upload ran while Telegram was blocked.
+    The content went to the Discord mirror and every reference to GitHub,
+    but a file stats commit held the branch past the 15-second deadline.
+    That one file answered SSH_FX_FAILURE although it was in the tree, and
+    FileZilla retried it into an "already exists" prompt that stopped the
+    whole queue.
+    """
+
+    @pytest.fixture
+    def metadata_api(self, mocker):
+        return mocker.AsyncMock(spec=MetaDataApi)
+
+    @pytest.fixture
+    def desc_api(self, mocker):
+        return mocker.AsyncMock(spec=FileDescApi)
+
+    @pytest.fixture
+    def store(self, mocker):
+        store = mocker.AsyncMock(spec=TelegramStore)
+        store.key = "tg:111"
+        return store
+
+    @pytest.fixture
+    def api(self, metadata_api, desc_api, store) -> FileApi:
+        return FileApi(metadata_api, desc_api, store)
+
+    @pytest.fixture
+    def root(self) -> TGFSDirectory:
+        return TGFSDirectory.root_dir()
+
+    @pytest.fixture
+    def message(self) -> FileMessageFromBuffer:
+        return FileMessageFromBuffer.new(buffer=b"512 KB", name="512KB.txt")
+
+    @staticmethod
+    def _resp(mocker, message_id: int, store_key):
+        resp = mocker.Mock()
+        resp.message_id = message_id
+        resp.mirrors = {}
+        resp.store = store_key
+        resp.fd = TGFSFileDesc(name="512KB.txt")
+        return resp
+
+    async def test_content_on_an_acting_store_is_journaled(
+        self, api, metadata_api, desc_api, root, message, mocker
+    ):
+        """While the primary is down the acting store owns the content and
+        the reference. CLOSE must not wait on GitHub for it either."""
+        desc_api.create_file_desc.return_value = self._resp(mocker, 555, "dc:9")
+        staged = TGFSFileRef(message_id=555, name="512KB.txt", location=root)
+        staged.store = "dc:9"
+        metadata_api.stage_upload.return_value = staged
+        create_ref = mocker.patch.object(root, "create_file_ref_async")
+
+        await api.upload(root, message, journal_file_ref=True)
+
+        metadata_api.stage_upload.assert_called_once_with(
+            root, "512KB.txt", 555, {}, "dc:9"
+        )
+        create_ref.assert_not_called()
+
+    async def test_a_commit_past_its_deadline_keeps_the_upload(
+        self, api, metadata_api, desc_api, root, message, mocker
+    ):
+        """The journal is off: the reference is still created first, so a
+        late commit leaves a readable file rather than a failed upload."""
+        desc_api.create_file_desc.return_value = self._resp(mocker, 777, None)
+        metadata_api.stage_upload.return_value = None
+
+        async def pending(name, message_id):
+            root.create_file_ref(name, message_id)
+            raise PendingCommitError(
+                "Timed out after 15s waiting for the file reference of "
+                f"{name} to be committed"
+            )
+
+        mocker.patch.object(root, "create_file_ref_async", side_effect=pending)
+
+        await api.upload(root, message, journal_file_ref=True)
+
+        assert root.find_file("512KB.txt").message_id == 777
+        metadata_api.request_push.assert_called_once()
+        metadata_api.push.assert_not_awaited()
+
+    async def test_a_create_that_left_no_reference_still_fails(
+        self, api, metadata_api, desc_api, root, message, mocker
+    ):
+        desc_api.create_file_desc.return_value = self._resp(mocker, 888, None)
+        metadata_api.stage_upload.return_value = None
+
+        async def pending(name, message_id):
+            raise PendingCommitError("Timed out")
+
+        mocker.patch.object(root, "create_file_ref_async", side_effect=pending)
+
+        with pytest.raises(PendingCommitError):
+            await api.upload(root, message, journal_file_ref=True)

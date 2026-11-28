@@ -481,8 +481,8 @@ class TestValidateFvMethod:
 
         result = await repository._validate_fv(fd, include_all_versions=False)
 
-        # get_messages is called but with empty list
-        mock_message_api.get_messages.assert_called_once_with([])
+        # Nothing to look up, so the store is not asked at all
+        mock_message_api.get_messages.assert_not_called()
 
         # Should return empty file descriptor since no valid versions found
         assert result.name == "empty_versions.txt"

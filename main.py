@@ -21,7 +21,13 @@ from vulquantafs.core import Client, Clients
 from vulquantafs.core.client import StoreFactory
 from vulquantafs.core.local_cache import CacheSweeper, LocalCache
 from vulquantafs.core.metadata_healing import MetadataHealWorker
-from vulquantafs.core.replication import ReplicationQueue, ReplicationWorker
+from vulquantafs.core.replication import (
+    ReplicationQueue,
+    ReplicationWorker,
+    queue_backup_pusher,
+    queue_descriptor_gaps,
+    restore_replication_backups,
+)
 from vulquantafs.utils.message_cache import set_message_cache_size
 
 
@@ -95,7 +101,7 @@ def start_cache_sweeper(
     return sweeper
 
 
-def start_replication_workers(
+async def start_replication_workers(
     clients: Clients, config: Config, replication: ReplicationQueue
 ) -> List[ReplicationWorker]:
     """One background worker per replicated file system.
@@ -104,8 +110,13 @@ def start_replication_workers(
     ``tee`` writes it closes the gaps a failed mirror write left behind,
     so a store that was temporarily down is caught up without manual
     action. It also drains the bytes a ``write_ack: cache`` write left
-    on the local disk.
+    on the local disk. On start every file whose descriptor lacks a
+    mirror copy is queued, so the gap is healed while the stores are up
+    instead of surfacing as unreadable files during an outage. A file
+    system with a metadata store also gets its queue snapshotted there,
+    so losing the data directory does not lose pending content gaps.
     """
+    await restore_replication_backups(clients, replication)
     workers: List[ReplicationWorker] = []
     for filesystem in config.filesystems.values():
         client = clients.get(filesystem.name)
@@ -113,6 +124,9 @@ def start_replication_workers(
             continue
         if not filesystem.mirrors and filesystem.write_ack != "cache":
             continue
+        queue_descriptor_gaps(client, replication)
+        if getattr(client, "metadata_api", None) is not None:
+            replication.register_backup(filesystem.name, queue_backup_pusher(client))
         worker = ReplicationWorker(client, replication)
         worker.start()
         workers.append(worker)
@@ -159,7 +173,7 @@ async def main():
     replication = ReplicationQueue(config.replication_queue_file)
     cache = create_cache(config)
     clients = await create_clients(config, replication, cache)
-    workers = start_replication_workers(clients, config, replication)
+    workers = await start_replication_workers(clients, config, replication)
     heal_worker = start_metadata_heal_worker(clients)
 
     app = create_app(clients, config, replication=replication, cache=cache)

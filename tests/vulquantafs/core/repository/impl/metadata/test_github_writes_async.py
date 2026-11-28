@@ -20,6 +20,7 @@ from vulquantafs.core.repository.impl.metadata.github_repo.gh_directory import (
     GithubConfig,
     GithubDirectory,
 )
+from vulquantafs.errors import PendingCommitError
 
 
 @pytest.fixture
@@ -194,7 +195,9 @@ class TestCreateFileRefAsync:
         directory = GithubDirectory(ghc, "d", None)
 
         start = time.monotonic()
-        with pytest.raises(Exception, match="Timed out"):
+        # A distinct error: the write landed, only the commit is late, and
+        # the caller that owns the file answers it as success.
+        with pytest.raises(PendingCommitError, match="Timed out"):
             await directory.create_file_ref_async("f", 1)
         assert time.monotonic() - start < 2
 
